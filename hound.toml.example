@@ -1,0 +1,72 @@
+# SurveillanceHound — example config.
+#
+# Drop this file at /etc/hound.toml (or wherever) and pass the path to every
+# `hound` command. Section-by-section commentary below; defaults are sane so
+# the only thing you HAVE to set is [capture] and your camera list.
+
+# ── Where to watch ─────────────────────────────────────────────────────────
+# Live: set `interface` to the NIC the surveillance traffic crosses.
+#       On an NVR this is usually the LAN-facing interface; on a firewall /
+#       switch, the mirror / SPAN port.
+# Replay: set `pcap_file` to a saved capture for offline analysis.
+# Set ONE of `interface` or `pcap_file` — never both.
+[capture]
+interface = "eth0"
+# pcap_file = "/var/spool/captures/today.pcap"
+snaplen   = 96               # bytes captured per packet — headers only
+# bpf     = "host 192.168.10.0/24"   # optional Berkeley Packet Filter
+
+# ── What is what on this network ───────────────────────────────────────────
+# Either name your cameras / NVRs by IP, or describe their subnet. Anything
+# else (the public internet) is "off-network" and gets the strict treatment.
+# `manufacturer_allowlist` is your vendor's cloud — flows to these CIDRs are
+# flagged as "manufacturer" (info), not as suspicious telemetry.
+[network]
+camera_ips     = ["192.168.10.20", "192.168.10.21", "192.168.10.22"]
+camera_subnets = ["192.168.10.0/24"]
+nvr_ips        = ["192.168.10.10"]
+manufacturer_allowlist = [
+    # "203.0.113.0/24",
+]
+
+# ── When to alert ──────────────────────────────────────────────────────────
+[thresholds]
+bulk_inbound_bytes  = 1_048_576    # >= this transferred TO a camera fires bulk_inbound
+long_lived_seconds  = 120.0        # camera<->public sessions older than this fire control_channel_suspect
+many_packets        = 200          # alt control_channel trigger
+silence_seconds     = 600.0        # a camera silent this long fires camera_offline
+flow_ttl_seconds    = 300.0        # idle flows flushed + dropped from RAM
+# routine_ports     = [80, 443, 53, 123, 554, 322, 8000, 8554, 37777, 34567]
+
+[alerts]
+dedup_window_seconds = 1800.0      # don't re-notify on the same alert within this window
+
+[store]
+path = "/var/lib/surveillancehound/hound.sqlite"
+# path = "./hound.sqlite"           # for ad-hoc runs
+
+# ── How to tell you ────────────────────────────────────────────────────────
+# Add a [[notify]] block per channel; multiple are fine. `level` is the
+# minimum severity that goes through that channel. Order: info < low < medium
+# < high < critical.
+
+[[notify]]
+type  = "stdout"
+level = "low"
+
+[[notify]]
+type  = "logfile"
+path  = "/var/log/hound.log"
+level = "info"
+
+[[notify]]
+type  = "jsonlines"
+path  = "/var/log/hound.alerts.jsonl"
+level = "low"
+
+# [[notify]]
+# type    = "webhook"
+# url     = "https://hooks.example.com/alerts"
+# level   = "medium"
+# timeout = 5.0
+# headers = { Authorization = "Bearer ..." }
