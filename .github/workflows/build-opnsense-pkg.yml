@@ -32,7 +32,10 @@ permissions:
   id-token: write
 
 env:
-  FREEBSD_VERSION: '14.2'   # match your OPNsense base (see note above)
+  FREEBSD_VERSION: '14.2'        # the FreeBSD release the build VM boots
+  ABI: 'FreeBSD:14:amd64'        # pkg ABI baked into the package — match your OPNsense
+  # ^ keep the major version of ABI in sync with FREEBSD_VERSION above.
+  #   OPNsense 25.x/26.x → FreeBSD:14:amd64 ; OPNsense 24.x → FreeBSD:13:amd64
 
 jobs:
   build:
@@ -68,9 +71,7 @@ jobs:
             sh deploy/opnsense/pkg/build-pkg.sh \
               --version "${{ steps.meta.outputs.version }}" \
               --out dist \
-              --abi "FreeBSD:${FREEBSD_VERSION%%.*}:amd64"
-        env:
-          FREEBSD_VERSION: ${{ env.FREEBSD_VERSION }}
+              --abi "${{ env.ABI }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -113,10 +114,8 @@ jobs:
             set -eu
             sh deploy/opnsense/pkg/build-pkg.sh \
               --version "${{ needs.build.outputs.version }}" \
-              --out dist --abi "FreeBSD:${FREEBSD_VERSION%%.*}:amd64" \
+              --out dist --abi "${{ env.ABI }}" \
               --repo --sign repo-sign.key
-        env:
-          FREEBSD_VERSION: ${{ env.FREEBSD_VERSION }}
       - name: Stage Pages site
         if: ${{ steps.gate.outputs.have_key == 'true' }}
         run: |
