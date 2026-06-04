@@ -1,0 +1,133 @@
+name: Build OPNsense package
+
+# Produces the os-hound .pkg inside a FreeBSD VM (GitHub runners are Linux, but
+# a FreeBSD-ABI package must be built on FreeBSD). On a published release it
+# attaches the .pkg to the release; if a repo signing key is configured it also
+# publishes a signed pkg repository to GitHub Pages for auto-updating installs.
+#
+# Triggers:
+#   - release: published   → build + attach .pkg (+ publish repo if key present)
+#   - push tag v*          → build + attach .pkg to that tag's release
+#   - workflow_dispatch    → build + upload artifact only (manual test)
+#
+# FreeBSD version note: pin `freebsd_version` to match your OPNsense base.
+#   OPNsense 25.x / 26.x → FreeBSD 14   (ABI FreeBSD:14:amd64)
+#   OPNsense 24.x        → FreeBSD 13   (ABI FreeBSD:13:amd64)
+
+on:
+  release:
+    types: [published]
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (defaults to pyproject.toml)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # attach assets to releases
+  pages: write      # publish the signed repo to GitHub Pages
+  id-token: write
+
+env:
+  FREEBSD_VERSION: '14.2'   # match your OPNsense base (see note above)
+
+jobs:
+  build:
+    name: Build .pkg on FreeBSD
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: meta
+        run: |
+          v='${{ github.event.inputs.version }}'
+          if [ -z "$v" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            v="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$v" ]; then
+            v=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' pyproject.toml | head -1)
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Building os-hound-$v"
+
+      - name: Build package in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ env.FREEBSD_VERSION }}
+          usesh: true
+          # everything below runs *inside* FreeBSD; the workspace is shared
+          run: |
+            set -eu
+            pkg --version
+            sh deploy/opnsense/pkg/build-pkg.sh \
+              --version "${{ steps.meta.outputs.version }}" \
+              --out dist \
+              --abi "FreeBSD:${FREEBSD_VERSION%%.*}:amd64"
+        env:
+          FREEBSD_VERSION: ${{ env.FREEBSD_VERSION }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: os-hound-${{ steps.meta.outputs.version }}
+          path: dist/**
+
+      - name: Attach .pkg to the release
+        if: ${{ github.event_name == 'release' || github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/os-hound-*.pkg
+
+  publish-repo:
+    name: Publish signed pkg repo to Pages
+    needs: build
+    if: ${{ github.event_name == 'release' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for signing key
+        id: gate
+        run: |
+          if [ -n "${{ secrets.HOUND_REPO_SIGNING_KEY }}" ]; then
+            echo "have_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No HOUND_REPO_SIGNING_KEY secret set — skipping repo publish. The .pkg is still attached to the release."
+          fi
+      - name: Write signing key
+        if: ${{ steps.gate.outputs.have_key == 'true' }}
+        run: printf '%s' '${{ secrets.HOUND_REPO_SIGNING_KEY }}' > repo-sign.key
+      - name: Build signed repo in FreeBSD VM
+        if: ${{ steps.gate.outputs.have_key == 'true' }}
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ env.FREEBSD_VERSION }}
+          usesh: true
+          run: |
+            set -eu
+            sh deploy/opnsense/pkg/build-pkg.sh \
+              --version "${{ needs.build.outputs.version }}" \
+              --out dist --abi "FreeBSD:${FREEBSD_VERSION%%.*}:amd64" \
+              --repo --sign repo-sign.key
+        env:
+          FREEBSD_VERSION: ${{ env.FREEBSD_VERSION }}
+      - name: Stage Pages site
+        if: ${{ steps.gate.outputs.have_key == 'true' }}
+        run: |
+          mkdir -p site/opnsense
+          cp -a dist/repo/* site/opnsense/
+          echo "os-hound pkg repository" > site/index.html
+      - name: Upload Pages artifact
+        if: ${{ steps.gate.outputs.have_key == 'true' }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Deploy to GitHub Pages
+        if: ${{ steps.gate.outputs.have_key == 'true' }}
+        uses: actions/deploy-pages@v4

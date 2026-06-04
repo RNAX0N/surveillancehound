@@ -1,0 +1,15 @@
+SurveillanceHound — always-running NVR / IP-camera network monitor.
+
+Watches the surveillance segment (camera VLAN, NVR uplink, or a SPAN port)
+for activity the surveillance threat model cares about: bulk transfers
+toward a camera (firmware push), long-lived camera↔public sessions on
+non-routine ports (control-channel-shaped), off-allowlist telemetry,
+new devices, new peers, silent cameras, and behavioral anomalies vs each
+camera's learned per-(weekday, hour) baseline.
+
+Per-camera ring buffer + on-alert pcap snapshots for forensic review.
+Pluggable notification channels: stdout, logfile, jsonlines, webhook,
+syslog (RFC 5424 UDP/TCP), email (SMTP), FTP/FTPS. A built-in read-only
+web dashboard renders the live state with a dark cyberpunk theme.
+
+WWW: https://github.com/RNAX0N/surveillancehound

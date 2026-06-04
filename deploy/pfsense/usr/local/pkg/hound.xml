@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!--
+    pfSense package definition for SurveillanceHound.
+
+    This XML drives the legacy pfSense package system. Once dropped in
+    /usr/local/pkg/hound.xml and registered (see deploy/pfsense/README.md),
+    pfSense adds the menu entry, generates a Services > SurveillanceHound
+    settings page from this <fields> tree, and writes the rendered TOML
+    on save via the function in hound.inc.
+-->
+<packagegui>
+    <description>SurveillanceHound — IP-camera network monitor</description>
+    <copyright>https://github.com/your-org/SurveillanceHound</copyright>
+    <name>SurveillanceHound</name>
+    <title>Services/SurveillanceHound</title>
+    <category>Services</category>
+    <version>0.1</version>
+    <include_file>/usr/local/pkg/hound.inc</include_file>
+    <menu>
+        <name>SurveillanceHound</name>
+        <tooltiptext>Configure SurveillanceHound IP-camera monitor</tooltiptext>
+        <section>Services</section>
+        <url>/hound.php</url>
+    </menu>
+    <service>
+        <name>hound</name>
+        <rcfile>hound.sh</rcfile>
+        <executable>hound</executable>
+        <description>SurveillanceHound — IP-camera network monitor</description>
+    </service>
+    <configpath>installedpackages/package/$packagename/configuration/settings</configpath>
+    <configfile>hound.xml</configfile>
+    <fields>
+        <field>
+            <fielddescr>Enable</fielddescr>
+            <fieldname>enabled</fieldname>
+            <description>Run the SurveillanceHound daemon at boot.</description>
+            <type>checkbox</type>
+            <default_value>off</default_value>
+        </field>
+        <field>
+            <fielddescr>Listen interface</fielddescr>
+            <fieldname>interface</fieldname>
+            <description>The interface the surveillance traffic crosses
+                (camera VLAN, NVR uplink, or a SPAN/mirror port).</description>
+            <type>interfaces_selection</type>
+            <required>true</required>
+        </field>
+        <field>
+            <fielddescr>BPF filter (optional)</fielddescr>
+            <fieldname>bpf</fieldname>
+            <description>Berkeley Packet Filter expression, e.g.
+                "host 192.168.10.0/24".</description>
+            <type>input</type>
+        </field>
+        <field>
+            <fielddescr>Snaplen</fielddescr>
+            <fieldname>snaplen</fieldname>
+            <description>Bytes captured per packet. 96 covers headers; raise
+                to 1500 if enabling snapshots.</description>
+            <type>input</type>
+            <default_value>96</default_value>
+        </field>
+        <field>
+            <fielddescr>Camera IPs</fielddescr>
+            <fieldname>camera_ips</fieldname>
+            <description>Comma-separated camera IPs.</description>
+            <type>input</type>
+        </field>
+        <field>
+            <fielddescr>Camera subnets</fielddescr>
+            <fieldname>camera_subnets</fieldname>
+            <description>Comma-separated CIDRs (e.g. 192.168.10.0/24).</description>
+            <type>input</type>
+        </field>
+        <field>
+            <fielddescr>NVR IPs</fielddescr>
+            <fieldname>nvr_ips</fieldname>
+            <type>input</type>
+        </field>
+        <field>
+            <fielddescr>Manufacturer allowlist</fielddescr>
+            <fieldname>manufacturer_allowlist</fieldname>
+            <description>Vendor cloud CIDRs your cameras legitimately talk to.</description>
+            <type>input</type>
+        </field>
+        <field>
+            <fielddescr>Enable baselining</fielddescr>
+            <fieldname>baseline_enabled</fieldname>
+            <description>Per-camera Welford anomaly detection.</description>
+            <type>checkbox</type>
+            <default_value>off</default_value>
+        </field>
+        <field>
+            <fielddescr>z threshold</fielddescr>
+            <fieldname>z_threshold</fieldname>
+            <type>input</type>
+            <default_value>4.0</default_value>
+        </field>
+        <field>
+            <fielddescr>Min samples per bucket</fielddescr>
+            <fieldname>min_samples</fieldname>
+            <type>input</type>
+            <default_value>100</default_value>
+        </field>
+        <field>
+            <fielddescr>Enable snapshots</fielddescr>
+            <fieldname>snapshot_enabled</fieldname>
+            <description>On-alert per-camera pcap dumps for forensic review.</description>
+            <type>checkbox</type>
+            <default_value>off</default_value>
+        </field>
+        <field>
+            <fielddescr>Snapshot window (s)</fielddescr>
+            <fieldname>snapshot_window_seconds</fieldname>
+            <type>input</type>
+            <default_value>60</default_value>
+        </field>
+        <field>
+            <fielddescr>Snapshot min severity</fielddescr>
+            <fieldname>snapshot_min_severity</fieldname>
+            <type>select</type>
+            <default_value>medium</default_value>
+            <options>
+                <option><name>info</name><value>info</value></option>
+                <option><name>low</name><value>low</value></option>
+                <option><name>medium</name><value>medium</value></option>
+                <option><name>high</name><value>high</value></option>
+                <option><name>critical</name><value>critical</value></option>
+            </options>
+        </field>
+        <field>
+            <fielddescr>Dashboard enabled</fielddescr>
+            <fieldname>web_enabled</fieldname>
+            <type>checkbox</type>
+            <default_value>on</default_value>
+        </field>
+        <field>
+            <fielddescr>Dashboard host</fielddescr>
+            <fieldname>web_host</fieldname>
+            <description>127.0.0.1 keeps it loopback. Bind a routable
+                address only behind your own reverse proxy + auth.</description>
+            <type>input</type>
+            <default_value>127.0.0.1</default_value>
+        </field>
+        <field>
+            <fielddescr>Dashboard port</fielddescr>
+            <fieldname>web_port</fieldname>
+            <type>input</type>
+            <default_value>8080</default_value>
+        </field>
+    </fields>
+    <custom_php_install_command>
+        hound_install_command();
+    </custom_php_install_command>
+    <custom_php_deinstall_command>
+        hound_deinstall_command();
+    </custom_php_deinstall_command>
+    <custom_php_resync_config_command>
+        hound_resync_config();
+    </custom_php_resync_config_command>
+</packagegui>

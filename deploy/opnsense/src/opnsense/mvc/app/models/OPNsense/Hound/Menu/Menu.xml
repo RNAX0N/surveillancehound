@@ -1,0 +1,6 @@
+<menu>
+    <Services>
+        <VisibleName>Services</VisibleName>
+        <SurveillanceHound VisibleName="SurveillanceHound" url="/ui/hound/" cssClass="fa fa-eye"/>
+    </Services>
+</menu>

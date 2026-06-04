@@ -15,6 +15,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from surveillancehound.baseline import Anomaly
 from surveillancehound.classify import FlowClassification
 from surveillancehound.config import AlertsCfg
 from surveillancehound.store import HoundStore
@@ -28,6 +29,7 @@ KIND_CAMERA_TO_CAMERA = "camera_to_camera"
 KIND_NEW_DEVICE = "new_device"
 KIND_NEW_PEER = "new_peer"
 KIND_CAMERA_OFFLINE = "camera_offline"
+KIND_BEHAVIORAL_ANOMALY = "behavioral_anomaly"
 
 
 _REPORTABLE_FLOW = {
@@ -110,6 +112,56 @@ class AlertEngine:
                 "the first time."
             ),
             dedup_key=dedup_key,
+        )
+
+    def behavioral_anomaly(self, anom: Anomaly, now: float) -> Alert | None:
+        """A camera-flow is outside its learned per-bucket baseline.
+
+        Two flavors of anomaly come through here:
+          * Welford anomalies (anom.model == "welford") — one feature
+            crossed a σ threshold. anom.z is a real standard-deviation
+            count; mean/std are populated.
+          * HS-Forest anomalies (anom.model == "hstree") — joint shape
+            score crossed [0,1] threshold. anom.feature == "joint",
+            anom.z is the score (NOT a σ count), mean/std are 0.0.
+
+        Same alert kind for both — operator's mental model is "the camera
+        is behaving weirdly" either way — but the detail text says which
+        model fired so they can investigate appropriately.
+        """
+        dedup_key = f"behavioral_anomaly:{anom.camera_ip}:{anom.feature}"
+        if self._suppressed(dedup_key, now):
+            return None
+        if anom.model == "hstree":
+            summary = (
+                f"camera {anom.camera_ip}: joint behavior anomaly "
+                f"(score={anom.z:.2f})"
+            )
+            detail = (
+                f"the HS-Forest baseline for camera {anom.camera_ip} "
+                f"scored this flow at {anom.z:.2f} (≥ threshold) for "
+                f"weekday={anom.weekday} hour={anom.hour:02d}. Score is "
+                f"in [0,1] across the ensemble; higher = rarer. This "
+                f"detector flags multivariate shape — bytes, packets, "
+                f"duration, and direction taken jointly — not any single "
+                f"feature in isolation."
+            )
+        else:
+            summary = (
+                f"camera {anom.camera_ip}: {anom.feature} anomaly "
+                f"(observed={anom.value:.0f}, z={anom.z:+.1f})"
+            )
+            detail = (
+                f"feature {anom.feature!r} for camera {anom.camera_ip} is "
+                f"{anom.z:+.1f}σ from the learned baseline for "
+                f"weekday={anom.weekday} hour={anom.hour:02d} "
+                f"(μ={anom.baseline_mean:.2f}, σ={anom.baseline_std:.2f}, "
+                f"observed={anom.value:.2f})."
+            )
+        return Alert(
+            ts=now, device_ip=anom.camera_ip, kind=KIND_BEHAVIORAL_ANOMALY,
+            severity="medium",
+            summary=summary, detail=detail, dedup_key=dedup_key,
         )
 
     def camera_offline(self, ip: str, silent_for: float, now: float) -> Alert | None:

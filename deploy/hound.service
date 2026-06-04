@@ -1,0 +1,69 @@
+# SurveillanceHound — always-running monitor.
+#
+# Install:
+#   sudo cp deploy/hound.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hound
+#
+# Logs:
+#   journalctl -u hound -f
+#
+# This unit assumes:
+#   * `hound` is on PATH at /usr/local/bin/hound (pip install -e . in a
+#     system venv, OR cp the venv shim to /usr/local/bin, OR adjust ExecStart).
+#   * The config lives at /etc/hound.toml.
+#   * SQLite + logs live under StateDirectory/LogsDirectory (managed by
+#     systemd; you don't have to create them).
+#   * tcpdump is on PATH. We grant the unit CAP_NET_RAW + CAP_NET_ADMIN
+#     instead of running as root — tcpdump only needs those two caps.
+
+[Unit]
+Description=SurveillanceHound — NVR / IP-camera network monitor
+Documentation=https://github.com/RNAX0N/surveillancehound
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hound run /etc/hound.toml
+Restart=always
+RestartSec=5s
+
+# Drop privileges. CAP_NET_RAW + CAP_NET_ADMIN are what tcpdump needs to
+# capture packets; AmbientCapabilities gives them to child processes too.
+# Alternative: keep User=root and remove these — simpler, less isolated.
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# State + logs (systemd creates and chowns these to the dynamic UID)
+StateDirectory=surveillancehound
+LogsDirectory=surveillancehound
+ConfigurationDirectory=surveillancehound
+RuntimeDirectory=surveillancehound
+
+# Hardening — block access to anything we don't need
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+PrivateTmp=yes
+PrivateDevices=no                 # tcpdump needs /dev/bpf* on BSD; harmless on Linux
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# Allow network syscalls (tcpdump needs them); block raw filesystem mounts etc.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @debug @cpu-emulation @obsolete
+
+# Resource bounds — defensive, not aggressive
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

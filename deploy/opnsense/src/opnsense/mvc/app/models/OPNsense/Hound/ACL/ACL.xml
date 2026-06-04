@@ -1,0 +1,10 @@
+<acl>
+    <page-services-hound>
+        <name>Services: SurveillanceHound</name>
+        <description>Allow access to the SurveillanceHound settings and dashboard.</description>
+        <patterns>
+            <pattern>ui/hound/*</pattern>
+            <pattern>api/hound/*</pattern>
+        </patterns>
+    </page-services-hound>
+</acl>

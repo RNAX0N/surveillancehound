@@ -1,0 +1,94 @@
+<model>
+    <mount>//OPNsense/Hound</mount>
+    <description>SurveillanceHound — IP-camera network monitor</description>
+    <version>0.1</version>
+    <items>
+        <general>
+            <enabled type="BooleanField">
+                <default>0</default>
+                <Required>Y</Required>
+            </enabled>
+            <interface type="InterfaceField">
+                <Required>Y</Required>
+                <Multiple>N</Multiple>
+            </interface>
+            <bpf type="TextField">
+                <Required>N</Required>
+            </bpf>
+            <snaplen type="IntegerField">
+                <default>96</default>
+                <MinimumValue>64</MinimumValue>
+                <MaximumValue>65535</MaximumValue>
+            </snaplen>
+        </general>
+        <network>
+            <camera_ips type="CSVListField">
+                <Required>N</Required>
+                <ValidationMessage>One IP per entry; comma-separated.</ValidationMessage>
+            </camera_ips>
+            <camera_subnets type="CSVListField">
+                <Required>N</Required>
+            </camera_subnets>
+            <nvr_ips type="CSVListField">
+                <Required>N</Required>
+            </nvr_ips>
+            <manufacturer_allowlist type="CSVListField">
+                <Required>N</Required>
+            </manufacturer_allowlist>
+        </network>
+        <baseline>
+            <enabled type="BooleanField">
+                <default>0</default>
+            </enabled>
+            <z_threshold type="NumericField">
+                <default>4.0</default>
+                <MinimumValue>1.0</MinimumValue>
+                <MaximumValue>20.0</MaximumValue>
+            </z_threshold>
+            <min_samples type="IntegerField">
+                <default>100</default>
+                <MinimumValue>5</MinimumValue>
+                <MaximumValue>100000</MaximumValue>
+            </min_samples>
+        </baseline>
+        <snapshot>
+            <enabled type="BooleanField">
+                <default>0</default>
+            </enabled>
+            <window_seconds type="NumericField">
+                <default>60.0</default>
+                <MinimumValue>5.0</MinimumValue>
+                <MaximumValue>3600.0</MaximumValue>
+            </window_seconds>
+            <min_severity type="OptionField">
+                <default>medium</default>
+                <OptionValues>
+                    <info>info</info>
+                    <low>low</low>
+                    <medium>medium</medium>
+                    <high>high</high>
+                    <critical>critical</critical>
+                </OptionValues>
+            </min_severity>
+        </snapshot>
+        <web>
+            <enabled type="BooleanField">
+                <default>1</default>
+            </enabled>
+            <host type="HostnameField">
+                <default>127.0.0.1</default>
+            </host>
+            <port type="PortField">
+                <default>8080</default>
+            </port>
+            <cert_file type="TextField">
+                <Required>N</Required>
+                <Mask>/^([\/].*|)$/u</Mask>
+            </cert_file>
+            <key_file type="TextField">
+                <Required>N</Required>
+                <Mask>/^([\/].*|)$/u</Mask>
+            </key_file>
+        </web>
+    </items>
+</model>

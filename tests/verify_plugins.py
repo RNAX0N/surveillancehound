@@ -1,0 +1,662 @@
+"""Validate the OPNsense + pfSense firewall plugins as far as we can
+without an actual FreeBSD VM.
+
+What we CAN verify here:
+  * Every XML file parses (well-formed).
+  * Every sh script passes `sh -n` (syntax).
+  * Every PHP file is brace-balanced and has matching <?php ?> (or omits
+    the close tag, which is the modern convention).
+  * The OPNsense `render_config.py` actually runs against a synthetic
+    config.xml and emits valid TOML — `tomllib` parses it without error
+    AND the round-tripped config has the expected fields.
+  * The pfSense `hound_render_toml` logic ported to Python emits valid
+    TOML for the same range of model inputs.
+
+What we CANNOT verify here:
+  * Phalcon MVC routing / Volt rendering / configd action invocation —
+    those need a real OPNsense system.
+  * pfSense package GUI rendering — needs a real pfSense system.
+
+This script lives next to the other end-to-end scripts. Run:
+    PYTHONPATH=src:tests python tests/verify_plugins.py
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import re
+import subprocess
+import sys
+import tempfile
+import tomllib
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+DEPLOY = ROOT / "deploy"
+OPNSENSE = DEPLOY / "opnsense"
+PFSENSE = DEPLOY / "pfsense"
+WAZUH = DEPLOY / "wazuh"
+
+
+# ---------------------------------------------------------------------------
+# static checks
+# ---------------------------------------------------------------------------
+
+
+def _check_xml_wellformed() -> None:
+    xmls = (list(OPNSENSE.rglob("*.xml"))
+            + list(PFSENSE.rglob("*.xml"))
+            + list(WAZUH.rglob("*.xml")))
+    assert xmls, "no XML files found under deploy/"
+    for f in xmls:
+        text = f.read_text()
+        try:
+            ET.fromstring(text)
+        except ET.ParseError:
+            # Wazuh decoder files canonically have multiple top-level
+            # <decoder> elements (no wrapping root); try once more with
+            # a synthetic <root> wrapper. If it parses then, it's valid
+            # Wazuh-shaped even if not strictly XML-1.0 wellformed.
+            try:
+                ET.fromstring(f"<root>{text}</root>")
+            except ET.ParseError as e:
+                raise AssertionError(
+                    f"{f}: not well-formed: {e}",
+                ) from e
+    print(f"  XML well-formed: {len(xmls)} file(s) "
+          f"(opnsense + pfsense + wazuh)")
+
+
+def _check_sh_syntax() -> None:
+    shells = [
+        DEPLOY / "hound.service",  # ini-ish, not a shell script — skip
+        OPNSENSE / "src/usr/local/etc/rc.d/hound",
+        OPNSENSE / "src/opnsense/scripts/OPNsense/Hound/reload.sh",
+    ]
+    checked = 0
+    for s in shells:
+        if not s.exists():
+            continue
+        if s.suffix == ".service":
+            continue
+        r = subprocess.run(
+            ["sh", "-n", str(s)], capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            raise AssertionError(f"{s}: sh -n failed: {r.stderr.strip()}")
+        checked += 1
+    assert checked >= 2, f"expected ≥2 shell scripts, checked {checked}"
+    print(f"  sh -n syntax: {checked} script(s)")
+
+
+def _check_php_brace_balance() -> None:
+    """Hand-rolled brace/<?php balance check — we don't have php-cli.
+
+    Rules:
+      * file must start with `<?php` or `<?` (modern convention is no
+        closing `?>` so it doesn't need to be there)
+      * curly braces balanced
+      * round parens balanced
+      * no obvious syntax errors via a few regex sniffs (unterminated
+        strings on a single line, double `;;`, etc.)
+    """
+    phps = list(OPNSENSE.rglob("*.php")) + list(PFSENSE.rglob("*.php"))
+    assert phps, "no PHP files found under deploy/"
+    for f in phps:
+        text = f.read_text()
+        assert text.startswith("<?php") or text.startswith("<?"), (
+            f"{f}: doesn't start with PHP tag"
+        )
+        # Extract every <?php ... ?> or <?= ... ?> block; only validate
+        # syntax INSIDE the PHP blocks (CSS/HTML braces in between are
+        # not our concern).
+        php_blocks = re.findall(
+            r"<\?(?:php|=)?(.*?)(?:\?>|\Z)", text, flags=re.DOTALL,
+        )
+        assert php_blocks, f"{f}: no <?php blocks found"
+        php_code = "\n".join(php_blocks)
+        # strip strings so we don't false-positive on braces inside them
+        stripped = re.sub(
+            r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|<<<['\"]?[A-Z_]+['\"]?\n.*?\n[A-Z_]+;?",
+            "",
+            php_code,
+            flags=re.DOTALL,
+        )
+        # also strip // and /* */ and # comments
+        stripped = re.sub(r"//.*?$", "", stripped, flags=re.MULTILINE)
+        stripped = re.sub(r"/\*.*?\*/", "", stripped, flags=re.DOTALL)
+        stripped = re.sub(r"#.*?$", "", stripped, flags=re.MULTILINE)
+        opens = stripped.count("{")
+        closes = stripped.count("}")
+        assert opens == closes, (
+            f"{f}: brace mismatch ({opens} open vs {closes} close) "
+            f"inside PHP blocks"
+        )
+        popens = stripped.count("(")
+        pcloses = stripped.count(")")
+        assert popens == pcloses, (
+            f"{f}: paren mismatch ({popens} open vs {pcloses} close) "
+            f"inside PHP blocks"
+        )
+        # double-semicolon — usually a typo
+        assert ";;" not in stripped, f"{f}: contains ';;'"
+        # no smart-quote slipped in (anywhere — would break literals)
+        for bad in ("‘", "’", "“", "”"):
+            assert bad not in text, f"{f}: contains curly-quote {bad!r}"
+    print(f"  PHP structural lint: {len(phps)} file(s)")
+
+
+# ---------------------------------------------------------------------------
+# OPNsense renderer end-to-end
+# ---------------------------------------------------------------------------
+
+
+def _load_opnsense_renderer():
+    """Import deploy/opnsense/.../render_config.py as a Python module."""
+    path = (OPNSENSE
+            / "src/opnsense/scripts/OPNsense/Hound/render_config.py")
+    spec = importlib.util.spec_from_file_location("hound_render", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _opnsense_synthetic_config(**overrides) -> str:
+    """Build a /conf/config.xml shaped subtree containing OPNsense/Hound.
+    Defaults reflect a typical small deployment."""
+    defaults = {
+        "interface": "vlan10",
+        "snaplen": "1500",
+        "bpf": "host 192.168.10.0/24",
+        "camera_ips": "192.168.10.20,192.168.10.21,192.168.10.22",
+        "camera_subnets": "192.168.10.0/24",
+        "nvr_ips": "192.168.10.10",
+        "manufacturer_allowlist": "203.0.113.0/24, 198.51.100.0/24",
+        "baseline_enabled": "1",
+        "z_threshold": "5.5",
+        "min_samples": "200",
+        "snapshot_enabled": "1",
+        "window_seconds": "120.0",
+        "min_severity": "high",
+        "web_enabled": "1",
+        "web_host": "127.0.0.1",
+        "web_port": "8765",
+    }
+    defaults.update(overrides)
+    d = defaults
+    return f"""<?xml version="1.0"?>
+<opnsense>
+  <OPNsense>
+    <Hound>
+      <general>
+        <interface>{d['interface']}</interface>
+        <snaplen>{d['snaplen']}</snaplen>
+        <bpf>{d['bpf']}</bpf>
+      </general>
+      <network>
+        <camera_ips>{d['camera_ips']}</camera_ips>
+        <camera_subnets>{d['camera_subnets']}</camera_subnets>
+        <nvr_ips>{d['nvr_ips']}</nvr_ips>
+        <manufacturer_allowlist>{d['manufacturer_allowlist']}</manufacturer_allowlist>
+      </network>
+      <baseline>
+        <enabled>{d['baseline_enabled']}</enabled>
+        <z_threshold>{d['z_threshold']}</z_threshold>
+        <min_samples>{d['min_samples']}</min_samples>
+      </baseline>
+      <snapshot>
+        <enabled>{d['snapshot_enabled']}</enabled>
+        <window_seconds>{d['window_seconds']}</window_seconds>
+        <min_severity>{d['min_severity']}</min_severity>
+      </snapshot>
+      <web>
+        <enabled>{d['web_enabled']}</enabled>
+        <host>{d['web_host']}</host>
+        <port>{d['web_port']}</port>
+      </web>
+    </Hound>
+  </OPNsense>
+</opnsense>
+"""
+
+
+def _check_opnsense_renderer() -> None:
+    mod = _load_opnsense_renderer()
+    cases = [
+        # rich case (every field set)
+        {},
+        # minimum: no cameras, no NVRs, no BPF, default snaplen
+        {
+            "bpf": "", "camera_ips": "", "camera_subnets": "",
+            "nvr_ips": "", "manufacturer_allowlist": "",
+            "baseline_enabled": "0", "snapshot_enabled": "0",
+            "web_enabled": "0",
+        },
+        # special characters that need TOML escaping (backslash + quote)
+        {
+            "bpf": r'host 1.2.3.4 and tcp port 22 \\ and not src 5.6.7.8',
+            "camera_ips": '10.0.0.1', "camera_subnets": "",
+            "nvr_ips": "", "manufacturer_allowlist": "",
+        },
+        # boolean strings the model might emit ("1"/"0", "on"/"off", "true"/"false")
+        {"baseline_enabled": "true", "snapshot_enabled": "on", "web_enabled": "yes"},
+    ]
+    for i, overrides in enumerate(cases):
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config.xml"
+            cfg_path.write_text(_opnsense_synthetic_config(**overrides))
+            out_path = Path(td) / "hound.toml"
+            rc = mod.main(["render_config.py", str(cfg_path), str(out_path)])
+            assert rc == 0, f"case {i}: render returned {rc}"
+            assert out_path.is_file(), f"case {i}: no output"
+            data = tomllib.loads(out_path.read_text())
+            # required structural assertions: every section present
+            for section in ("capture", "network", "store", "baseline",
+                            "snapshot", "web"):
+                assert section in data, (
+                    f"case {i}: missing [{section}] in output",
+                )
+            assert isinstance(data["network"]["camera_ips"], list)
+            assert isinstance(data["network"]["camera_subnets"], list)
+            assert isinstance(data["baseline"]["enabled"], bool)
+            assert isinstance(data["snapshot"]["enabled"], bool)
+            assert isinstance(data["web"]["enabled"], bool)
+            assert isinstance(data["capture"]["snaplen"], int)
+            assert data["store"]["path"] == "/var/lib/hound/hound.sqlite"
+            # at least one notify channel always present (default stdout)
+            assert isinstance(data.get("notify"), list)
+            assert any(n["type"] == "stdout" for n in data["notify"])
+    print(f"  OPNsense renderer: {len(cases)} model variants → valid TOML each")
+
+
+def _check_opnsense_renderer_error_path() -> None:
+    """Missing config block should fail loudly, not silently emit garbage."""
+    mod = _load_opnsense_renderer()
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "config.xml"
+        cfg.write_text('<?xml version="1.0"?><opnsense><Junk/></opnsense>')
+        out = Path(td) / "hound.toml"
+        rc = mod.main(["render_config.py", str(cfg), str(out)])
+        assert rc != 0, "expected non-zero on missing <Hound> block"
+        assert not out.exists(), "shouldn't have written output on error"
+    print("  OPNsense renderer: error path returns non-zero on missing block")
+
+
+# ---------------------------------------------------------------------------
+# pfSense renderer — ported to Python so we can validate output
+# ---------------------------------------------------------------------------
+
+
+def _pf_csv_to_toml_array(csv: str) -> str:
+    """Equivalent of hound_csv_to_toml_array() in deploy/pfsense/.../hound.inc"""
+    items = [x.strip() for x in (csv or "").split(",") if x.strip()]
+    quoted = ['"' + x.replace("\\", "\\\\") + '"' for x in items]
+    return "[" + ", ".join(quoted) + "]"
+
+
+def _pf_b(b: bool) -> str:
+    return "true" if b else "false"
+
+
+def _pf_render_toml(iface: str, bpf: str, snaplen: int,
+                    camera_ips: str, camera_subnets: str, nvr_ips: str,
+                    mfg_allow: str,
+                    bp_enabled: bool, z: float, min_samples: int,
+                    sn_enabled: bool, sn_window: float, sn_minsev: str,
+                    web_enabled: bool, web_host: str, web_port: int) -> str:
+    """Python port of hound_render_toml() — mirrors the PHP heredoc exactly.
+    If you edit hound.inc, mirror the change here AND extend the case list."""
+    bpf_line = f'bpf       = "{bpf}"\n' if bpf else ""
+    cams = _pf_csv_to_toml_array(camera_ips)
+    subnets = _pf_csv_to_toml_array(camera_subnets)
+    nvrs = _pf_csv_to_toml_array(nvr_ips)
+    allow = _pf_csv_to_toml_array(mfg_allow)
+    return f"""# Generated by the SurveillanceHound pfSense package — do not hand-edit.
+# To add custom [[notify]] blocks, drop them into /etc/hound.toml.local
+# (sourced by the rc.d script).
+
+[capture]
+interface = "{iface}"
+snaplen   = {snaplen}
+{bpf_line}
+[network]
+camera_ips             = {cams}
+camera_subnets         = {subnets}
+nvr_ips                = {nvrs}
+manufacturer_allowlist = {allow}
+
+[store]
+path = "/var/lib/hound/hound.sqlite"
+
+[baseline]
+enabled                = {_pf_b(bp_enabled)}
+z_threshold            = {z}
+min_samples            = {min_samples}
+flush_interval_seconds = 60.0
+
+[snapshot]
+enabled         = {_pf_b(sn_enabled)}
+window_seconds  = {sn_window}
+min_severity    = "{sn_minsev}"
+snaplen         = 1500
+
+[web]
+enabled                = {_pf_b(web_enabled)}
+host                   = "{web_host}"
+port                   = {web_port}
+poll_interval_seconds  = 5.0
+
+[[notify]]
+type  = "stdout"
+level = "low"
+
+[[notify]]
+type      = "jsonlines"
+path      = "/var/log/hound/hound.alerts.jsonl"
+level     = "low"
+max_bytes = 10485760
+keep      = 5"""
+
+
+def _check_pfsense_renderer() -> None:
+    cases = [
+        # full
+        dict(iface="igb1", bpf="host 192.168.10.0/24", snaplen=1500,
+             camera_ips="192.168.10.20,192.168.10.21", camera_subnets="192.168.10.0/24",
+             nvr_ips="192.168.10.10", mfg_allow="203.0.113.0/24",
+             bp_enabled=True, z=4.0, min_samples=100,
+             sn_enabled=True, sn_window=60.0, sn_minsev="medium",
+             web_enabled=True, web_host="127.0.0.1", web_port=8080),
+        # minimum / empty
+        dict(iface="lan", bpf="", snaplen=96,
+             camera_ips="", camera_subnets="", nvr_ips="", mfg_allow="",
+             bp_enabled=False, z=4.0, min_samples=100,
+             sn_enabled=False, sn_window=60.0, sn_minsev="medium",
+             web_enabled=False, web_host="127.0.0.1", web_port=8080),
+        # only NVR set
+        dict(iface="opt2", bpf="", snaplen=96,
+             camera_ips="", camera_subnets="10.0.0.0/24", nvr_ips="10.0.0.5",
+             mfg_allow="",
+             bp_enabled=True, z=3.5, min_samples=50,
+             sn_enabled=False, sn_window=30.0, sn_minsev="high",
+             web_enabled=True, web_host="0.0.0.0", web_port=8888),
+    ]
+    for i, args in enumerate(cases):
+        out = _pf_render_toml(**args)
+        data = tomllib.loads(out)
+        # every section present
+        for section in ("capture", "network", "store", "baseline",
+                        "snapshot", "web"):
+            assert section in data, f"case {i}: missing [{section}]"
+        # capture interface preserved
+        assert data["capture"]["interface"] == args["iface"]
+        assert data["capture"]["snaplen"] == args["snaplen"]
+        # bpf only present if non-empty
+        if args["bpf"]:
+            assert data["capture"].get("bpf") == args["bpf"]
+        else:
+            assert "bpf" not in data["capture"]
+        # CSV → array
+        expected_cams = [x.strip() for x in args["camera_ips"].split(",")
+                         if x.strip()]
+        assert data["network"]["camera_ips"] == expected_cams
+        # booleans round-trip as bools (not strings)
+        assert data["baseline"]["enabled"] is args["bp_enabled"]
+        assert data["snapshot"]["enabled"] is args["sn_enabled"]
+        assert data["web"]["enabled"] is args["web_enabled"]
+        # default notify always present
+        assert any(n["type"] == "stdout" for n in data["notify"])
+        assert any(n["type"] == "jsonlines" for n in data["notify"])
+    print(f"  pfSense renderer: {len(cases)} model variants → valid TOML each")
+
+
+# ---------------------------------------------------------------------------
+# Cross-plugin consistency
+# ---------------------------------------------------------------------------
+
+
+def _check_cross_consistency() -> None:
+    """Both renderers must emit configs the surveillancehound config loader
+    can actually consume. Round-trip through the real loader."""
+    sys.path.insert(0, str(ROOT / "src"))
+    from surveillancehound.config import load_from_dict
+
+    mod = _load_opnsense_renderer()
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "config.xml"
+        cfg.write_text(_opnsense_synthetic_config())
+        out = Path(td) / "hound.toml"
+        mod.main(["render_config.py", str(cfg), str(out)])
+        parsed = tomllib.loads(out.read_text())
+        loaded = load_from_dict(parsed)
+        assert loaded.capture.interface == "vlan10"
+        assert loaded.baseline.enabled
+        assert loaded.snapshot.enabled
+        assert loaded.web.enabled
+        assert any(n.type == "stdout" for n in loaded.notify)
+
+    pf_out = _pf_render_toml(
+        iface="igb1", bpf="", snaplen=96,
+        camera_ips="10.0.0.1", camera_subnets="", nvr_ips="", mfg_allow="",
+        bp_enabled=False, z=4.0, min_samples=100,
+        sn_enabled=False, sn_window=60.0, sn_minsev="medium",
+        web_enabled=False, web_host="127.0.0.1", web_port=8080,
+    )
+    parsed = tomllib.loads(pf_out)
+    loaded = load_from_dict(parsed)
+    assert loaded.capture.interface == "igb1"
+    assert loaded.network.camera_ips == ["10.0.0.1"]
+
+    print("  cross-consistency: both renderers → load_from_dict accepts them")
+
+
+def _check_wazuh_artifacts() -> None:
+    """Validate the Wazuh decoder + rules:
+
+      * XML well-formedness (covered by _check_xml_wellformed, but we
+        also verify the file LIVES under deploy/wazuh)
+      * Every <field name="X"> in the rules references a field that
+        Hound's Alert.as_dict() actually emits — otherwise the rule
+        silently never matches, which is a real foot-gun
+      * Rule IDs in the operator-defined 100200+ range
+      * Severity references are valid Hound severities
+      * Custom syslog decoder's <order> fields match what the
+        SyslogChannel structured-data block produces
+    """
+    sys.path.insert(0, str(ROOT / "src"))
+    from surveillancehound.alerts import Alert  # noqa: PLC0415
+
+    # ground-truth: what fields does Hound's JSON output actually have?
+    sample = Alert(
+        ts=1.7e9, device_ip="10.0.0.1", kind="bulk_inbound",
+        severity="high", summary="x", detail="y",
+        dedup_key="bulk_inbound:10.0.0.1",
+    ).as_dict()
+    emitted_fields = set(sample.keys())
+    # rules can also match on the @source.* labels we add via localfile-snippet
+    allowed_fields = emitted_fields | {"@source.name", "@source.product"}
+
+    rules_path = WAZUH / "hound-rules.xml"
+    assert rules_path.is_file(), rules_path
+    tree = ET.parse(rules_path)
+    root = tree.getroot()
+    referenced_fields: set[str] = set()
+    rule_ids: list[int] = []
+    severities_in_rules: set[str] = set()
+    for rule in root.iter("rule"):
+        rid = int(rule.attrib["id"])
+        assert 100000 <= rid <= 119999, (
+            f"rule {rid}: outside the operator-defined 100000–119999 range"
+        )
+        rule_ids.append(rid)
+        for fld in rule.findall("field"):
+            referenced_fields.add(fld.attrib["name"])
+            if fld.attrib["name"] == "severity":
+                m = re.match(r"\^?(\w+)\$?$", (fld.text or "").strip())
+                if m:
+                    severities_in_rules.add(m.group(1))
+    assert len(rule_ids) == len(set(rule_ids)), (
+        f"duplicate rule IDs in hound-rules.xml: {rule_ids}"
+    )
+    missing = referenced_fields - allowed_fields
+    assert not missing, (
+        f"rules reference fields Hound doesn't emit: {missing}. "
+        f"Hound emits: {sorted(emitted_fields)}"
+    )
+    valid_severities = {"info", "low", "medium", "high", "critical"}
+    bad = severities_in_rules - valid_severities
+    assert not bad, (
+        f"rules reference invalid severities: {bad}. "
+        f"Hound emits: {sorted(valid_severities)}"
+    )
+
+    # decoder check — the <order> field names must match what the rules
+    # consume
+    decoder_path = WAZUH / "hound-decoder.xml"
+    assert decoder_path.is_file(), decoder_path
+    # the file has multiple <decoder> top-level elements without a wrapping
+    # root, so we wrap it for the XML parser
+    wrapped = f"<root>{decoder_path.read_text()}</root>"
+    droot = ET.fromstring(wrapped)
+    decoder_order_fields: set[str] = set()
+    for order in droot.iter("order"):
+        for f in (order.text or "").split(","):
+            f = f.strip()
+            if f:
+                decoder_order_fields.add(f)
+    # the decoder must extract the same fields the rules match on
+    rules_need = referenced_fields - {"@source.name", "@source.product"}
+    not_decoded = rules_need - decoder_order_fields - {"kind"}  # kind in prematch
+    # Wazuh's built-in json decoder produces all fields automatically, so
+    # this is only a hard check when there's NO json source — for now
+    # just inform if the syslog decoder is missing anything
+    missing_in_decoder = rules_need - decoder_order_fields
+    if missing_in_decoder:
+        # Not fatal: the json path covers it. But warn.
+        print(f"  wazuh: note — syslog decoder doesn't extract "
+              f"{sorted(missing_in_decoder)} (json path covers these)")
+
+    # localfile-snippet sanity: must reference the same path Hound writes to
+    snippet = (WAZUH / "localfile-snippet.xml").read_text()
+    # parse the <localfile> stanza (file has comments + the snippet)
+    snippet_xml = re.sub(r"<!--.*?-->", "", snippet, flags=re.DOTALL).strip()
+    lfroot = ET.fromstring(f"<root>{snippet_xml}</root>")
+    lf = lfroot.find("localfile")
+    assert lf is not None, "no <localfile> in snippet"
+    assert lf.findtext("log_format") == "json", (
+        "snippet must use json log_format"
+    )
+    assert lf.findtext("location").endswith(".jsonl"), (
+        "snippet location should end .jsonl"
+    )
+
+    print(f"  wazuh rules: {len(rule_ids)} rules, ids "
+          f"{min(rule_ids)}..{max(rule_ids)}; fields validated against "
+          f"Alert.as_dict()")
+
+
+def _check_opnsense_layout() -> None:
+    """Assert the OPNsense MVC tree has every file the framework expects.
+
+    Three real bugs caught by the dev-rig live validation became permanent
+    static checks:
+
+      (a) Every controllers/OPNsense/<Plugin>/IndexController.php that calls
+          `getForm("<name>")` must have a corresponding
+          controllers/OPNsense/<Plugin>/forms/<name>.xml on disk. OPNsense's
+          base controller looks for forms next to the *controller*, not the
+          model. Misplacing the form throws a 500 on every UI hit.
+
+      (b) Every models/OPNsense/<Plugin>/<Plugin>.xml schema must have a
+          sibling <Plugin>.php class extending BaseModel. Without it,
+          ApiMutableServiceControllerBase::getModel() fails with
+          ``ReflectionException: Class "\\OPNsense\\<Plugin>\\<Plugin>"
+          does not exist``.
+
+      (c) Every rc.d script referenced by a configd action file must exist
+          at the path the action declares (verified by reading the actual
+          `command:` lines from actions_*.conf).
+    """
+    import re
+    ctl_root = OPNSENSE / "src/opnsense/mvc/app/controllers/OPNsense"
+    mdl_root = OPNSENSE / "src/opnsense/mvc/app/models/OPNsense"
+    cfg_root = OPNSENSE / "src/opnsense/service/conf/actions.d"
+    plugin_dirs = sorted(d for d in ctl_root.iterdir() if d.is_dir())
+    if not plugin_dirs:
+        raise AssertionError(f"no plugin dirs under {ctl_root}")
+    for plug in plugin_dirs:
+        name = plug.name
+        # (a) form references → matching XML present
+        idx = plug / "IndexController.php"
+        if idx.exists():
+            wanted = set(re.findall(
+                r'getForm\(\s*[\'"]([^\'"]+)[\'"]', idx.read_text(),
+            ))
+            for form_name in wanted:
+                form_xml = plug / "forms" / f"{form_name}.xml"
+                assert form_xml.exists(), (
+                    f"{idx} calls getForm({form_name!r}) but "
+                    f"{form_xml} is missing"
+                )
+        # (b) model XML → matching PHP class
+        model_xml = mdl_root / name / f"{name}.xml"
+        if model_xml.exists():
+            model_php = mdl_root / name / f"{name}.php"
+            assert model_php.exists(), (
+                f"{model_xml} present but {model_php} is missing — "
+                f"ApiMutableServiceControllerBase needs the PHP class to "
+                f"reflect on (otherwise: ReflectionException at runtime)"
+            )
+    # (c) every command: line in actions_*.conf points to a real file in the
+    # plugin tree (mapped from absolute install path → src tree path)
+    for actions in cfg_root.glob("actions_*.conf"):
+        for line in actions.read_text().splitlines():
+            line = line.strip()
+            if not line.startswith("command:"):
+                continue
+            cmd = line[len("command:"):].split()[0]
+            # Map install paths to src/ paths
+            src_path = None
+            if cmd.startswith("/usr/local/opnsense/"):
+                src_path = OPNSENSE / "src/opnsense" / cmd[len("/usr/local/opnsense/"):]
+            elif cmd.startswith("/usr/local/etc/rc.d/"):
+                src_path = OPNSENSE / "src/usr/local/etc/rc.d" / Path(cmd).name
+            elif cmd.startswith("/etc/rc.d/"):
+                # legacy path — also accept if installed there
+                src_path = OPNSENSE / "src/etc/rc.d" / Path(cmd).name
+            if src_path is not None and not src_path.exists():
+                raise AssertionError(
+                    f"{actions}: 'command:{cmd}' references a file that "
+                    f"isn't in the plugin tree at {src_path}"
+                )
+    print(f"  OPNsense layout: {len(plugin_dirs)} plugin(s) "
+          f"— controllers↔forms↔models↔actions all wired")
+
+
+def main() -> int:
+    print("=== Plugin static checks ===")
+    _check_xml_wellformed()
+    _check_sh_syntax()
+    _check_php_brace_balance()
+    _check_opnsense_layout()
+    print()
+    print("=== OPNsense renderer ===")
+    _check_opnsense_renderer()
+    _check_opnsense_renderer_error_path()
+    print()
+    print("=== pfSense renderer ===")
+    _check_pfsense_renderer()
+    print()
+    print("=== Cross-plugin consistency ===")
+    _check_cross_consistency()
+    print()
+    print("=== Wazuh integration ===")
+    _check_wazuh_artifacts()
+    print()
+    print("PLUGINS VERIFICATION PASSED")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

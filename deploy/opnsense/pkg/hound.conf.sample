@@ -1,0 +1,29 @@
+# SurveillanceHound pkg repository — durable, auto-updating install.
+#
+# Install this on the firewall as:
+#     /usr/local/etc/pkg/repos/hound.conf
+# then:
+#     fetch -o /usr/local/etc/pkg/repos/hound-repo.pub \
+#       https://rnax0n.github.io/surveillancehound/opnsense/hound-repo.pub
+#     pkg update
+#     pkg install os-hound
+#
+# After this, `os-hound` upgrades alongside everything else (`pkg upgrade`) and
+# is far more likely to survive OPNsense firmware updates than a one-off
+# `pkg add` of a release asset — because it's a real, configured repository.
+#
+# The `url` must point at the directory containing meta.conf + packagesite.*
+# (what the workflow publishes to GitHub Pages). NOTE: GitHub Pages serves only
+# from PUBLIC repos on free plans — surveillancehound is private, so until it's
+# made public (or you host the repo elsewhere) this Tier-C path won't resolve.
+#
+# IMPORTANT: keep `enabled: yes` only for this third-party repo; do NOT disable
+# OPNsense's own repositories, or firmware updates break.
+
+hound: {
+  url: "https://rnax0n.github.io/surveillancehound/opnsense",
+  mirror_type: "none",
+  signature_type: "pubkey",
+  pubkey: "/usr/local/etc/pkg/repos/hound-repo.pub",
+  enabled: yes
+}

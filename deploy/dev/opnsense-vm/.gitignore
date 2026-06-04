@@ -1,0 +1,10 @@
+cache/
+var/
+*.qcow2
+*.img
+*.img.bz
+*.sock
+*.pid
+ssh_key
+ssh_key.pub
+console.log

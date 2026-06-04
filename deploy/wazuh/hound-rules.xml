@@ -1,0 +1,161 @@
+<!--
+    SurveillanceHound — Wazuh custom rules.
+
+    Drop in:
+        /var/ossec/etc/rules/local_hound_rules.xml
+
+    Then restart Wazuh:
+        systemctl restart wazuh-manager
+
+    Assumes you've added the localfile snippet from `localfile-snippet.xml`
+    so the Wazuh agent (or manager, depending on where Hound runs) is
+    parsing `/var/log/hound/hound.alerts.jsonl` as JSON.
+
+    Rule IDs use the operator-defined range 100200–100299. Renumber to
+    avoid collisions if you already use that range.
+
+    Severity mapping (Hound → Wazuh level):
+        info     → 3   (informational; usually filtered)
+        low      → 5   (notice)
+        medium   → 8   (alert)
+        high     → 11  (high; pages on-call by default)
+        critical → 13  (critical; pages everyone)
+
+    Per-kind rules layer on top (specific kind matches override the
+    generic severity rule by inheriting + raising the level when the
+    threat model warrants it). MITRE ATT&CK tags let SOC dashboards
+    pivot Hound alerts alongside other detections.
+-->
+<group name="surveillancehound,nvr,camera,">
+
+    <!-- Anchor rule: anything coming from the Hound jsonlines log -->
+    <rule id="100200" level="0">
+        <decoded_as>json</decoded_as>
+        <field name="kind">\.+</field>
+        <field name="severity">\.+</field>
+        <field name="device_ip">\.+</field>
+        <description>SurveillanceHound: event anchor</description>
+    </rule>
+
+    <!-- Severity-only fallbacks (used when no per-kind rule matches) -->
+    <rule id="100201" level="3">
+        <if_sid>100200</if_sid>
+        <field name="severity">^info$</field>
+        <description>SurveillanceHound [info]: $(kind) on $(device_ip)</description>
+    </rule>
+    <rule id="100202" level="5">
+        <if_sid>100200</if_sid>
+        <field name="severity">^low$</field>
+        <description>SurveillanceHound [low]: $(kind) on $(device_ip)</description>
+    </rule>
+    <rule id="100203" level="8">
+        <if_sid>100200</if_sid>
+        <field name="severity">^medium$</field>
+        <description>SurveillanceHound [medium]: $(kind) on $(device_ip)</description>
+    </rule>
+    <rule id="100204" level="11">
+        <if_sid>100200</if_sid>
+        <field name="severity">^high$</field>
+        <description>SurveillanceHound [high]: $(kind) on $(device_ip)</description>
+    </rule>
+    <rule id="100205" level="13">
+        <if_sid>100200</if_sid>
+        <field name="severity">^critical$</field>
+        <description>SurveillanceHound [CRITICAL]: $(kind) on $(device_ip)</description>
+    </rule>
+
+    <!-- Per-kind specific rules. MITRE ATT&CK tags help SIEM dashboards -->
+
+    <rule id="100210" level="11">
+        <if_sid>100200</if_sid>
+        <field name="kind">^bulk_inbound$</field>
+        <description>SurveillanceHound: bulk transfer TOWARD camera $(device_ip) — possible firmware/model push</description>
+        <mitre>
+            <id>T1190</id>
+            <id>T1542</id>
+        </mitre>
+        <group>camera_manipulation,</group>
+    </rule>
+
+    <rule id="100211" level="10">
+        <if_sid>100200</if_sid>
+        <field name="kind">^control_channel_suspect$</field>
+        <description>SurveillanceHound: camera $(device_ip) holds C2-shaped session</description>
+        <mitre>
+            <id>T1071</id>
+            <id>T1095</id>
+        </mitre>
+        <group>command_and_control,</group>
+    </rule>
+
+    <rule id="100212" level="8">
+        <if_sid>100200</if_sid>
+        <field name="kind">^telemetry_offnet$</field>
+        <description>SurveillanceHound: camera $(device_ip) telemetry to non-allowlisted host</description>
+        <mitre>
+            <id>T1041</id>
+        </mitre>
+        <group>exfiltration,</group>
+    </rule>
+
+    <rule id="100213" level="8">
+        <if_sid>100200</if_sid>
+        <field name="kind">^behavioral_anomaly$</field>
+        <description>SurveillanceHound: behavioral anomaly on camera $(device_ip)</description>
+        <mitre>
+            <id>T1499</id>
+        </mitre>
+        <group>anomaly_detection,</group>
+    </rule>
+
+    <rule id="100214" level="5">
+        <if_sid>100200</if_sid>
+        <field name="kind">^new_device$</field>
+        <description>SurveillanceHound: new device on segment — $(device_ip)</description>
+        <mitre>
+            <id>T1078</id>
+        </mitre>
+        <group>discovery,</group>
+    </rule>
+
+    <rule id="100215" level="5">
+        <if_sid>100200</if_sid>
+        <field name="kind">^new_peer$</field>
+        <description>SurveillanceHound: camera $(device_ip) contacted new peer</description>
+        <group>discovery,</group>
+    </rule>
+
+    <rule id="100216" level="8">
+        <if_sid>100200</if_sid>
+        <field name="kind">^camera_offline$</field>
+        <description>SurveillanceHound: camera $(device_ip) silent — possibly offline</description>
+        <mitre>
+            <id>T1499</id>
+        </mitre>
+        <group>availability,</group>
+    </rule>
+
+    <!-- Correlation rule: repeated high-severity Hound alerts on one
+         camera within 5 minutes suggests an active incident, not a
+         false positive. Bump to level 13. -->
+    <rule id="100220" level="13" frequency="3" timeframe="300">
+        <if_matched_sid>100210</if_matched_sid>
+        <same_field>device_ip</same_field>
+        <description>SurveillanceHound: SUSTAINED bulk_inbound on camera $(device_ip) — 3+ events in 5 min</description>
+        <mitre>
+            <id>T1190</id>
+        </mitre>
+        <group>camera_manipulation,active_incident,</group>
+    </rule>
+
+    <rule id="100221" level="13" frequency="3" timeframe="300">
+        <if_matched_sid>100211</if_matched_sid>
+        <same_field>device_ip</same_field>
+        <description>SurveillanceHound: SUSTAINED C2-shaped session on camera $(device_ip) — 3+ events in 5 min</description>
+        <mitre>
+            <id>T1071</id>
+        </mitre>
+        <group>command_and_control,active_incident,</group>
+    </rule>
+
+</group>

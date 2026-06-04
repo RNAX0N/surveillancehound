@@ -72,6 +72,49 @@ class AlertRow:
     notified_channels: str = ""
 
 
+@dataclass
+class SnapshotRow:
+    """One pcap snapshot dumped on alert. `path` is on the local fs."""
+    id: int | None
+    alert_id: int
+    camera_ip: str
+    path: str
+    byte_count: int
+    packet_count: int
+    created_at: float
+
+
+@dataclass
+class BaselineRow:
+    """One Welford bucket — per (camera_ip, weekday, hour, feature)."""
+    camera_ip: str
+    weekday: int   # 0..6 (Monday..Sunday, per datetime.weekday())
+    hour: int      # 0..23 (local time)
+    feature: str
+    n: int
+    mean: float
+    m2: float
+    last_updated: float
+
+
+@dataclass
+class BaselineForestRow:
+    """One Half-Space Forest serialized to a blob — per (camera_ip, weekday, hour).
+
+    The whole forest is one row per bucket (versus Welford's per-feature
+    rows) because the trees score features jointly and the leaf-mass arrays
+    don't decompose. ``blob`` is whatever ``HSForest.serialize()`` returned.
+    """
+    camera_ip: str
+    weekday: int
+    hour: int
+    n_samples: int
+    n_samples_in_window: int
+    has_reference: bool
+    blob: bytes
+    last_updated: float
+
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS devices (
     ip            TEXT PRIMARY KEY,
@@ -126,6 +169,42 @@ CREATE TABLE IF NOT EXISTS notifications (
     error           TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_alert ON notifications(alert_id);
+
+CREATE TABLE IF NOT EXISTS baselines (
+    camera_ip      TEXT NOT NULL,
+    weekday        INTEGER NOT NULL,
+    hour           INTEGER NOT NULL,
+    feature        TEXT NOT NULL,
+    n              INTEGER NOT NULL,
+    mean           REAL NOT NULL,
+    m2             REAL NOT NULL,
+    last_updated   REAL NOT NULL,
+    PRIMARY KEY (camera_ip, weekday, hour, feature)
+);
+
+CREATE TABLE IF NOT EXISTS baseline_forests (
+    camera_ip            TEXT NOT NULL,
+    weekday              INTEGER NOT NULL,
+    hour                 INTEGER NOT NULL,
+    n_samples            INTEGER NOT NULL,    -- cumulative samples ever seen
+    n_samples_in_window  INTEGER NOT NULL,    -- progress toward next rollover
+    has_reference        INTEGER NOT NULL,    -- 0|1, true after first rollover
+    blob                 BLOB NOT NULL,       -- compact serialized forest
+    last_updated         REAL NOT NULL,
+    PRIMARY KEY (camera_ip, weekday, hour)
+);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id      INTEGER NOT NULL,
+    camera_ip     TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    byte_count    INTEGER NOT NULL,
+    packet_count  INTEGER NOT NULL,
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_alert ON snapshots(alert_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_camera ON snapshots(camera_ip);
 """
 
 
@@ -273,6 +352,14 @@ class HoundStore:
             )
             return cur.lastrowid
 
+    def set_alert_channels(self, alert_id: int, channels: str) -> None:
+        """Record which channel types actually delivered an alert (audit trail)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE alerts SET notified_channels = ? WHERE id = ?",
+                (channels, alert_id),
+            )
+
     def list_alerts(self, *, limit: int = 50) -> list[AlertRow]:
         with self._lock:
             rows = self._conn.execute(
@@ -287,6 +374,220 @@ class HoundStore:
             )
             for r in rows
         ]
+
+    # ----- baselines -----
+
+    def load_baselines(
+        self, *, camera_ip: str | None = None
+    ) -> list[BaselineRow]:
+        """Return persisted Welford buckets. Filter by camera if given.
+        Sorted (camera, weekday, hour, feature) for stable display in the CLI."""
+        q = "SELECT * FROM baselines"
+        args: tuple = ()
+        if camera_ip:
+            q += " WHERE camera_ip = ?"
+            args = (camera_ip,)
+        q += " ORDER BY camera_ip, weekday, hour, feature"
+        with self._lock:
+            rows = self._conn.execute(q, args).fetchall()
+        return [
+            BaselineRow(
+                camera_ip=r["camera_ip"], weekday=r["weekday"], hour=r["hour"],
+                feature=r["feature"], n=r["n"], mean=r["mean"], m2=r["m2"],
+                last_updated=r["last_updated"],
+            )
+            for r in rows
+        ]
+
+    def delete_baselines(self, *, camera_ip: str | None = None) -> int:
+        """Wipe persisted buckets. Returns the rowcount. NOTE: a running
+        daemon still holds learned state in RAM and will re-upsert on the
+        next flush — stop the daemon first if you want a true reset.
+
+        Also wipes the HS-Forest rows for the same scope so a model switch
+        doesn't leave half-stale state behind."""
+        n = 0
+        args: tuple = ()
+        if camera_ip:
+            where = " WHERE camera_ip = ?"
+            args = (camera_ip,)
+        else:
+            where = ""
+        with self._lock, self._conn:
+            for table in ("baselines", "baseline_forests"):
+                cur = self._conn.execute(f"DELETE FROM {table}" + where, args)
+                n += cur.rowcount
+            return n
+
+    # ----- baseline forests (HS-Tree engine) -----
+
+    def load_forests(
+        self, *, camera_ip: str | None = None,
+    ) -> list[BaselineForestRow]:
+        """Return persisted HS-Forest rows, optionally filtered to one camera."""
+        q = "SELECT * FROM baseline_forests"
+        args: tuple = ()
+        if camera_ip:
+            q += " WHERE camera_ip = ?"
+            args = (camera_ip,)
+        q += " ORDER BY camera_ip, weekday, hour"
+        with self._lock:
+            rows = self._conn.execute(q, args).fetchall()
+        return [
+            BaselineForestRow(
+                camera_ip=r["camera_ip"], weekday=r["weekday"], hour=r["hour"],
+                n_samples=r["n_samples"],
+                n_samples_in_window=r["n_samples_in_window"],
+                has_reference=bool(r["has_reference"]),
+                blob=bytes(r["blob"]),
+                last_updated=r["last_updated"],
+            )
+            for r in rows
+        ]
+
+    def delete_forests(
+        self, *, camera_ip: str | None = None,
+        weekday: int | None = None, hour: int | None = None,
+    ) -> int:
+        """Wipe HS-Forest rows. Filter is conjunctive (all `not None` clauses
+        must match). Used both by the CLI reset path and by HSEngine to drop
+        rows that fail to deserialize (schema drift)."""
+        clauses: list[str] = []
+        args: list = []
+        if camera_ip is not None:
+            clauses.append("camera_ip = ?"); args.append(camera_ip)
+        if weekday is not None:
+            clauses.append("weekday = ?"); args.append(int(weekday))
+        if hour is not None:
+            clauses.append("hour = ?"); args.append(int(hour))
+        q = "DELETE FROM baseline_forests"
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
+        with self._lock, self._conn:
+            cur = self._conn.execute(q, tuple(args))
+            return cur.rowcount
+
+    def upsert_forests_batch(self, rows: list[BaselineForestRow]) -> None:
+        """Insert-or-replace every passed forest row in one transaction."""
+        if not rows:
+            return
+        with self._lock, self._conn:
+            self._conn.executemany(
+                """INSERT INTO baseline_forests (
+                    camera_ip, weekday, hour, n_samples,
+                    n_samples_in_window, has_reference, blob, last_updated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(camera_ip, weekday, hour) DO UPDATE SET
+                    n_samples = excluded.n_samples,
+                    n_samples_in_window = excluded.n_samples_in_window,
+                    has_reference = excluded.has_reference,
+                    blob = excluded.blob,
+                    last_updated = excluded.last_updated
+                """,
+                [
+                    (
+                        r.camera_ip, r.weekday, r.hour, r.n_samples,
+                        r.n_samples_in_window, 1 if r.has_reference else 0,
+                        r.blob, r.last_updated,
+                    )
+                    for r in rows
+                ],
+            )
+
+    def prune(
+        self, *, flows_older_than: float | None = None,
+        alerts_older_than: float | None = None,
+        notifications_older_than: float | None = None,
+    ) -> dict[str, int]:
+        """Delete old rows. Each cutoff is an epoch ts; rows with
+        last_seen/ts < cutoff are removed. Returns per-table rowcounts."""
+        deleted: dict[str, int] = {}
+        with self._lock, self._conn:
+            if flows_older_than is not None:
+                cur = self._conn.execute(
+                    "DELETE FROM flows WHERE last_seen < ?", (flows_older_than,)
+                )
+                deleted["flows"] = cur.rowcount
+            if alerts_older_than is not None:
+                cur = self._conn.execute(
+                    "DELETE FROM alerts WHERE ts < ?", (alerts_older_than,)
+                )
+                deleted["alerts"] = cur.rowcount
+            if notifications_older_than is not None:
+                cur = self._conn.execute(
+                    "DELETE FROM notifications WHERE attempted_at < ?",
+                    (notifications_older_than,),
+                )
+                deleted["notifications"] = cur.rowcount
+        # VACUUM must run outside a transaction
+        if any(deleted.values()):
+            with self._lock:
+                self._conn.execute("VACUUM")
+        return deleted
+
+    def upsert_baselines_batch(self, rows: list[BaselineRow]) -> None:
+        """Write back N dirty buckets in a single transaction. Called on the
+        baseliner's flush cadence — NOT per packet, NOT per flow."""
+        if not rows:
+            return
+        with self._lock, self._conn:
+            self._conn.executemany(
+                """INSERT INTO baselines (camera_ip, weekday, hour, feature,
+                                          n, mean, m2, last_updated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(camera_ip, weekday, hour, feature) DO UPDATE SET
+                       n = excluded.n,
+                       mean = excluded.mean,
+                       m2 = excluded.m2,
+                       last_updated = excluded.last_updated
+                """,
+                [
+                    (r.camera_ip, r.weekday, r.hour, r.feature,
+                     r.n, r.mean, r.m2, r.last_updated)
+                    for r in rows
+                ],
+            )
+
+    # ----- snapshots -----
+
+    def insert_snapshot(self, s: SnapshotRow) -> int:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """INSERT INTO snapshots (alert_id, camera_ip, path,
+                                          byte_count, packet_count, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (s.alert_id, s.camera_ip, s.path,
+                 s.byte_count, s.packet_count, s.created_at),
+            )
+            return cur.lastrowid
+
+    def list_snapshots(self, *, limit: int = 50) -> list[SnapshotRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM snapshots ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [
+            SnapshotRow(
+                id=r["id"], alert_id=r["alert_id"], camera_ip=r["camera_ip"],
+                path=r["path"], byte_count=r["byte_count"],
+                packet_count=r["packet_count"], created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def get_snapshot(self, snapshot_id: int) -> SnapshotRow | None:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM snapshots WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+        if r is None:
+            return None
+        return SnapshotRow(
+            id=r["id"], alert_id=r["alert_id"], camera_ip=r["camera_ip"],
+            path=r["path"], byte_count=r["byte_count"],
+            packet_count=r["packet_count"], created_at=r["created_at"],
+        )
 
     # ----- notifications -----
 

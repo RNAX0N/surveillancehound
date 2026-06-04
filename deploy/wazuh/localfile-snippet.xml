@@ -1,0 +1,21 @@
+<!--
+    SurveillanceHound — Wazuh agent ingestion snippet.
+
+    Add the contents of this file inside <ossec_config>...</ossec_config>
+    in /var/ossec/etc/ossec.conf on whichever host runs the Wazuh agent
+    co-located with Hound (typically the NVR or firewall itself).
+
+    Then restart the agent:
+        systemctl restart wazuh-agent
+
+    The agent will start tailing Hound's jsonlines log; Wazuh's built-in
+    json decoder parses each line into structured fields, and the rules
+    in hound-rules.xml fire on those fields.
+-->
+
+<localfile>
+    <log_format>json</log_format>
+    <location>/var/log/hound/hound.alerts.jsonl</location>
+    <label key="@source.name">surveillancehound</label>
+    <label key="@source.product">SurveillanceHound</label>
+</localfile>

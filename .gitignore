@@ -19,3 +19,6 @@ dist/
 # editor
 .idea/
 .vscode/
+
+# local dev config (use hound.toml.example as the template)
+/hound.toml

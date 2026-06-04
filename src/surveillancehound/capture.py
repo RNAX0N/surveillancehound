@@ -22,8 +22,10 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import threading
 from collections.abc import Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 from surveillancehound.config import CaptureCfg
 from surveillancehound.pcap import (
@@ -42,18 +44,23 @@ class CaptureError(RuntimeError):
 
 
 def stream_packets(
-    cfg: CaptureCfg,
+    cfg: CaptureCfg, *, keep_raw: bool = False, snaplen_override: int | None = None,
 ) -> tuple[Iterator[Packet], CaptureStats, "CaptureHandle"]:
     """Open a packet source (live or file) and yield Packets.
 
     Returns (generator, stats, handle). `handle.close()` releases the
     subprocess / file. Stats fill in as the generator is consumed.
+
+    `keep_raw=True` makes the parser preserve the original classic-pcap
+    record bytes on each Packet (used by the snapshot ring buffer).
+    `snaplen_override` bumps the capture snaplen — typically the snapshot
+    feature wants 1500 instead of the 96 bytes flow analysis needs.
     """
     if cfg.pcap_file:
         path = Path(cfg.pcap_file)
         if not path.is_file():
             raise CaptureError(f"pcap_file not found: {path}")
-        gen, stats = read_packets(path)
+        gen, stats = read_packets(path, keep_raw=keep_raw)
         return gen, stats, _FileHandle()
 
     if not cfg.interface:
@@ -64,11 +71,12 @@ def stream_packets(
             "the BSD ships it)."
         )
 
+    effective_snaplen = max(64, snaplen_override or cfg.snaplen)
     argv = [
         "tcpdump",
         "-i", cfg.interface,
         "-U",                                  # packet-buffered output
-        "-s", str(max(64, cfg.snaplen)),       # snaplen
+        "-s", str(effective_snaplen),          # snaplen
         "-n",                                  # no DNS
         "-w", "-",                             # pcap to stdout
     ]
@@ -77,12 +85,13 @@ def stream_packets(
     log.info("starting live capture: %s", " ".join(argv))
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+        start_new_session=True,
     )
     if proc.stdout is None:
         proc.kill()
         raise CaptureError("tcpdump subprocess produced no stdout")
     try:
-        gen, stats = read_packets_from_stream(proc.stdout)
+        gen, stats = read_packets_from_stream(proc.stdout, keep_raw=keep_raw)
     except PcapError as e:
         err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
         proc.kill()
@@ -90,7 +99,25 @@ def stream_packets(
         raise CaptureError(
             f"tcpdump did not produce a valid pcap stream: {e}\nstderr:\n{err}"
         ) from e
+    # Validation passed — now drain stderr on a daemon thread. A full PIPE
+    # buffer (~64KB) would block tcpdump's next stderr write and stall the
+    # whole daemon. Forwarding to the log keeps diagnostics visible.
+    if proc.stderr is not None:
+        threading.Thread(
+            target=_forward_stderr, args=(proc.stderr,),
+            name="tcpdump-stderr", daemon=True,
+        ).start()
     return gen, stats, _ProcHandle(proc)
+
+
+def _forward_stderr(stream: BinaryIO) -> None:
+    try:
+        for raw in iter(stream.readline, b""):
+            line = raw.decode(errors="replace").rstrip()
+            if line:
+                log.info("tcpdump: %s", line)
+    except (OSError, ValueError):
+        return  # pipe closed under us — the subprocess is going away
 
 
 # --- handles -----------------------------------------------------------------

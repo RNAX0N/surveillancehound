@@ -25,6 +25,7 @@ the first next-header, SLL2, exotic link types, truncated records.
 
 from __future__ import annotations
 
+import dataclasses
 import socket
 import struct
 from collections.abc import Iterator
@@ -49,7 +50,12 @@ _TCP_FLAG_BITS = [
 
 @dataclass(frozen=True)
 class Packet:
-    """One parsed packet — just the fields flow analysis needs."""
+    """One parsed packet — just the fields flow analysis needs.
+
+    When `keep_raw=True` is passed to the parser, `raw_record` holds the
+    original classic-pcap record (16-byte header + body) so the snapshot
+    writer can dump it back to a pcap file the operator can open in
+    Wireshark. None for pcapng input (we don't synthesize a classic record)."""
 
     ts: float  # epoch seconds (float)
     src_ip: str
@@ -59,6 +65,7 @@ class Packet:
     dst_port: int | None
     length: int  # original on-wire length in bytes
     tcp_flags: str  # e.g. "S", "SA", "" — empty for non-TCP
+    raw_record: bytes | None = None
 
 
 @dataclass
@@ -83,31 +90,44 @@ class PcapError(Exception):
 # --- public entry points -----------------------------------------------------
 
 
-def read_packets(path: Path) -> tuple[Iterator[Packet], CaptureStats]:
+def read_packets(
+    path: Path, *, keep_raw: bool = False,
+) -> tuple[Iterator[Packet], CaptureStats]:
     """Open a capture FILE and return (packet generator, stats)."""
     fh = path.open("rb")
-    return _read_from(fh, stream=False)
+    return _read_from(fh, stream=False, keep_raw=keep_raw)
 
 
 def read_packets_from_stream(
-    fh: BinaryIO,
+    fh: BinaryIO, *, keep_raw: bool = False,
 ) -> tuple[Iterator[Packet], CaptureStats]:
     """Read packets from a binary STREAM (e.g. tcpdump stdout).
 
     The stream must begin at the pcap / pcapng global header. The generator
     runs as long as the stream yields bytes — perfect for a live capture
     pipeline. The stream is NOT closed by the generator; the caller owns it.
+
+    When `keep_raw=True`, every yielded Packet carries its original classic
+    pcap record bytes in `raw_record` (classic pcap source only — pcapng
+    leaves it None). This is the snapshot ring buffer's input.
     """
-    return _read_from(fh, stream=True)
+    return _read_from(fh, stream=True, keep_raw=keep_raw)
 
 
-def _read_from(fh: BinaryIO, *, stream: bool) -> tuple[Iterator[Packet], CaptureStats]:
+def _read_from(
+    fh: BinaryIO, *, stream: bool, keep_raw: bool = False,
+) -> tuple[Iterator[Packet], CaptureStats]:
     magic = fh.read(4)
     stats = CaptureStats()
     if magic in (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4",
                  b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d"):
         stats.file_format = "pcap"
-        return _iter_pcap_after_magic(fh, magic, stats, close_fh=not stream), stats
+        return (
+            _iter_pcap_after_magic(
+                fh, magic, stats, close_fh=not stream, keep_raw=keep_raw,
+            ),
+            stats,
+        )
     if magic == b"\x0a\x0d\x0d\x0a":
         stats.file_format = "pcapng"
         return _iter_pcapng_after_magic(fh, stats, close_fh=not stream), stats
@@ -123,7 +143,8 @@ def _read_from(fh: BinaryIO, *, stream: bool) -> tuple[Iterator[Packet], Capture
 
 
 def _iter_pcap_after_magic(
-    fh: BinaryIO, magic: bytes, stats: CaptureStats, *, close_fh: bool
+    fh: BinaryIO, magic: bytes, stats: CaptureStats, *,
+    close_fh: bool, keep_raw: bool = False,
 ) -> Iterator[Packet]:
     try:
         rest = fh.read(20)
@@ -153,6 +174,8 @@ def _iter_pcap_after_magic(
                 stats.packets_skipped += 1
             else:
                 stats.packets_parsed += 1
+                if keep_raw:
+                    pkt = dataclasses.replace(pkt, raw_record=raw + data)
                 yield pkt
     finally:
         if close_fh:
@@ -353,14 +376,54 @@ def _with_transport(
     )
 
 
+# --- snapshot writer ---------------------------------------------------------
+
+
+# Classic pcap global header: LE, microsecond, Ethernet, snaplen=65535. We
+# emit this format for snapshots because (a) it's what tcpdump produces by
+# default, so the raw_records we captured already conform to it, and (b) it
+# opens cleanly in Wireshark on any platform.
+_PCAP_GLOBAL_HEADER = struct.pack(
+    "<IHHiIII",
+    0xA1B2C3D4,   # magic
+    2, 4,         # version major.minor
+    0,            # thiszone
+    0,            # sigfigs
+    65535,        # snaplen
+    1,            # network = Ethernet
+)
+
+
+def write_pcap(path: Path, records: Iterator[bytes]) -> int:
+    """Write a classic pcap file from raw record bytes (header + body each).
+
+    Used by the snapshot writer when an alert dumps the per-camera ring
+    buffer to disk for forensic review. Returns total bytes written.
+    Skips None records (pcapng-sourced packets have no raw record).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with path.open("wb") as f:
+        f.write(_PCAP_GLOBAL_HEADER)
+        total += len(_PCAP_GLOBAL_HEADER)
+        for rec in records:
+            if rec is None:
+                continue
+            f.write(rec)
+            total += len(rec)
+    return total
+
+
 def _read_exact(fh: BinaryIO, n: int) -> bytes | None:
-    """Read exactly `n` bytes, blocking as needed. Returns None on clean EOF."""
+    """Read exactly `n` bytes, blocking as needed. Returns None on EOF or short
+    read — a truncated record is indistinguishable from EOF here, and the
+    caller (pcap iterator) handles both by incrementing skipped + breaking."""
     if n <= 0:
         return b""
     buf = bytearray()
     while len(buf) < n:
         chunk = fh.read(n - len(buf))
         if not chunk:
-            return None if not buf else None  # short read = treat as EOF
+            return None
         buf.extend(chunk)
     return bytes(buf)

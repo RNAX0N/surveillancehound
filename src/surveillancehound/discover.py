@@ -33,6 +33,11 @@ from surveillancehound.config import NetworkCfg
 # Dahua, ONVIF, the common alt-RTSP / alt-camera-mgmt ports.
 _CAMERA_PORTS = frozenset({554, 8554, 8000, 8001, 37777, 37778, 9000, 322})
 
+# Cap on the per-source peer set used for the NVR heuristic. We only need
+# enough peers to ask "are ≥3 of them cameras?" — past that, accumulating
+# more entries just bloats memory on a long-running daemon.
+_MAX_PEER_HINT_SIZE = 64
+
 
 @dataclass
 class DeviceClassifier:
@@ -92,19 +97,25 @@ class DeviceClassifier:
         if dst_port in _CAMERA_PORTS and self._learned.get(dst_ip, "other") == "other":
             if dst_ip not in self._nvr_set and dst_ip not in self._camera_set:
                 self._learned[dst_ip] = "camera"
-        # NVR hint: a LAN device that talks to many camera-classified peers
-        peers = self._peers_per_ip.setdefault(src_ip, set())
-        peers.add(dst_ip)
+                self._peers_per_ip.pop(dst_ip, None)
+        # NVR hint: a LAN device that talks to many camera-classified peers.
+        # Skip once src is classified (no further hint to gather) and cap the
+        # per-src peer set — keeps `_peers_per_ip` bounded on a busy segment.
         if (
-            len(peers) >= 3
-            and src_ip not in self._camera_set
-            and self._learned.get(src_ip, "other") == "other"
+            src_ip in self._learned
+            or src_ip in self._camera_set
+            or src_ip in self._nvr_set
         ):
-            cams = sum(
-                1 for p in peers if self.role_for(p) == "camera"
-            )
+            return
+        peers = self._peers_per_ip.setdefault(src_ip, set())
+        if dst_ip in peers or len(peers) >= _MAX_PEER_HINT_SIZE:
+            return
+        peers.add(dst_ip)
+        if len(peers) >= 3:
+            cams = sum(1 for p in peers if self.role_for(p) == "camera")
             if cams >= 3:
                 self._learned[src_ip] = "nvr"
+                self._peers_per_ip.pop(src_ip, None)
 
     def is_on_manufacturer_allowlist(self, ip: str) -> bool:
         try:

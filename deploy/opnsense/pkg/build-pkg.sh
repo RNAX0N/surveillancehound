@@ -1,0 +1,169 @@
+#!/bin/sh
+#
+# Build the os-hound OPNsense package (.txz) — and, optionally, a signed pkg
+# repository you can subscribe a firewall to for durable, auto-updating installs.
+#
+# MUST run on FreeBSD (uses pkg-create/pkg-repo). In CI that's a FreeBSD VM;
+# locally it's an OPNsense box or any FreeBSD 14 host. The produced package is
+# self-contained — it bundles the SurveillanceHound Python sources and declares
+# NO hard deps: OPNsense already ships python3 (configd is written in it) and
+# tcpdump (base), and the /usr/local/bin/hound wrapper finds python 3.11+. This
+# also lets `pkg add` the .txz succeed offline, with no dependency fetch.
+#
+# Usage:
+#   sh deploy/opnsense/pkg/build-pkg.sh [options]
+#     --version X.Y.Z     package version (default: from pyproject.toml / git tag)
+#     --out DIR           output dir for the .txz (default: ./dist)
+#     --repo              also build a pkg repository under <out>/repo
+#     --sign KEYFILE      RSA private key to sign the repo catalog (implies --repo)
+#     --abi ABI           override pkg ABI (default: host, e.g. FreeBSD:14:amd64)
+#
+# Examples:
+#   sh deploy/opnsense/pkg/build-pkg.sh --version 0.1.0
+#   sh deploy/opnsense/pkg/build-pkg.sh --version 0.1.0 --repo --sign /tmp/hound-repo.key
+
+set -eu
+
+die() { printf '\033[31mbuild-pkg: %s\033[0m\n' "$*" >&2; exit 1; }
+say() { printf '\033[36m▸\033[0m %s\n' "$*"; }
+
+command -v pkg >/dev/null 2>&1 || die "pkg(8) not found — this must run on FreeBSD/OPNsense."
+
+# --- locate the repo --------------------------------------------------------
+script_dir=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$script_dir/../../.." && pwd)
+[ -f "$REPO_ROOT/pyproject.toml" ] || die "can't find repo root (looked at $REPO_ROOT)"
+
+# --- args -------------------------------------------------------------------
+VERSION=""
+OUT="$REPO_ROOT/dist"
+BUILD_REPO=0
+SIGN_KEY=""
+ABI_OVERRIDE=""
+MAINTAINER="${HOUND_MAINTAINER:-njack2af@proton.me}"
+WWW="${HOUND_WWW:-https://github.com/RNAX0N/surveillancehound}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --version) VERSION="$2"; shift 2 ;;
+        --out)     OUT="$2"; shift 2 ;;
+        --repo)    BUILD_REPO=1; shift ;;
+        --sign)    SIGN_KEY="$2"; BUILD_REPO=1; shift 2 ;;
+        --abi)     ABI_OVERRIDE="$2"; shift 2 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+if [ -z "$VERSION" ]; then
+    VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$REPO_ROOT/pyproject.toml" | head -1)
+fi
+[ -n "$VERSION" ] || die "could not determine version (pass --version)"
+PKGNAME="os-hound"
+say "building ${PKGNAME}-${VERSION}"
+
+# --- stage the filesystem ---------------------------------------------------
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT INT TERM
+STAGE="$WORK/stage"
+PLUGIN_SRC="$REPO_ROOT/deploy/opnsense/src"
+
+# 1) plugin tree → /usr/local/opnsense, rc.d → /usr/local/etc/rc.d
+mkdir -p "$STAGE/usr/local"
+cp -a "$PLUGIN_SRC/opnsense" "$STAGE/usr/local/opnsense"
+mkdir -p "$STAGE/usr/local/etc/rc.d"
+cp -a "$PLUGIN_SRC/usr/local/etc/rc.d/hound" "$STAGE/usr/local/etc/rc.d/hound"
+
+# 2) Python sources → /usr/local/share/hound/lib (version-independent)
+mkdir -p "$STAGE/usr/local/share/hound/lib"
+cp -a "$REPO_ROOT/src/surveillancehound" "$STAGE/usr/local/share/hound/lib/surveillancehound"
+
+# 3) the hound CLI wrapper → /usr/local/bin/hound
+mkdir -p "$STAGE/usr/local/bin"
+cat > "$STAGE/usr/local/bin/hound" <<'WRAP'
+#!/bin/sh
+# SurveillanceHound CLI (packaged). Bundled sources live under /usr/local/share/hound/lib.
+PY=""
+for c in python3.11 python3.12 python3.13 python3; do
+    if command -v "$c" >/dev/null 2>&1; then PY=$(command -v "$c"); break; fi
+done
+[ -n "$PY" ] || { echo "hound: python 3.11+ not found (pkg install python311)" >&2; exit 1; }
+exec env PYTHONPATH=/usr/local/share/hound/lib "$PY" -m surveillancehound.cli "$@"
+WRAP
+
+# strip caches + set exec bits (pkg captures on-disk modes)
+find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} +
+chmod 0555 "$STAGE/usr/local/bin/hound" "$STAGE/usr/local/etc/rc.d/hound"
+chmod 0755 "$STAGE"/usr/local/opnsense/scripts/OPNsense/Hound/*.sh \
+           "$STAGE"/usr/local/opnsense/scripts/OPNsense/Hound/*.py
+
+# --- plist (absolute paths, files + symlinks) -------------------------------
+PLIST="$WORK/plist"
+( cd "$STAGE" && find . \( -type f -o -type l \) ) | sed 's#^\.##' | sort > "$PLIST"
+say "$(wc -l < "$PLIST" | tr -d ' ') files staged"
+
+# --- lifecycle scripts (single-line; embedded in the manifest) --------------
+# post-install: create the service user + state/log dirs, refresh the UI.
+PI='pw groupshow hound >/dev/null 2>&1 || pw groupadd hound; pw usershow hound >/dev/null 2>&1 || pw useradd hound -g hound -s /usr/sbin/nologin -d /var/lib/hound -c SurveillanceHound; install -d -o hound -g hound -m 0750 /var/lib/hound; install -d -o hound -g hound -m 0755 /var/log/hound; if command -v configctl >/dev/null 2>&1; then service configd restart >/dev/null 2>&1 || true; configctl webgui restart >/dev/null 2>&1 || true; fi; true'
+# pre-deinstall: stop + disable the daemon before files vanish.
+PRD='service hound onestop >/dev/null 2>&1 || true; sysrc -x hound_enable >/dev/null 2>&1 || true; true'
+# post-deinstall: refresh the UI so the menu entry disappears.
+POD='command -v configctl >/dev/null 2>&1 && configctl webgui restart >/dev/null 2>&1 || true; true'
+
+# --- manifest (UCL; scripts inlined) ----------------------------------------
+MANIFEST="$WORK/+MANIFEST"
+cat > "$MANIFEST" <<MANI
+name = "${PKGNAME}"
+version = "${VERSION}"
+origin = "security/${PKGNAME}"
+comment = "SurveillanceHound — always-running NVR / IP-camera network monitor"
+maintainer = "${MAINTAINER}"
+www = "${WWW}"
+prefix = "/usr/local"
+categories = ["security"]
+licenselogic = "single"
+licenses = ["PROPRIETARY"]
+desc = "SurveillanceHound watches the surveillance segment (camera VLAN / NVR uplink / SPAN port) for bulk transfers toward a camera, control-channel-shaped sessions, off-allowlist telemetry, new devices/peers, silent cameras, and behavioral anomalies. Adds Services > SurveillanceHound to the OPNsense UI. Headers only — no payload, no DNS, no video."
+scripts {
+  "post-install" = "${PI}"
+  "pre-deinstall" = "${PRD}"
+  "post-deinstall" = "${POD}"
+}
+MANI
+
+# --- build ------------------------------------------------------------------
+mkdir -p "$OUT"
+ABI_ARGS=""
+[ -n "$ABI_OVERRIDE" ] && ABI_ARGS="-o ABI=$ABI_OVERRIDE -o OSVERSION=1400000"
+say "pkg create (abi: ${ABI_OVERRIDE:-$(pkg config ABI)})"
+# Default format = the universal `.pkg` (zstd) — exactly what OPNsense ships.
+# Modern pkg names every package `<name>-<version>.pkg` regardless of the
+# internal compression, so don't assume a `.txz` extension.
+# shellcheck disable=SC2086
+pkg $ABI_ARGS create -o "$OUT" -r "$STAGE" -p "$PLIST" -M "$MANIFEST"
+
+PKG=$(ls -t "$OUT/${PKGNAME}-${VERSION}".* 2>/dev/null | head -1)
+[ -n "$PKG" ] && [ -f "$PKG" ] || die "pkg create did not produce a package in $OUT"
+say "package: $PKG"
+pkg info -F "$PKG" 2>/dev/null | sed 's/^/    /' || true
+
+# --- optional: signed repository --------------------------------------------
+if [ "$BUILD_REPO" = "1" ]; then
+    REPODIR="$OUT/repo"
+    say "building pkg repository → $REPODIR"
+    rm -rf "$REPODIR"; mkdir -p "$REPODIR"
+    cp "$PKG" "$REPODIR/"
+    if [ -n "$SIGN_KEY" ]; then
+        [ -f "$SIGN_KEY" ] || die "signing key not found: $SIGN_KEY"
+        say "signing catalog with $SIGN_KEY"
+        pkg repo "$REPODIR" "$SIGN_KEY"
+        # publish the matching public key so the firewall can verify
+        openssl rsa -in "$SIGN_KEY" -pubout -out "$REPODIR/hound-repo.pub" 2>/dev/null \
+            || die "could not derive public key from $SIGN_KEY"
+    else
+        say "no --sign key — building an UNSIGNED repo (signature_type: none)"
+        pkg repo "$REPODIR"
+    fi
+    say "repo catalog:"; ls -1 "$REPODIR" | sed 's/^/    /'
+fi
+
+say "done."

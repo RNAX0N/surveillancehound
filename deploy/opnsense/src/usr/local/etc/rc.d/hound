@@ -1,0 +1,46 @@
+#!/bin/sh
+#
+# SurveillanceHound — FreeBSD rc.d service script (OPNsense and stock
+# FreeBSD both honor this layout). Enable via:
+#
+#   sysrc hound_enable=YES
+#   service hound start
+#
+# Defaults (override in /etc/rc.conf or /etc/rc.conf.local):
+#   hound_enable    = NO
+#   hound_config    = /usr/local/etc/hound.toml
+#   hound_user      = hound
+#   hound_bin       = /usr/local/bin/hound
+
+# PROVIDE: hound
+# REQUIRE: NETWORKING SERVERS
+# BEFORE:  LOGIN
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name=hound
+rcvar=hound_enable
+
+load_rc_config $name
+
+: ${hound_enable:=NO}
+: ${hound_config:=/usr/local/etc/hound.toml}
+: ${hound_user:=hound}
+: ${hound_bin:=/usr/local/bin/hound}
+
+pidfile=/var/run/${name}.pid
+logfile=/var/log/${name}/hound.log
+command=/usr/sbin/daemon
+command_args="-c -P ${pidfile} -o ${logfile} -- ${hound_bin} run ${hound_config}"
+command_interpreter=""
+required_files="${hound_config}"
+
+start_precmd=hound_prestart
+
+hound_prestart() {
+    install -d -o "${hound_user}" -g "${hound_user}" -m 0755 /var/log/${name}
+    install -d -o "${hound_user}" -g "${hound_user}" -m 0755 /var/lib/hound
+}
+
+run_rc_command "$1"

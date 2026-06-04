@@ -45,6 +45,66 @@ dedup_window_seconds = 1800.0      # don't re-notify on the same alert within th
 path = "/var/lib/surveillancehound/hound.sqlite"
 # path = "./hound.sqlite"           # for ad-hoc runs
 
+# ── Per-camera behavioral baselining (opt-in) ──────────────────────────────
+# Two models, same alert kind (`behavioral_anomaly`) and same lifecycle.
+# Both gate alerts behind `min_samples` per (camera, weekday, hour) bucket
+# and persist learned state to SQLite so restarts resume rather than retrain.
+# Pure stdlib for both — no extra dependencies.
+#
+#   model = "welford"  (default) — per-feature running mean/variance.
+#                                  Fires when ONE feature crosses σ threshold.
+#   model = "hstree"             — streaming Half-Space Forest (Tan/Ting/Liu
+#                                  2011). A real ML anomaly detector. Catches
+#                                  JOINT multivariate anomalies that Welford
+#                                  misses by construction (each feature
+#                                  normal in isolation, combination rare).
+[baseline]
+enabled                = false       # opt-in; off by default
+model                  = "welford"   # "welford" | "hstree"
+min_samples            = 100         # both — bucket samples before alerts arm
+flush_interval_seconds = 60.0        # both — how often to write back to disk
+# --- welford-only ---
+z_threshold            = 4.0         # σ above which a feature alerts
+# --- hstree-only (ignored if model = "welford") ---
+hstree_n_trees         = 8           # ensemble size (8-25 typical)
+hstree_depth           = 6           # leaves = 2**depth
+hstree_window_size     = 250         # samples per "reference / latest" rollover
+hstree_score_threshold = 0.7         # [0,1] — higher fires less; 0.7 ≈ rare
+hstree_seed            = 0           # 0 = clock-seeded; non-zero = reproducible
+
+# ── Per-camera packet snapshots on alert (opt-in) ──────────────────────────
+# When enabled, the daemon keeps a rolling ring buffer of the last
+# `window_seconds` of raw packets per camera. Whenever an alert fires at
+# severity >= `min_severity`, the matching camera's buffer is dumped to
+# <dir>/<alert_id>.pcap so you can open the full suspicious window in
+# Wireshark. Memory is bounded by `max_buffer_bytes` per camera.
+# Live-capture only — pcapng replay leaves snapshots empty.
+[snapshot]
+enabled         = false              # opt-in; off by default
+window_seconds  = 60.0               # how much pre-alert traffic to keep
+min_severity    = "medium"           # info | low | medium | high | critical
+# dir           = "/var/lib/surveillancehound/snapshots"   # default: <store>/snapshots
+snaplen         = 1500               # bumps capture snaplen for useful forensics
+max_buffer_bytes = 33554432          # 32 MiB per camera — oldest-evicted
+
+# ── Local web dashboard (opt-in) ───────────────────────────────────────────
+# Read-only dashboard. Bound to localhost by default — expose to a routable
+# interface ONLY behind your own reverse proxy + auth.
+# Launch with: `hound web /etc/hound.toml`
+#
+# HTTPS: leave cert_file/key_file blank for plain HTTP. Set BOTH to PEM
+# paths to enable TLS — required when embedding the dashboard via iframe
+# inside an HTTPS UI (browsers block HTTP iframes on HTTPS parents). Any
+# PEM works; for OPNsense's bundled plugin a self-signed pair is auto-
+# generated on save.
+[web]
+enabled                = false       # off by default
+host                   = "127.0.0.1" # bind address
+port                   = 8080
+poll_interval_seconds  = 5.0         # browser auto-refresh cadence
+# cert_file            = "/etc/ssl/hound-web.crt"
+# key_file             = "/etc/ssl/hound-web.key"
+
 # ── How to tell you ────────────────────────────────────────────────────────
 # Add a [[notify]] block per channel; multiple are fine. `level` is the
 # minimum severity that goes through that channel. Order: info < low < medium
@@ -55,18 +115,131 @@ type  = "stdout"
 level = "low"
 
 [[notify]]
-type  = "logfile"
-path  = "/var/log/hound.log"
-level = "info"
+type      = "logfile"
+path      = "/var/log/hound.log"
+level     = "info"
+max_bytes = 10485760   # 10 MiB; 0 disables rotation
+keep      = 5          # keep <path>.1 .. <path>.5
 
 [[notify]]
-type  = "jsonlines"
-path  = "/var/log/hound.alerts.jsonl"
-level = "low"
+type      = "jsonlines"
+path      = "/var/log/hound.alerts.jsonl"
+level     = "low"
+max_bytes = 10485760
+keep      = 5
 
+# --- Webhook (generic JSON POST) ---
+# The webhook body is the alert dict — see surveillancehound.alerts.Alert.as_dict.
+# Most chat / paging services accept this directly via their incoming-webhook URL.
 # [[notify]]
 # type    = "webhook"
 # url     = "https://hooks.example.com/alerts"
 # level   = "medium"
 # timeout = 5.0
 # headers = { Authorization = "Bearer ..." }
+
+# --- Slack (incoming webhook) ---
+# Create a Slack app, enable Incoming Webhooks, copy the URL.
+# Slack ignores fields it doesn't know about, so the raw alert dict works.
+# [[notify]]
+# type  = "webhook"
+# url   = "https://hooks.slack.com/services/T000/B000/XXXXXXXX"
+# level = "medium"
+
+# --- Discord (server webhook) ---
+# Server Settings → Integrations → Webhooks → New Webhook → copy URL.
+# Append `?wait=true` to get a richer response on success.
+# [[notify]]
+# type  = "webhook"
+# url   = "https://discord.com/api/webhooks/.../...?wait=true"
+# level = "medium"
+
+# --- Microsoft Teams (Incoming Webhook connector) ---
+# Channel → Connectors → Incoming Webhook → copy URL.
+# Teams renders the JSON as raw text; consider a small intermediary if you
+# want MessageCards / Adaptive Cards.
+# [[notify]]
+# type  = "webhook"
+# url   = "https://outlook.office.com/webhook/..."
+# level = "medium"
+
+# --- PagerDuty (Events API v2) ---
+# Send the alert through a generic events integration. The webhook channel
+# posts the raw alert dict; for production use, write a tiny intermediary
+# (e.g. cloud function) that wraps it in the Events v2 envelope.
+# [[notify]]
+# type    = "webhook"
+# url     = "https://events.pagerduty.com/v2/enqueue"
+# level   = "high"
+# headers = { Authorization = "Token token=..." }
+
+# --- Syslog → Security Onion / Graylog / Splunk / generic SIEM ---
+# RFC 5424 with STRUCTURED-DATA so the SIEM can parse fields without regex.
+# Security Onion's default syslog input listens on UDP/514. For TCP, use
+# `proto = "tcp"` — Hound uses RFC 6587 octet-counting framing.
+# [[notify]]
+# type     = "syslog"
+# host     = "secop-onion.lan"
+# port     = 514
+# proto    = "udp"          # udp | tcp
+# facility = 16             # 16=local0, 17=local1, ... 23=local7
+# app_name = "hound"
+# level    = "low"
+
+# --- Wazuh — two paths, see deploy/wazuh/README.md ---
+# Path A (recommended): keep a jsonlines channel (above) AND drop
+#   deploy/wazuh/localfile-snippet.xml into /var/ossec/etc/ossec.conf;
+#   the Wazuh agent tails the file with the built-in json decoder.
+# Path B: ship via syslog directly to the Wazuh manager, plus
+#   deploy/wazuh/hound-decoder.xml on the manager.
+# Either way, the rules in deploy/wazuh/hound-rules.xml give you
+# MITRE-tagged Wazuh alerts in the 100200+ ID range.
+# [[notify]]
+# type     = "syslog"
+# host     = "wazuh-mgr.lan"
+# port     = 514
+# proto    = "udp"
+# app_name = "hound"
+# level    = "low"
+
+# --- Syslog → pfSense / OPNsense remote log target ---
+# Configure the firewall's "Remote Logging Options" to send to this host;
+# this entry is the OPPOSITE direction (Hound *sending* to the firewall's
+# central syslog). For Hound running ON the firewall, see deploy/pfsense or
+# deploy/opnsense for the bundled plugin.
+# [[notify]]
+# type  = "syslog"
+# host  = "192.0.2.5"
+# proto = "tcp"
+# level = "info"
+
+# --- Email (SMTP, STARTTLS by default) ---
+# For Gmail-style SMTP-AUTH, use an app password (not the account password).
+# `smtp_to` is a list — recipients are comma-joined into the To: header.
+# [[notify]]
+# type                 = "email"
+# smtp_host            = "smtp.example.com"
+# smtp_port            = 587
+# smtp_user            = "alerts@example.com"
+# smtp_password        = "app-password-here"
+# smtp_use_tls         = true
+# smtp_from            = "alerts@example.com"
+# smtp_to              = ["secops@example.com"]
+# smtp_subject_prefix  = "[SurveillanceHound]"
+# level                = "medium"
+# timeout              = 10.0
+
+# --- FTP / FTPS upload (one JSON file per alert) ---
+# Uploads `hound-<unix_ts>-<kind>-<device>.json` per alert. Default level
+# is "high" — opening a fresh FTP connection per alert is wasteful for
+# noisier severities. Set `ftp_use_tls = true` for explicit FTPS (AUTH TLS).
+# [[notify]]
+# type         = "ftp"
+# host         = "ftp.example.com"
+# port         = 21
+# ftp_user     = "hound"
+# ftp_password = "..."
+# ftp_dir      = "/hound-alerts"
+# ftp_use_tls  = false
+# level        = "high"
+# timeout      = 15.0

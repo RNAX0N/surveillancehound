@@ -1,0 +1,30 @@
+<!--
+    SurveillanceHound — Wazuh custom decoder (syslog path).
+
+    Drop in:
+        /var/ossec/etc/decoders/local_hound_decoder.xml
+
+    This decoder is ONLY needed if you're ingesting Hound via the syslog
+    channel (RFC 5424 to Wazuh's <remote><connection>syslog</connection>
+    input). If you're using the jsonlines + localfile path (recommended),
+    Wazuh's built-in json decoder handles parsing and you only need the
+    rules file — skip this one.
+
+    Hound's syslog format (see surveillancehound/notify.py SyslogChannel):
+        <PRIVAL>1 TIMESTAMP HOSTNAME hound - KIND [hound@32473 kind="..."
+                severity="..." device="..."] MSG
+
+    Wazuh's built-in 5424 parser handles the header; we add a sub-decoder
+    to extract the STRUCTURED-DATA fields (kind, severity, device) into
+    named fields the rules file can match on.
+-->
+<decoder name="surveillancehound-syslog">
+    <parent>syslog</parent>
+    <prematch>hound\[?\d*\]?: </prematch>
+</decoder>
+
+<decoder name="surveillancehound-syslog-fields">
+    <parent>surveillancehound-syslog</parent>
+    <regex offset="after_parent">\[hound@\d+ kind="(\S+?)" severity="(\S+?)" device="(\S+?)"\] (.+)$</regex>
+    <order>kind, severity, device_ip, summary</order>
+</decoder>

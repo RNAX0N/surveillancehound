@@ -26,6 +26,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 from surveillancehound.alerts import Alert, AlertEngine
+from surveillancehound.baseline import BaselineEngine, HSEngine, make_engine
 from surveillancehound.capture import CaptureError, stream_packets
 from surveillancehound.classify import FlowClassifier
 from surveillancehound.config import HoundCfg
@@ -33,7 +34,8 @@ from surveillancehound.discover import DeviceClassifier
 from surveillancehound.flows import FlowAggregator, LiveFlow
 from surveillancehound.notify import Dispatcher, build_channel
 from surveillancehound.pcap import Packet
-from surveillancehound.store import AlertRow, FlowRow, HoundStore
+from surveillancehound.snapshot import SnapshotEngine, snapshot_dir_for
+from surveillancehound.store import AlertRow, FlowRow, HoundStore, SnapshotRow
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +67,36 @@ class Hound:
         self.dispatcher = Dispatcher(
             [build_channel(c) for c in cfg.notify], store=self.store,
         )
+        self.baseliner: BaselineEngine | HSEngine | None = None
+        if cfg.baseline.enabled:
+            self.baseliner = make_engine(cfg.baseline)
+            self.baseliner.bootstrap_from(self.store)
+            if cfg.baseline.model == "hstree":
+                log.info(
+                    "baseline: hstree enabled (trees=%d, depth=%d, window=%d, "
+                    "score≥%g, min_samples=%d, flush=%gs)",
+                    cfg.baseline.hstree_n_trees, cfg.baseline.hstree_depth,
+                    cfg.baseline.hstree_window_size,
+                    cfg.baseline.hstree_score_threshold,
+                    cfg.baseline.min_samples,
+                    cfg.baseline.flush_interval_seconds,
+                )
+            else:
+                log.info(
+                    "baseline: welford enabled (z=%g, min_samples=%d, flush=%gs)",
+                    cfg.baseline.z_threshold, cfg.baseline.min_samples,
+                    cfg.baseline.flush_interval_seconds,
+                )
+        self.snapshotter: SnapshotEngine | None = None
+        if cfg.snapshot.enabled:
+            snap_dir = snapshot_dir_for(cfg.snapshot, cfg.store.path)
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            self.snapshotter = SnapshotEngine(cfg.snapshot, snap_dir)
+            log.info(
+                "snapshot: enabled (window=%gs, min_severity=%s, dir=%s)",
+                cfg.snapshot.window_seconds, cfg.snapshot.min_severity,
+                snap_dir,
+            )
         self.stats = RunStats()
         self._stop_flag = False
         # cameras seen this run; used to keep new_peer alerts tight
@@ -89,15 +121,29 @@ class Hound:
         decides whether to relaunch on False.
         """
         self.stats.started_at = time.time()
+        keep_raw = self.snapshotter is not None
+        snaplen_override = (
+            self.cfg.snapshot.snaplen if self.snapshotter is not None else None
+        )
         try:
-            gen, _stats, handle = stream_packets(self.cfg.capture)
+            gen, _stats, handle = stream_packets(
+                self.cfg.capture,
+                keep_raw=keep_raw, snaplen_override=snaplen_override,
+            )
         except CaptureError as e:
             log.error("capture failed to start: %s", e)
             return False
         try:
             self._loop(gen)
-            # drain everything on shutdown so nothing is lost
-            self._flush(list(self.flows.drain()), now=time.time())
+            # drain everything on shutdown so nothing is lost. Sort by
+            # last_ts so the baseliner sees flows in time order regardless of
+            # dict-iteration order — anomaly detection is order-sensitive.
+            self._flush(
+                sorted(self.flows.drain(), key=lambda f: f.last_ts),
+                now=time.time(),
+            )
+            if self.baseliner is not None:
+                self.baseliner.flush(self.store)
             return True
         finally:
             handle.close()
@@ -133,14 +179,28 @@ class Hound:
         now = time.time()
         for ip in (pkt.src_ip, pkt.dst_ip):
             self._maybe_new_device(ip, now)
+        # snapshot ring buffer — append the raw record under any camera
+        # endpoint, so the buffer captures the conversation regardless of
+        # direction. No-op if snapshots disabled or this is pcapng input.
+        if self.snapshotter is not None:
+            for ip in (pkt.src_ip, pkt.dst_ip):
+                if self.devices.role_for(ip) == "camera":
+                    self.snapshotter.observe(ip, pkt.ts, pkt.raw_record)
 
     def _tick(self, now: float) -> None:
-        # 1) evict idle flows and process them
-        evicted = list(self.flows.evict_idle(now, self.cfg.thresholds.flow_ttl_seconds))
+        # 1) evict idle flows and process them — sort by last_ts so the
+        #    baseliner sees flows in time order across the eviction batch
+        evicted = sorted(
+            self.flows.evict_idle(now, self.cfg.thresholds.flow_ttl_seconds),
+            key=lambda f: f.last_ts,
+        )
         if evicted:
             self._flush(evicted, now=now)
         # 2) check for silent cameras
         self._check_silence(now)
+        # 3) write baselines back to disk on cadence (no-op if disabled)
+        if self.baseliner is not None:
+            self.baseliner.maybe_flush(self.store, now)
 
     def _flush(self, flows: list[LiveFlow], *, now: float) -> None:
         for fl in flows:
@@ -177,6 +237,14 @@ class Hound:
                     peer_alert = self.alerts.new_peer(fc.src_ip, fc.dst_ip, now)
                     if peer_alert is not None:
                         self._emit(peer_alert)
+            # behavioral baseline (opt-in): score this flow against the
+            # camera's learned per-bucket envelope, emit one alert per
+            # feature that crossed the z threshold
+            if self.baseliner is not None and cam_role == "camera":
+                for anom in self.baseliner.observe(fc.src_ip, fl, fc, now):
+                    a = self.alerts.behavioral_anomaly(anom, now)
+                    if a is not None:
+                        self._emit(a)
 
     def _maybe_new_device(self, ip: str, now: float) -> None:
         if ip in self._seen_ips:
@@ -207,11 +275,18 @@ class Hound:
         )
         alert_id = self.store.insert_alert(row)
         delivered = self.dispatcher.dispatch(alert, alert_id)
-        # update the alert row with the delivered channels (audit)
         if delivered:
-            with self.store._lock, self.store._conn:  # noqa: SLF001
-                self.store._conn.execute(  # noqa: SLF001
-                    "UPDATE alerts SET notified_channels = ? WHERE id = ?",
-                    (",".join(delivered), alert_id),
-                )
+            self.store.set_alert_channels(alert_id, ",".join(delivered))
+        # dump per-camera ring buffer to a pcap for forensic review
+        if self.snapshotter is not None:
+            dumped = self.snapshotter.dump_for_alert(
+                alert.device_ip, alert.severity, alert_id,
+            )
+            if dumped is not None:
+                path, byte_count, packet_count = dumped
+                self.store.insert_snapshot(SnapshotRow(
+                    id=None, alert_id=alert_id, camera_ip=alert.device_ip,
+                    path=str(path), byte_count=byte_count,
+                    packet_count=packet_count, created_at=alert.ts,
+                ))
         self.stats.alerts_emitted += 1

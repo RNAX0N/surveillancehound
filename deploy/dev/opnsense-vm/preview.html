@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SurveillanceHound — OPNsense plugin UI preview</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+    Static, dependency-free preview of how the OPNsense plugin's Volt view
+    will render inside OPNsense's UI. Mocks the OPNsense base_form output
+    (which is a Bootstrap table) so the skin can be reviewed without booting
+    OPNsense. Open this file directly in any browser.
+-->
+<style>
+/* mock the small surrounding chrome OPNsense adds — header bar + sidebar nav */
+html,body { margin:0; padding:0; background:#1c2833; font-family:Helvetica,Arial,sans-serif; color:#bdc3c7; }
+.opn-topbar { height:44px; background:#0c1219; border-bottom:1px solid #000; display:flex; align-items:center; padding:0 18px; color:#fff; font-size:14px; }
+.opn-topbar .crumbs { color:#8aa1b6; font-size:12px; margin-left:14px; }
+.opn-shell { display:flex; height:calc(100vh - 44px); }
+.opn-sidebar { width:220px; background:#0c1219; padding:14px 0; font-size:12px; color:#8aa1b6; border-right:1px solid #000; }
+.opn-sidebar .head { padding:6px 16px; color:#fff; font-weight:bold; letter-spacing:.5px; }
+.opn-sidebar a { display:block; padding:5px 16px 5px 28px; color:#bdc3c7; text-decoration:none; }
+.opn-sidebar a.active { background:#1e3a52; color:#fff; border-left:3px solid #00d4ff; padding-left:25px; }
+.opn-content { flex:1; overflow:auto; padding:15px; background:#1c2833; }
+
+/* — paste of the plugin's scoped CSS, identical to index.volt — */
+.hound-plugin-page { --hp-bg:#03060d; --hp-bg-2:#0a1020; --hp-bg-card:linear-gradient(160deg, rgba(10,16,32,0.95), rgba(3,6,13,0.95)); --hp-border:rgba(0,212,255,0.22); --hp-border-2:rgba(255,0,170,0.18); --hp-text:#d6e4f0; --hp-muted:#6c87a5; --hp-cyan:#00d4ff; --hp-magenta:#ff00aa; --hp-green:#00ff9c; --hp-amber:#ffaa00; --hp-red:#ff3860; --hp-glow-c:0 0 14px rgba(0,212,255,0.55); --hp-glow-m:0 0 14px rgba(255,0,170,0.55); --hp-mono:ui-monospace,"SF Mono","JetBrains Mono","IBM Plex Mono",Menlo,Consolas,"Courier New",monospace; background:var(--hp-bg); color:var(--hp-text); padding:18px 22px 32px; margin:-15px -15px 0; min-height:calc(100vh - 100px); font-family:var(--hp-mono); }
+.hound-plugin-page::before { content:""; position:fixed; top:0; left:0; right:0; bottom:0; background:repeating-linear-gradient(180deg,rgba(255,255,255,.012) 0,rgba(255,255,255,.012) 1px,transparent 1px,transparent 3px); pointer-events:none; z-index:1; }
+.hound-plugin-page > * { position:relative; z-index:2; }
+.hound-header { display:flex; align-items:center; justify-content:space-between; gap:18px; padding:14px 18px; margin-bottom:18px; background:var(--hp-bg-card); border:1px solid var(--hp-border); border-radius:4px; box-shadow:var(--hp-glow-c), inset 0 1px 0 rgba(255,255,255,.04); position:relative; overflow:hidden; }
+.hound-header::after { content:""; position:absolute; inset:0; background:radial-gradient(circle at 100% 0%, rgba(255,0,170,.10), transparent 50%); pointer-events:none; }
+.hound-brand { display:flex; align-items:center; gap:14px; }
+.hound-brand-mark { width:38px; height:38px; border-radius:4px; background:linear-gradient(135deg,var(--hp-cyan),var(--hp-magenta)); box-shadow:var(--hp-glow-c); display:flex; align-items:center; justify-content:center; color:var(--hp-bg); font-weight:700; font-size:18px; letter-spacing:1px; }
+.hound-brand-text .title { font-size:18px; font-weight:600; color:var(--hp-text); letter-spacing:.5px; margin:0; }
+.hound-brand-text .sub { font-size:11px; color:var(--hp-muted); letter-spacing:2px; text-transform:uppercase; }
+.hound-status-pill { display:inline-flex; align-items:center; gap:10px; padding:6px 14px; background:rgba(0,0,0,.4); border:1px solid var(--hp-border); border-radius:999px; font-size:11px; letter-spacing:2px; color:var(--hp-muted); }
+.hound-status-pill .dot { width:8px; height:8px; border-radius:999px; background:var(--hp-muted); animation:hp-pulse 2.4s ease-in-out infinite; }
+.hound-status-pill.status-running .dot { background:var(--hp-green); box-shadow:0 0 10px var(--hp-green); }
+.hound-status-pill.status-running .dot-label { color:var(--hp-green); }
+@keyframes hp-pulse { 0%,100%{opacity:1} 50%{opacity:.55} }
+.hound-plugin-page .nav-tabs { border-bottom:1px solid var(--hp-border); padding:0 6px; list-style:none; margin:0; display:flex; }
+.hound-plugin-page .nav-tabs > li > a { display:block; padding:10px 18px; color:var(--hp-muted); font-size:12px; letter-spacing:2px; text-transform:uppercase; text-decoration:none; border-radius:4px 4px 0 0; margin-right:4px; transition:color .12s,background .12s,box-shadow .12s; border:1px solid transparent; }
+.hound-plugin-page .nav-tabs > li > a:hover { color:var(--hp-cyan); background:rgba(0,212,255,.05); }
+.hound-plugin-page .nav-tabs > li.active > a { background:var(--hp-bg-2); color:var(--hp-cyan); border-color:var(--hp-border); border-bottom-color:var(--hp-bg-2); box-shadow:0 -2px 0 var(--hp-cyan), 0 -10px 14px -8px var(--hp-cyan) inset; }
+.hound-plugin-page .tab-content { background:var(--hp-bg-2); border:1px solid var(--hp-border); border-top:none; border-radius:0 0 4px 4px; padding:22px; }
+.hound-note { background:linear-gradient(90deg,rgba(0,212,255,.08),rgba(0,212,255,0) 60%); border-left:2px solid var(--hp-cyan); box-shadow:-2px 0 12px -4px var(--hp-cyan); padding:12px 16px; margin:0 0 18px; font-size:12.5px; line-height:1.55; color:var(--hp-text); border-radius:0 2px 2px 0; }
+.hound-note strong { color:var(--hp-cyan); letter-spacing:.5px; }
+.hound-note code { background:rgba(0,0,0,.45); color:var(--hp-magenta); padding:1px 6px; border-radius:2px; font-size:11.5px; border:1px solid var(--hp-border-2); }
+.hound-note ol { margin:6px 0 0 20px; padding:0; }
+.hound-note li { margin:4px 0; }
+.hound-plugin-page table { width:100%; border-collapse:collapse; margin-bottom:18px; }
+.hound-plugin-page td { padding:10px 12px; border-top:1px solid rgba(255,255,255,.04); color:var(--hp-text); vertical-align:top; }
+.hound-plugin-page tr.label_block td { background:linear-gradient(90deg,rgba(255,0,170,.10),transparent 70%); color:var(--hp-magenta); border-top:1px solid var(--hp-border-2); border-bottom:1px solid var(--hp-border-2); font-size:12px; letter-spacing:2px; text-transform:uppercase; padding:10px 12px; font-weight:600; }
+.hound-plugin-page .control-label { color:var(--hp-text); font-weight:500; font-size:13px; width:240px; }
+.hound-plugin-page .help-block { color:var(--hp-muted); font-size:11.5px; line-height:1.5; margin-top:4px; }
+.hound-plugin-page input.form-control, .hound-plugin-page select.form-control { background:rgba(0,0,0,.4); border:1px solid rgba(0,212,255,.18); color:var(--hp-text); border-radius:3px; box-shadow:inset 0 1px 0 rgba(0,0,0,.4); padding:6px 10px; font-family:var(--hp-mono); width:100%; box-sizing:border-box; transition:border-color .12s, box-shadow .12s; }
+.hound-plugin-page input.form-control:focus, .hound-plugin-page select.form-control:focus { border-color:var(--hp-cyan); box-shadow:0 0 0 1px var(--hp-cyan), 0 0 10px rgba(0,212,255,.35); outline:none; }
+.hound-plugin-page input[type="checkbox"] { accent-color:var(--hp-cyan); transform:scale(1.15); margin-right:6px; }
+.hound-actions { display:flex; align-items:center; gap:14px; margin-top:18px; padding-top:18px; border-top:1px dashed var(--hp-border); }
+.hound-plugin-page #saveAct { background:linear-gradient(135deg,var(--hp-cyan),#0099cc); color:var(--hp-bg); border:none; border-radius:3px; padding:9px 22px; font-family:var(--hp-mono); font-weight:700; font-size:12px; letter-spacing:2px; text-transform:uppercase; box-shadow:0 0 14px rgba(0,212,255,.5), 0 2px 0 rgba(0,0,0,.4); cursor:pointer; transition:transform .12s, box-shadow .12s; }
+.hound-plugin-page #saveAct:hover { transform:translateY(-1px); box-shadow:0 0 22px rgba(0,212,255,.85), 0 3px 0 rgba(0,0,0,.4); }
+.hound-actions .meta { color:var(--hp-muted); font-size:11px; letter-spacing:1.5px; text-transform:uppercase; }
+</style>
+</head>
+<body>
+
+<div class="opn-topbar">
+    OPNsense — fw.lan
+    <span class="crumbs">&nbsp;›&nbsp; Services &nbsp;›&nbsp; SurveillanceHound</span>
+</div>
+
+<div class="opn-shell">
+
+    <div class="opn-sidebar">
+        <div class="head">▸ SERVICES</div>
+        <a href="#">Captive Portal</a>
+        <a href="#">DHCPv4</a>
+        <a href="#">Intrusion Detection</a>
+        <a href="#">Monit</a>
+        <a class="active" href="#">SurveillanceHound</a>
+        <a href="#">Web Proxy</a>
+        <a href="#">Zenarmor</a>
+    </div>
+
+    <div class="opn-content">
+        <div class="hound-plugin-page">
+
+            <div class="hound-header">
+                <div class="hound-brand">
+                    <div class="hound-brand-mark">SH</div>
+                    <div class="hound-brand-text">
+                        <div class="title">SurveillanceHound</div>
+                        <div class="sub">NVR / IP-camera network monitor</div>
+                    </div>
+                </div>
+                <div class="hound-status-pill status-running">
+                    <span class="dot"></span>
+                    <span class="dot-label">RUNNING</span>
+                </div>
+            </div>
+
+            <ul class="nav nav-tabs">
+                <li class="active"><a href="#">▸ Settings</a></li>
+                <li><a href="#">▸ Live dashboard</a></li>
+                <li><a href="#">▸ Help</a></li>
+            </ul>
+
+            <div class="tab-content">
+
+                <div class="hound-note">
+                    <strong>What runs here.</strong> The daemon watches the selected interface for activity the surveillance threat model cares about: bulk transfers <em>toward</em> a camera, long-lived camera↔public sessions on non-routine ports, off-allowlist telemetry, behavioral anomalies vs each camera's learned baseline, new devices, new peers, and silent cameras. Saving regenerates <code>/usr/local/etc/hound.toml</code> and restarts the service. Headers only — no payload inspection, no DNS, no video.
+                </div>
+
+                <table>
+                    <tr class="label_block"><td colspan="2">CAPTURE</td></tr>
+                    <tr>
+                        <td class="control-label">Enable</td>
+                        <td><input type="checkbox" checked> Run the SurveillanceHound daemon at boot.</td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">Listen interface</td>
+                        <td>
+                            <select class="form-control"><option>opt1 (camera VLAN)</option><option>lan</option><option>wan</option></select>
+                            <div class="help-block">The NIC the surveillance traffic crosses. On OPNsense this is typically the camera VLAN or a SPAN/mirror port.</div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">BPF filter (optional)</td>
+                        <td>
+                            <input type="text" class="form-control" value="host 192.168.10.0/24">
+                            <div class="help-block">Berkeley Packet Filter expression.</div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">Snaplen (bytes)</td>
+                        <td>
+                            <input type="text" class="form-control" value="96">
+                            <div class="help-block">96 covers all header layers; raise to 1500 if enabling snapshots.</div>
+                        </td>
+                    </tr>
+
+                    <tr class="label_block"><td colspan="2">NETWORK ROLES</td></tr>
+                    <tr>
+                        <td class="control-label">Camera IPs</td>
+                        <td>
+                            <input type="text" class="form-control" value="192.168.10.20, 192.168.10.21, 192.168.10.22">
+                            <div class="help-block">Comma-separated camera IPs.</div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">Camera subnets</td>
+                        <td>
+                            <input type="text" class="form-control" value="192.168.10.0/24">
+                            <div class="help-block">Comma-separated CIDRs.</div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">NVR IPs</td>
+                        <td><input type="text" class="form-control" value="192.168.10.10"></td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">Manufacturer allowlist</td>
+                        <td>
+                            <input type="text" class="form-control" value="203.0.113.0/24">
+                            <div class="help-block">The vendor cloud your cameras legitimately talk to.</div>
+                        </td>
+                    </tr>
+
+                    <tr class="label_block"><td colspan="2">BEHAVIORAL BASELINING (OPT-IN)</td></tr>
+                    <tr>
+                        <td class="control-label">Enable per-camera baselining</td>
+                        <td><input type="checkbox" checked></td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">z threshold</td>
+                        <td>
+                            <input type="text" class="form-control" value="4.0">
+                            <div class="help-block">Standard deviations from the bucket mean before an anomaly alert fires.</div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">Min samples per bucket</td>
+                        <td>
+                            <input type="text" class="form-control" value="100">
+                            <div class="help-block">Cold-start guard — no anomalies fire until each (camera, weekday, hour) bucket has this many observations.</div>
+                        </td>
+                    </tr>
+
+                    <tr class="label_block"><td colspan="2">FORENSIC SNAPSHOTS (OPT-IN)</td></tr>
+                    <tr>
+                        <td class="control-label">Enable pcap snapshots on alert</td>
+                        <td><input type="checkbox" checked></td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">Ring buffer window (seconds)</td>
+                        <td><input type="text" class="form-control" value="60"></td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">Min severity to snapshot</td>
+                        <td><select class="form-control"><option>medium</option><option>high</option><option>critical</option></select></td>
+                    </tr>
+
+                    <tr class="label_block"><td colspan="2">LOCAL DASHBOARD</td></tr>
+                    <tr>
+                        <td class="control-label">Enable dashboard</td>
+                        <td><input type="checkbox" checked></td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">Bind host</td>
+                        <td>
+                            <input type="text" class="form-control" value="127.0.0.1">
+                            <div class="help-block">Keeps it loopback-only. Bind to a routable address only behind your own auth/proxy.</div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="control-label">Bind port</td>
+                        <td><input type="text" class="form-control" value="8080"></td>
+                    </tr>
+                </table>
+
+                <div class="hound-actions">
+                    <button id="saveAct">▸ Save &amp; restart</button>
+                    <span class="meta">writes /usr/local/etc/hound.toml + bounces hound.service</span>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+</div>
+
+</body>
+</html>

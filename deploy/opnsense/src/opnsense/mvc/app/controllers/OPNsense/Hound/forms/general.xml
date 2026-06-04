@@ -1,0 +1,146 @@
+<form>
+    <field>
+        <type>header</type>
+        <label>Capture</label>
+    </field>
+    <field>
+        <id>general.enabled</id>
+        <label>Enable</label>
+        <type>checkbox</type>
+        <help>Run the SurveillanceHound daemon at boot.</help>
+    </field>
+    <field>
+        <id>general.interface</id>
+        <label>Listen interface</label>
+        <type>dropdown</type>
+        <style>selectpicker</style>
+        <help>The NIC the surveillance traffic crosses. On OPNsense this is
+              typically the camera VLAN or a SPAN/mirror port. Single
+              interface only — use a BPF filter below to narrow within it.</help>
+    </field>
+    <field>
+        <id>general.bpf</id>
+        <label>BPF filter (optional)</label>
+        <type>text</type>
+        <help>Berkeley Packet Filter expression, e.g. "host 192.168.10.0/24".</help>
+    </field>
+    <field>
+        <id>general.snaplen</id>
+        <label>Snaplen (bytes)</label>
+        <type>text</type>
+        <help>Bytes captured per packet for flow analysis. 96 covers all
+              header layers; raise to 1500 if enabling snapshots.</help>
+    </field>
+
+    <field>
+        <type>header</type>
+        <label>Network roles</label>
+    </field>
+    <field>
+        <id>network.camera_ips</id>
+        <label>Camera IPs</label>
+        <type>text</type>
+        <help>Comma-separated camera IPs.</help>
+    </field>
+    <field>
+        <id>network.camera_subnets</id>
+        <label>Camera subnets</label>
+        <type>text</type>
+        <help>Comma-separated CIDRs. Anything in here is treated as a camera
+              unless also listed as an NVR.</help>
+    </field>
+    <field>
+        <id>network.nvr_ips</id>
+        <label>NVR IPs</label>
+        <type>text</type>
+    </field>
+    <field>
+        <id>network.manufacturer_allowlist</id>
+        <label>Manufacturer allowlist (CIDRs)</label>
+        <type>text</type>
+        <help>The vendor cloud your cameras legitimately talk to.</help>
+    </field>
+
+    <field>
+        <type>header</type>
+        <label>Behavioral baselining (opt-in)</label>
+    </field>
+    <field>
+        <id>baseline.enabled</id>
+        <label>Enable per-camera baselining</label>
+        <type>checkbox</type>
+    </field>
+    <field>
+        <id>baseline.z_threshold</id>
+        <label>z threshold</label>
+        <type>text</type>
+        <help>Standard deviations from the bucket mean before an anomaly
+              alert fires (default 4.0).</help>
+    </field>
+    <field>
+        <id>baseline.min_samples</id>
+        <label>Min samples per bucket</label>
+        <type>text</type>
+        <help>Cold-start guard — no anomalies fire until each (camera,
+              weekday, hour) bucket has this many observations.</help>
+    </field>
+
+    <field>
+        <type>header</type>
+        <label>Forensic snapshots (opt-in)</label>
+    </field>
+    <field>
+        <id>snapshot.enabled</id>
+        <label>Enable per-camera pcap snapshots on alert</label>
+        <type>checkbox</type>
+    </field>
+    <field>
+        <id>snapshot.window_seconds</id>
+        <label>Ring buffer window (seconds)</label>
+        <type>text</type>
+    </field>
+    <field>
+        <id>snapshot.min_severity</id>
+        <label>Minimum alert severity to snapshot</label>
+        <type>dropdown</type>
+    </field>
+
+    <field>
+        <type>header</type>
+        <label>Local dashboard</label>
+    </field>
+    <field>
+        <id>web.enabled</id>
+        <label>Enable dashboard</label>
+        <type>checkbox</type>
+    </field>
+    <field>
+        <id>web.host</id>
+        <label>Bind host</label>
+        <type>text</type>
+        <help>127.0.0.1 keeps it loopback-only. Bind to a routable address
+              only behind your own auth/proxy.</help>
+    </field>
+    <field>
+        <id>web.port</id>
+        <label>Bind port</label>
+        <type>text</type>
+    </field>
+    <field>
+        <id>web.cert_file</id>
+        <label>TLS cert (optional)</label>
+        <type>text</type>
+        <help>Absolute path to a PEM-encoded TLS certificate. Leave blank
+              to inherit OPNsense's own UI scheme: HTTPS by default (a
+              self-signed cert is auto-generated and stored under
+              /var/lib/hound/), HTTP if OPNsense itself runs HTTP. The
+              dashboard's scheme must match the firewall UI's or browsers
+              block the embedded iframe as mixed content.</help>
+    </field>
+    <field>
+        <id>web.key_file</id>
+        <label>TLS private key (optional)</label>
+        <type>text</type>
+        <help>Absolute path to the matching PEM private key.</help>
+    </field>
+</form>
