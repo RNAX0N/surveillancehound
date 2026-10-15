@@ -25,6 +25,10 @@
 
 <decoder name="surveillancehound-syslog-fields">
     <parent>surveillancehound-syslog</parent>
-    <regex offset="after_parent">\[hound@\d+ kind="(\S+?)" severity="(\S+?)" device="(\S+?)"\] (.+)$</regex>
+    <!-- device="" is legitimate: capture_stalled is about the sensor, not a
+         camera, so it carries no device IP. `\S*?` (not `\S+?`) is what lets
+         that alert's fields extract on the syslog path — with a `+` the whole
+         regex failed to match and every field came through empty. -->
+    <regex offset="after_parent">\[hound@\d+ kind="(\S+?)" severity="(\S+?)" device="(\S*?)"\] (.+)$</regex>
     <order>kind, severity, device_ip, summary</order>
 </decoder>

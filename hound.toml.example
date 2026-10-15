@@ -41,6 +41,24 @@ flow_ttl_seconds    = 300.0        # idle flows flushed + dropped from RAM
 [alerts]
 dedup_window_seconds = 1800.0      # don't re-notify on the same alert within this window
 
+# ── Uptime monitoring ──────────────────────────────────────────────────────
+# PASSIVE: a camera counts as up because packets from it were seen on the
+# monitored interface. Nothing is probed. A camera that is powered and
+# recording but no longer visible to this sensor (moved VLAN, mirror/SPAN
+# port reconfigured) is indistinguishable from one that is powered down.
+#
+# Cameras listed in [network] are seeded at startup, so one that was already
+# powered down before the daemon started alerts (`camera_never_seen`) instead
+# of being silently absent. `capture_stall_seconds` is the dead-man's-switch:
+# zero packets of ANY kind for that long means the sensor itself is blind, so
+# one `capture_stalled` fires and per-camera offline alerts are suppressed.
+[uptime]
+enabled               = true
+startup_grace_seconds = 600.0      # 0 -> inherit thresholds.silence_seconds
+capture_stall_seconds = 120.0      # 0 -> disable the dead-man's-switch
+recovery_alerts       = true       # emit camera_recovered when a camera returns
+report_window_seconds = 86400.0    # default window for `hound uptime` + /api/uptime
+
 [store]
 path = "/var/lib/surveillancehound/hound.sqlite"
 # path = "./hound.sqlite"           # for ad-hoc runs

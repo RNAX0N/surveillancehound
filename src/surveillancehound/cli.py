@@ -19,6 +19,13 @@ Subcommands:
   hound devices <config.toml>
       Print every device the daemon has observed.
 
+  hound uptime <config.toml> [--window SECONDS] [--outages]
+      Per-camera liveness and availability over a window (default
+      [uptime].report_window_seconds, 24h). --outages prints the downtime
+      history instead of the summary table. Availability is computed over
+      time the monitor was actually watching, so a stopped daemon is never
+      charged to a camera as downtime.
+
   hound baselines <config.toml> [--camera IP | --reset IP | --reset-all]
       Inspect learned per-camera baselines, or wipe them. NOTE: stop the
       daemon before --reset — it holds Welford state in RAM.
@@ -132,6 +139,96 @@ def cmd_devices(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dur(seconds: float) -> str:
+    """Compact duration for table cells — '3d 4h', '12m', '45s'."""
+    s = int(max(0.0, seconds))
+    if s == 0:
+        return "-"
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    if s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    return f"{s // 86400}d {(s % 86400) // 3600}h"
+
+
+_PASSIVE_NOTE = (
+    "Uptime is inferred from traffic observed on the monitored interface, "
+    "not from active probing.\nA camera that is powered but no longer "
+    "visible to this sensor reads the same as one that is off."
+)
+
+
+def cmd_uptime(args: argparse.Namespace) -> int:
+    cfg = _cfg(args.config)
+    window = args.window if args.window else cfg.uptime.report_window_seconds
+    now = time.time()
+    store = HoundStore(path=cfg.store.path)
+    try:
+        session = store.current_monitor_session()
+        if session is None:
+            print("no monitor session recorded yet — has the daemon run?")
+        else:
+            running = session.ended_at is None
+            state = "running" if running else "stopped"
+            stall_window = cfg.uptime.capture_stall_seconds
+            recent = store.recent_flows(limit=1)
+            last_flow = recent[0].last_seen if recent else 0.0
+            blind = (
+                running and stall_window > 0
+                and (now - last_flow) > stall_window
+            )
+            print(
+                f"monitor: {state} on {session.source!r} since "
+                f"{datetime.fromtimestamp(session.started_at):%Y-%m-%d %H:%M:%S}"
+                + ("  [CAPTURE MAY BE STALLED]" if blind else "")
+            )
+
+        if args.outages:
+            rows = store.list_outages(since=now - window, limit=500)
+            if not rows:
+                print(f"no outages in the last {_dur(window)}")
+                return 0
+            print(f"\n{'camera':18s} {'from':19s} {'to':19s} "
+                  f"{'duration':>10s}  cause")
+            for o in rows:
+                until = (
+                    f"{datetime.fromtimestamp(o.up_at):%Y-%m-%d %H:%M:%S}"
+                    if o.up_at is not None else "(ongoing)"
+                )
+                print(
+                    f"{o.camera_ip:18s} "
+                    f"{datetime.fromtimestamp(o.down_since):%Y-%m-%d %H:%M:%S} "
+                    f"{until:19s} {_dur(o.duration(now)):>10s}  {o.cause}"
+                )
+            print(f"\n{_PASSIVE_NOTE}")
+            return 0
+
+        report = store.uptime_report(window, now)
+        if not report:
+            print("no cameras or NVRs known yet — check [network] in the config")
+            return 0
+        print(f"\nwindow: last {_dur(window)}")
+        print(f"{'IP':18s} {'role':7s} {'state':11s} {'last seen':19s} "
+              f"{'down for':>10s} {'outages':>8s} {'avail':>7s}")
+        for r in report:
+            last = (
+                f"{datetime.fromtimestamp(r.last_seen):%Y-%m-%d %H:%M:%S}"
+                if r.last_seen > 0 else "never"
+            )
+            avail = "n/a" if r.availability is None else f"{r.availability:.2%}"
+            print(
+                f"{r.ip:18s} {r.role:7s} {r.state:11s} {last:19s} "
+                f"{_dur(r.current_downtime):>10s} {r.outage_count:8d} "
+                f"{avail:>7s}"
+            )
+        print(f"\n{_PASSIVE_NOTE}")
+    finally:
+        store.close()
+    return 0
+
+
 def cmd_baselines(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
     store = HoundStore(path=cfg.store.path)
@@ -219,6 +316,10 @@ def cmd_prune(args: argparse.Namespace) -> int:
             kwargs["notifications_older_than"] = (
                 now - args.notifications_days * 86400.0
             )
+        if args.outages_days is not None:
+            kwargs["outages_older_than"] = now - args.outages_days * 86400.0
+        if args.sessions_days is not None:
+            kwargs["sessions_older_than"] = now - args.sessions_days * 86400.0
         if not kwargs:
             sys.exit(
                 "no cutoff given. specify --flows-days, --alerts-days, "
@@ -316,6 +417,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_d.add_argument("config")
     p_d.set_defaults(func=cmd_devices)
 
+    p_u = sub.add_parser(
+        "uptime", help="per-camera liveness + availability (passive)"
+    )
+    p_u.add_argument("config")
+    p_u.add_argument("--window", type=float, default=None,
+                     help="reporting window in seconds "
+                          "(default [uptime].report_window_seconds)")
+    p_u.add_argument("--outages", action="store_true",
+                     help="print the outage history instead of the summary")
+    p_u.set_defaults(func=cmd_uptime)
+
     p_b = sub.add_parser("baselines", help="inspect or reset learned baselines")
     p_b.add_argument("config")
     p_b.add_argument("--camera", help="filter to one camera IP")
@@ -337,6 +449,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="delete alert rows older than N days")
     p_p.add_argument("--notifications-days", type=float,
                      help="delete notification audit rows older than N days")
+    p_p.add_argument("--outages-days", type=float,
+                     help="delete CLOSED outage rows older than N days")
+    p_p.add_argument("--sessions-days", type=float,
+                     help="delete ENDED monitor session rows older than N days")
     p_p.set_defaults(func=cmd_prune)
 
     p_w = sub.add_parser("web", help="serve the local dashboard")
