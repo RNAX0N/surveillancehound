@@ -33,9 +33,21 @@ $(document).ready(function() {
     $("#saveAct").click(function () {
         $("#saveAct").prop("disabled", true);
         saveFormToEndpoint("/api/hound/settings/set", 'frm_general_settings', function () {
-            ajaxCall("/api/hound/service/reload", {}, function () {
-                updateServiceStatusUI('hound');
+            // Saving only writes config.xml. The daemon reads
+            // /usr/local/etc/hound.toml, which this re-renders — without it
+            // the settings look applied but the daemon keeps the old file.
+            ajaxCall("/api/hound/service/reload", {}, function (data, status) {
                 $("#saveAct").prop("disabled", false);
+                if (!data || data.status !== 'ok') {
+                    $("#hound-save-error")
+                        .text((data && data.message)
+                            ? data.message
+                            : "{{ lang._('Settings were saved but the configuration could not be applied.') }}")
+                        .show();
+                } else {
+                    $("#hound-save-error").hide();
+                }
+                updateServiceStatusUI('hound');
                 if ($("#dashboard").hasClass("active")) {
                     loadDashboard();
                 }
@@ -222,6 +234,7 @@ $(document).ready(function() {
                        ['fields': generalForm, 'id': 'frm_general_settings']) }}
             <div class="col-md-12">
                 <hr/>
+                <div id="hound-save-error" class="alert alert-danger" style="display:none;"></div>
                 <button class="btn btn-primary" id="saveAct" type="button"
                         data-endpoint="/api/hound/settings/set"
                         data-label="{{ lang._('Save') }}"

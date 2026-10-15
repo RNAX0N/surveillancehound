@@ -272,11 +272,62 @@ def _check_interface_is_resolved() -> None:
     print("  interface: the alias stored by the form resolves to the device")
 
 
+
+def _check_ui_endpoints_exist() -> None:
+    """Every /api/hound/... the view calls must resolve to a real action.
+
+    A UI pointed at a nonexistent endpoint fails as "Endpoint not found",
+    and when it is a follow-up call the failure is quiet in the worst way:
+    Save itself succeeds, config.xml is written, and the operator believes
+    the change is live while the daemon keeps running the previously
+    rendered file. `reload` was exactly that — the base controller supplies
+    start/stop/restart/status/reconfigure and nothing else.
+    """
+    view = (PLUGIN / "views/OPNsense/Hound/index.volt").read_text()
+    called = set(re.findall(r'["\'](/api/hound/([a-z]+)/([a-zA-Z]+))["\']', view))
+
+    # actions defined in our own controllers
+    own: dict[str, set[str]] = {}
+    for php in (PLUGIN / "controllers/OPNsense/Hound/Api").glob("*.php"):
+        ctrl = php.stem.replace("Controller", "").lower()
+        own[ctrl] = {
+            m.lower() for m in
+            re.findall(r"public function ([a-zA-Z]+)Action", php.read_text())
+        }
+
+    # actions inherited from the OPNsense base classes we extend
+    inherited = {
+        "ApiMutableModelControllerBase": {"get", "set"},
+        "ApiMutableServiceControllerBase": {
+            "start", "stop", "restart", "status", "reconfigure",
+        },
+        "ApiControllerBase": set(),
+    }
+    for php in (PLUGIN / "controllers/OPNsense/Hound/Api").glob("*.php"):
+        ctrl = php.stem.replace("Controller", "").lower()
+        text = php.read_text()
+        for base, acts in inherited.items():
+            if re.search(rf"extends[ \t]+{base}(?![A-Za-z])", text):
+                own[ctrl] |= acts
+
+    missing = []
+    for full, ctrl, action in sorted(called):
+        if action.lower() not in own.get(ctrl, set()):
+            missing.append(f"{full} (controller {ctrl!r} has: "
+                           f"{sorted(own.get(ctrl, []))})")
+    assert not missing, (
+        "the view calls endpoint(s) that do not exist:\n    "
+        + "\n    ".join(missing)
+    )
+    print(f"  endpoints: all {len(called)} /api/hound/* calls in the view resolve")
+
+
 def main() -> int:
     print("=== OPNsense field wiring ===")
     _check_inventories()
     _check_round_trip()
     _check_interface_is_resolved()
+    _check_ui_endpoints_exist()
     print("\nOPNSENSE FIELD VERIFICATION PASSED")
     return 0
 
