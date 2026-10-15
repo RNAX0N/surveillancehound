@@ -24,16 +24,23 @@
         <network>
             <camera_ips type="CSVListField">
                 <Required>N</Required>
-                <ValidationMessage>One IP per entry; comma-separated.</ValidationMessage>
+                <Mask>/^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}|[0-9A-Fa-f:]+)$/u</Mask>
+                <ValidationMessage>Enter IP addresses, one per entry. Hostnames are not supported - the daemon does no DNS resolution and only sees addresses on the wire. To cover a whole range use Camera subnets instead.</ValidationMessage>
             </camera_ips>
             <camera_subnets type="CSVListField">
                 <Required>N</Required>
+                <Mask>/^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(\/(3[0-2]|[12]?\d))?|[0-9A-Fa-f:]+(\/(12[0-8]|1[01]\d|[1-9]?\d))?)$/u</Mask>
+                <ValidationMessage>Enter CIDR ranges such as 192.168.10.0/24 (a bare address means a single host). Hostnames are not supported.</ValidationMessage>
             </camera_subnets>
             <nvr_ips type="CSVListField">
                 <Required>N</Required>
+                <Mask>/^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}|[0-9A-Fa-f:]+)$/u</Mask>
+                <ValidationMessage>Enter IP addresses, one per entry. Hostnames are not supported.</ValidationMessage>
             </nvr_ips>
             <manufacturer_allowlist type="CSVListField">
                 <Required>N</Required>
+                <Mask>/^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(\/(3[0-2]|[12]?\d))?|[0-9A-Fa-f:]+(\/(12[0-8]|1[01]\d|[1-9]?\d))?)$/u</Mask>
+                <ValidationMessage>Enter CIDR ranges such as 203.0.113.0/24. Hostnames are not supported.</ValidationMessage>
             </manufacturer_allowlist>
         </network>
         <thresholds>

@@ -62,6 +62,7 @@ Schema (see hound.toml.example):
 
 from __future__ import annotations
 
+import ipaddress
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -283,6 +284,63 @@ def load_from_dict(data: dict) -> HoundCfg:
     return _from_dict(data)
 
 
+def _addresses(section: dict, key: str) -> list[str]:
+    """Validate a list of bare IP addresses.
+
+    The daemon never resolves DNS — it only ever sees addresses on the
+    wire — so a hostname here matches nothing. Left unvalidated that fails
+    *silently*: the device is never classified as a camera, so it gets no
+    uptime tracking and no camera alerts, and the config looks perfectly
+    reasonable. Refusing it at load time is the only honest option.
+    """
+    out = []
+    for raw in section.get(key, []):
+        value = str(raw).strip()
+        if not value:
+            continue
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            hint = (
+                f"config: [network].{key} entry {value!r} is not an IP address. "
+            )
+            if "/" in value:
+                hint += (
+                    f"It looks like a CIDR — put ranges in "
+                    f"[network].{key.replace('_ips', '_subnets')} instead."
+                )
+            else:
+                hint += (
+                    "Hostnames are not supported: the daemon does no DNS "
+                    "resolution and only ever sees addresses on the wire. "
+                    "Use the address, or cover the whole range with "
+                    "[network].camera_subnets."
+                )
+            raise ValueError(hint) from None
+        out.append(value)
+    return out
+
+
+def _networks(section: dict, key: str) -> list[str]:
+    """Validate a list of CIDRs (a bare address is accepted as a /32)."""
+    out = []
+    for raw in section.get(key, []):
+        value = str(raw).strip()
+        if not value:
+            continue
+        try:
+            ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            raise ValueError(
+                f"config: [network].{key} entry {value!r} is not a network. "
+                f"Use CIDR notation such as 192.168.10.0/24. Hostnames are "
+                f"not supported — the daemon does no DNS resolution and only "
+                f"ever sees addresses on the wire."
+            ) from None
+        out.append(value)
+    return out
+
+
 def _from_dict(data: dict) -> HoundCfg:
     cap = data.get("capture", {})
     net = data.get("network", {})
@@ -313,10 +371,10 @@ def _from_dict(data: dict) -> HoundCfg:
         )
 
     network = NetworkCfg(
-        camera_ips=list(net.get("camera_ips", [])),
-        camera_subnets=list(net.get("camera_subnets", [])),
-        nvr_ips=list(net.get("nvr_ips", [])),
-        manufacturer_allowlist=list(net.get("manufacturer_allowlist", [])),
+        camera_ips=_addresses(net, "camera_ips"),
+        camera_subnets=_networks(net, "camera_subnets"),
+        nvr_ips=_addresses(net, "nvr_ips"),
+        manufacturer_allowlist=_networks(net, "manufacturer_allowlist"),
     )
     thresholds = ThresholdCfg(
         bulk_inbound_bytes=int(th.get("bulk_inbound_bytes", 1_048_576)),
