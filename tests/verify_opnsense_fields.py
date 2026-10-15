@@ -150,11 +150,36 @@ def _model_fields() -> list[tuple[str, str]]:
     return out
 
 
+def _model_root() -> str:
+    """The key `getAction` wraps the model in — the last path element of
+    <mount>, lowercased. For //OPNsense/Hound that is `hound`."""
+    root = ET.parse(MODEL_XML).getroot()
+    mount = (root.findtext("mount") or "").rstrip("/")
+    assert mount, "model has no <mount>"
+    return mount.rsplit("/", 1)[-1].lower()
+
+
 def _check_inventories() -> None:
-    """Model, form and this test must agree on the field set."""
+    """Model, form and this test must agree on the field set.
+
+    Form ids must carry the model-root prefix. OPNsense's getAction wraps
+    the model, so the payload is {"hound": {"general": ...}} and
+    mapDataToFormUI matches ids against that shape. An id of
+    `general.interface` matches nothing: the field silently never
+    populates, and Save posts the wrong shape. Every field looked present
+    in the UI while none of them were actually bound.
+    """
+    prefix = _model_root() + "."
     model = {name for name, _ in _model_fields()}
-    form = set(re.findall(r"<id>([^<]+)</id>", FORM_XML.read_text()))
+    form_raw = set(re.findall(r"<id>([^<]+)</id>", FORM_XML.read_text()))
     covered = set(FIELDS)
+
+    unprefixed = sorted(i for i in form_raw if not i.startswith(prefix))
+    assert not unprefixed, (
+        f"form id(s) missing the '{prefix}' model-root prefix: {unprefixed} — "
+        f"these will never bind to the API payload"
+    )
+    form = {i[len(prefix):] for i in form_raw}
 
     assert not (model - form), f"in the model but not the form: {sorted(model - form)}"
     assert not (form - model), f"in the form but not the model: {sorted(form - model)}"
@@ -166,7 +191,8 @@ def _check_inventories() -> None:
         f"this test covers field(s) the model no longer has: "
         f"{sorted(covered - model)}"
     )
-    print(f"  inventory: {len(model)} fields, model/form/test all agree")
+    print(f"  inventory: {len(model)} fields, model/form/test agree; "
+          f"all form ids carry the '{prefix}' prefix")
 
 
 def _build_config_xml() -> str:
