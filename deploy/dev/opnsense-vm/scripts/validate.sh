@@ -131,7 +131,8 @@ echo "═══ 3. Model ↔ render_config.py round-trip ═══"
 #     against the system's interface aliases (`lan`/`wan`/`opt1`...), NOT
 #     against bare NIC names — using `vtnet0` would 400.
 save_resp="$(ui -H 'Content-Type: application/json' \
-    -d '{"hound":{"general":{"enabled":"1","interface":"lan","camera_ips":"192.168.10.20"}}}' \
+    -d '{"hound":{"general":{"enabled":"1","interface":"lan"},
+          "network":{"camera_ips":"192.168.10.20"}}}' \
     -X POST "https://127.0.0.1:${HOST_HTTPS_PORT}/api/hound/settings/set")"
 check "POST /api/hound/settings/set succeeds" '"saved"' "${save_resp}"
 
@@ -149,14 +150,24 @@ toml_size="$(${SSH} 'wc -c < /usr/local/etc/hound.toml 2>/dev/null || echo 0' | 
 check "rendered hound.toml is non-empty" '^[1-9][0-9]*$' "${toml_size}"
 
 # 3e. The rendered TOML has the saved interface and parses cleanly
-parse_out="$(${SSH} "cd /usr/local/src/SurveillanceHound && \
-    PYTHONPATH=src ${PY} -c '
+# The python package lives under /usr/local/src/SurveillanceHound after
+# `make plugin-drop`, and under /usr/local/share/hound/lib after a real
+# `pkg install os-hound` — validate has to work against either.
+PYLIB="$(${SSH} 'for d in /usr/local/src/SurveillanceHound/src /usr/local/share/hound/lib; do
+    [ -d "$d/surveillancehound" ] && { echo "$d"; break; }
+done' 2>/dev/null | tr -d '\r' | head -1)"
+check "python package present on the VM" "surveillancehound|/usr/local" "${PYLIB:-<not found>}"
+parse_out="$(${SSH} "PYTHONPATH='${PYLIB}' ${PY} -c '
 import tomllib, surveillancehound.config as c, sys
 with open(\"/usr/local/etc/hound.toml\", \"rb\") as f: data = tomllib.load(f)
 cfg = c.load_from_dict(data)
 print(\"OK loaded interface=\" + (cfg.capture.interface or \"<none>\") + \" cameras=\" + str(len(cfg.network.camera_ips)))
 '" 2>&1)"
 check "TOML round-trips through load_from_dict" "^OK loaded" "${parse_out}"
+# camera_ips lives under <network>, not <general> — posting it in the wrong
+# section is silently dropped by the model, which used to leave this whole
+# round-trip asserting an empty camera list.
+check "saved camera_ips survived the round-trip" "cameras=1" "${parse_out}"
 
 echo
 echo "═══ Summary ═══"
