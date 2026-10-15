@@ -828,6 +828,112 @@ def _check_agent_is_silent(tmp: Path) -> None:
     print("  agent mode: dispatch disabled, relay client constructed")
 
 
+def _check_resource_bounds(tmp: Path) -> None:
+    """Quota, disk guard and VACUUM guard.
+
+    Retention bounds how old relayed rows get. These bound how many, and
+    how much damage a write can do when the disk is nearly gone — the two
+    cases where a sensor holding a valid key is still a liability.
+    """
+    import os as _os
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "bounds.sqlite")
+    T = 1_700_000_000.0
+
+    # --- per-sensor quota: oldest trimmed, newest kept, cap respected
+    cap = 10
+    for i in range(25):
+        recs = V.validate_records(
+            {"alerts": [{
+                "remote_id": i, "ts": T + i, "device_ip": "10.0.0.5",
+                "kind": "new_device", "severity": "low",
+                "summary": f"a{i}", "detail": "", "dedup_key": f"k{i}",
+            }]}, 100)
+        store.ingest_remote_batch("noisy", "inst", i + 1, recs, T + i,
+                                  max_rows_per_sensor=cap)
+    rows = store._conn.execute(
+        "SELECT ts FROM remote_alerts WHERE sensor_id='noisy' ORDER BY ts"
+    ).fetchall()
+    assert len(rows) == cap, f"quota not enforced: {len(rows)} rows, cap {cap}"
+    assert rows[0]["ts"] == T + 15, (
+        "quota must evict the OLDEST rows; the recent picture is the one "
+        f"worth keeping (kept from ts={rows[0]['ts'] - T})"
+    )
+
+    # A hostile sensor must only ever be able to evict ITS OWN history.
+    quiet = V.validate_records(
+        {"alerts": [{"remote_id": 1, "ts": T, "device_ip": "10.0.0.9",
+                     "kind": "new_device", "severity": "low",
+                     "summary": "quiet", "detail": "", "dedup_key": "q"}]}, 100)
+    store.ingest_remote_batch("quiet", "i2", 1, quiet, T, max_rows_per_sensor=cap)
+    for i in range(25, 60):
+        recs = V.validate_records(
+            {"alerts": [{"remote_id": i, "ts": T + i, "device_ip": "10.0.0.5",
+                         "kind": "new_device", "severity": "low",
+                         "summary": f"a{i}", "detail": "", "dedup_key": f"k{i}"}]},
+            100)
+        store.ingest_remote_batch("noisy", "inst", i + 1, recs, T + i,
+                                  max_rows_per_sensor=cap)
+    assert store._conn.execute(
+        "SELECT COUNT(*) c FROM remote_alerts WHERE sensor_id='quiet'"
+    ).fetchone()["c"] == 1, (
+        "one sensor flooding must never evict another sensor's rows"
+    )
+
+    # cap of 0 disables, and must not delete anything
+    before = store._conn.execute(
+        "SELECT COUNT(*) c FROM remote_alerts").fetchone()["c"]
+    recs = V.validate_records(
+        {"alerts": [{"remote_id": 999, "ts": T + 999, "device_ip": "10.0.0.5",
+                     "kind": "new_device", "severity": "low", "summary": "z",
+                     "detail": "", "dedup_key": "z"}]}, 100)
+    store.ingest_remote_batch("noisy", "inst", 10_000, recs, T + 999,
+                              max_rows_per_sensor=0)
+    assert store._conn.execute(
+        "SELECT COUNT(*) c FROM remote_alerts").fetchone()["c"] == before + 1, (
+        "max_rows_per_sensor=0 must disable trimming entirely"
+    )
+    print(f"  quota: trims oldest to cap, scoped per sensor, 0 disables")
+
+    # --- VACUUM guard: never run it when free space cannot cover a rewrite
+    store._VACUUM_HEADROOM = 1e18          # demand an impossible amount
+    assert store._vacuum_is_safe() is False, (
+        "VACUUM must be skipped when the disk cannot hold a second copy"
+    )
+    store._VACUUM_HEADROOM = 2.0
+    assert store._vacuum_is_safe() is True, "normal case must still VACUUM"
+
+    # Skipping must still DELETE: data goes, only reclamation waits.
+    store._VACUUM_HEADROOM = 1e18
+    d = store.prune_remote(T + 10_000)
+    assert sum(d.values()) > 0, "prune must delete even when VACUUM is skipped"
+    store._VACUUM_HEADROOM = 2.0
+    print("  vacuum guard: skipped when space is short, rows still deleted")
+
+    # --- disk guard: fails OPEN when unknowable, CLOSED when genuinely low
+    cfg = _collector_cfg(0, min_free_disk_mb=0.0)
+    srv = IngestServer(cfg, store, now=lambda: T)
+    assert srv._disk_ok() is True, "0 must disable the disk guard"
+    srv.cfg = _collector_cfg(0, min_free_disk_mb=1e12)   # a petabyte free
+    assert srv._disk_ok() is False, "guard must trip when free space is short"
+
+    real = _os.statvfs
+    def _boom(_p):
+        raise OSError("statvfs unavailable")
+    _os.statvfs = _boom
+    try:
+        assert srv._disk_ok() is True, (
+            "an unreadable filesystem must fail OPEN — refusing every batch "
+            "would turn an unknown into a total relay outage"
+        )
+    finally:
+        _os.statvfs = real
+    store.close()
+    print("  disk guard: trips when low, fails open when unreadable")
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -843,6 +949,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         _check_remote_store(Path(td))
         _check_quarantine(Path(td))
+        _check_resource_bounds(Path(td))
     print("=== listener ===")
     with tempfile.TemporaryDirectory() as td:
         _check_listener(Path(td))

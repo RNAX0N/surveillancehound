@@ -206,6 +206,15 @@ class RelayCfg:
     max_batches_per_minute: int = 60
     clock_skew_seconds: float = 300.0
     remote_retention_days: float = 30.0
+    # Retention bounds how OLD relayed rows get; this bounds how MANY. A
+    # sensor holding a valid key can otherwise outrun a 30-day window by
+    # orders of magnitude, so the cap is what makes collector disk usage a
+    # function of sensor COUNT rather than of sensor BEHAVIOUR. 0 disables.
+    max_rows_per_sensor: int = 250_000
+    # Refuse to ingest when the filesystem holding the store is nearly
+    # full. A wedged SQLite write is a far worse failure than a rejected
+    # batch the agent will spool and resend. 0 disables.
+    min_free_disk_mb: float = 256.0
     sensors: list[RelaySensorCfg] = field(default_factory=list)
 
     @property
@@ -443,6 +452,8 @@ def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
         max_batches_per_minute=int(rl.get("max_batches_per_minute", 60)),
         clock_skew_seconds=float(rl.get("clock_skew_seconds", 300.0)),
         remote_retention_days=float(rl.get("remote_retention_days", 30.0)),
+        max_rows_per_sensor=int(rl.get("max_rows_per_sensor", 250_000)),
+        min_free_disk_mb=float(rl.get("min_free_disk_mb", 256.0)),
         sensors=[
             RelaySensorCfg(id=str(x.get("id", "")).strip(),
                            key=str(x.get("key", "")))

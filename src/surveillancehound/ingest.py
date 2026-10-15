@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import ssl
 import threading
@@ -132,6 +133,22 @@ class IngestServer:
 
     # ----- request handling -----
 
+    def _disk_ok(self) -> bool:
+        """Is there room to write? Fail OPEN if we cannot tell.
+
+        If `statvfs` is unavailable or errors, refusing every batch would
+        turn an unknown into an outage of the whole relay. The store's own
+        write errors remain the backstop in that case.
+        """
+        limit = self.cfg.min_free_disk_mb
+        if limit <= 0:
+            return True
+        try:
+            st = os.statvfs(self.store.path.parent)
+        except (OSError, AttributeError):
+            return True
+        return (st.f_bavail * st.f_frsize) >= (limit * 1024 * 1024)
+
     def handle_batch(self, source: str, body: bytes, headers) -> tuple[int, dict]:
         now = self.now()
 
@@ -215,9 +232,26 @@ class IngestServer:
             log.warning("relay: rejected batch from %s: %s", sensor_id, e)
             return HTTPStatus.BAD_REQUEST, {"error": str(e)}
 
+        # Last gate before writing. A full filesystem is the one failure
+        # that can damage the store rather than merely lose a batch, and
+        # the agent spools a rejection and resends it, so refusing here
+        # costs nothing a retry does not recover.
+        if not self._disk_ok():
+            log.error(
+                "relay: refusing ingest from %s — under %.0f MB free on the "
+                "store filesystem. Relayed data is being dropped until space "
+                "is freed; local capture is unaffected.",
+                sensor_id, self.cfg.min_free_disk_mb,
+            )
+            return HTTPStatus.INSUFFICIENT_STORAGE, {
+                "error": "collector is low on disk; retry later",
+                "retry_after": 300,
+            }
+
         counts = self.store.ingest_remote_batch(
             sensor_id, instance_id, seq, records, now,
             skew=skew, body_bytes=len(body),
+            max_rows_per_sensor=self.cfg.max_rows_per_sensor,
         )
 
         if self.on_alerts and records.get("alerts"):

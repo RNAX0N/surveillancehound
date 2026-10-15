@@ -295,3 +295,16 @@ keep      = 5
 # [[relay.sensor]]
 # id  = "frigate"
 # key = "<same shared secret>"
+#
+# Collector resource bounds. An agent holding a valid key is still a host
+# you do not control, so its data is bounded by age, by row count, and by
+# how little disk is left — not by trust.
+#
+# remote_retention_days = 30.0     # age out relayed rows; 0 keeps forever
+# max_rows_per_sensor   = 250000   # per table, oldest trimmed first; 0 = no cap
+# min_free_disk_mb      = 256.0    # refuse ingest below this; 0 disables
+#
+# A trimmed or refused batch is not lost data in the usual case: the agent
+# spools what it could not deliver and resends it. These limits exist so a
+# single talkative or hostile sensor cannot fill the disk that local capture
+# depends on.

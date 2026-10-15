@@ -32,6 +32,7 @@ daemon's continuous write load.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -961,9 +962,51 @@ class HoundStore:
                 deleted[table] = cur.rowcount
         return deleted
 
+    # Append-only relayed tables and the column that orders them oldest-first.
+    # Upsert-keyed tables are capped too: a sensor can claim an unbounded
+    # number of distinct IPs, so "one row per IP" is not a bound.
+    _QUOTA_TABLES = (
+        ("remote_flows", "last_seen"),
+        ("remote_alerts", "ts"),
+        ("remote_outages", "down_since"),
+        ("remote_devices", "last_seen"),
+        ("remote_uptime", "reported_at"),
+    )
+
+    def _enforce_sensor_quota(self, sensor_id: str, cap: int) -> int:
+        """Trim this sensor's rows to the `cap` newest in each table.
+
+        Called inside the ingest transaction so a batch can never leave the
+        store over quota, even briefly. Trimming the OLDEST is deliberate:
+        under a flood the recent picture is the one worth keeping, and it
+        also means a hostile sensor can only ever evict its own history,
+        never another sensor's and never any locally-observed row.
+        """
+        if cap <= 0:
+            return 0
+        trimmed = 0
+        for table, order_col in self._QUOTA_TABLES:
+            n = self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE sensor_id = ?",
+                (sensor_id,),
+            ).fetchone()[0]
+            if n <= cap:
+                continue
+            trimmed += self._conn.execute(
+                f"""DELETE FROM {table}
+                     WHERE rowid IN (
+                         SELECT rowid FROM {table}
+                          WHERE sensor_id = ?
+                          ORDER BY {order_col} ASC, rowid ASC
+                          LIMIT ?)""",
+                (sensor_id, n - cap),
+            ).rowcount
+        return trimmed
+
     def ingest_remote_batch(
         self, sensor_id: str, instance_id: str, seq: int, records: dict,
         now: float, skew: float = 0.0, body_bytes: int = 0,
+        max_rows_per_sensor: int = 0,
     ) -> dict[str, int]:
         """Write one validated batch. Atomic, including the seq bump.
 
@@ -1089,7 +1132,19 @@ class HoundStore:
                  1 if mon.get("blind") else 0,
                  float(mon.get("last_activity_ts", 0.0))),
             )
+
+            # Inside the same transaction: a batch must never leave this
+            # sensor over quota, not even between statements.
+            trimmed = self._enforce_sensor_quota(sensor_id, max_rows_per_sensor)
+        if trimmed:
+            log.warning(
+                "relay: sensor %r is over its %d-row quota; trimmed %d of "
+                "its oldest row(s). Raise [relay] max_rows_per_sensor if "
+                "this sensor is legitimately this busy.",
+                sensor_id, max_rows_per_sensor, trimmed,
+            )
         counts["total"] = total
+        counts["trimmed"] = trimmed
         return counts
 
     def remote_alert_last_at(self, sensor_id: str, dedup_key: str) -> float | None:
@@ -1454,10 +1509,40 @@ class HoundStore:
                 )
                 deleted["notifications"] = cur.rowcount
         # VACUUM must run outside a transaction
-        if any(deleted.values()):
+        if any(deleted.values()) and self._vacuum_is_safe():
             with self._lock:
                 self._conn.execute("VACUUM")
         return deleted
+
+    # VACUUM builds a complete second copy of the database before swapping
+    # it in, so it needs free space of at least the file's own size. Headroom
+    # above that covers WAL growth from the daemon still writing underneath.
+    _VACUUM_HEADROOM = 2.0
+
+    def _vacuum_is_safe(self) -> bool:
+        """Skip the VACUUM rather than risk filling the disk reclaiming space.
+
+        Running out of space mid-VACUUM on an appliance leaves no room for
+        the thing the daemon actually exists to do. A skipped VACUUM only
+        means the file stays sparse until the next prune; rows are already
+        deleted either way. Fail OPEN when the free space cannot be read,
+        matching the pre-existing behaviour.
+        """
+        try:
+            need = self.path.stat().st_size * self._VACUUM_HEADROOM
+            st = os.statvfs(self.path.parent)
+        except (OSError, AttributeError):
+            return True
+        free = st.f_bavail * st.f_frsize
+        if free >= need:
+            return True
+        log.warning(
+            "store: skipping VACUUM — it needs about %.0f MB free and only "
+            "%.0f MB is available. Rows were still deleted; the file will "
+            "stay sparse and be reused. Free disk to reclaim it.",
+            need / 1e6, free / 1e6,
+        )
+        return False
 
     def upsert_baselines_batch(self, rows: list[BaselineRow]) -> None:
         """Write back N dirty buckets in a single transaction. Called on the

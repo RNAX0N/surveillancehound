@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator
@@ -63,6 +64,9 @@ log = logging.getLogger(__name__)
 
 # how often (seconds) to evict idle flows + check for silent cameras
 _TICK_S = 5.0
+# Retention is housekeeping, not detection. Hourly is frequent enough to
+# bound disk and rare enough that it never competes with packet handling.
+_REMOTE_PRUNE_EVERY_S = 3600.0
 
 
 @dataclass
@@ -149,6 +153,11 @@ class Hound:
                 cfg.relay, self.store, on_alerts=self._on_relayed_alerts,
                 now=time.time,
             )
+        # Relayed rows arrive from hosts we do not control, so their volume
+        # is not ours to bound at write time. Retention is what keeps a
+        # collector's disk finite; without this sweep `remote_retention_days`
+        # is a config field that does nothing.
+        self._last_remote_prune = 0.0
         self.stats = RunStats()
         self._stop_flag = False
         # guards everything the watchdog tick and the packet path share
@@ -377,6 +386,36 @@ class Hound:
         # 3) write baselines back to disk on cadence (no-op if disabled)
         if self.baseliner is not None:
             self.baseliner.maybe_flush(self.store, now)
+        # 4) age out relayed rows (collector only, hourly)
+        self._maybe_prune_remote(now)
+
+    def _maybe_prune_remote(self, now: float) -> None:
+        """Age out relayed rows on an hourly cadence.
+
+        Only the collector accumulates these. The sweep is deliberately
+        cheap and failure-tolerant: a locked or unwritable database must
+        degrade to "disk keeps growing", never to a daemon that stops
+        capturing. Retention is the only bound on `remote_*` growth,
+        because the rows come from hosts whose volume we do not control.
+        """
+        if self.ingest is None:
+            return
+        days = self.cfg.relay.remote_retention_days
+        if days <= 0:                      # 0 disables, per config convention
+            return
+        if (now - self._last_remote_prune) < _REMOTE_PRUNE_EVERY_S:
+            return
+        self._last_remote_prune = now
+        try:
+            deleted = self.store.prune_remote(now - days * 86400.0)
+        except sqlite3.Error as e:
+            log.warning("relay: remote retention sweep failed: %s", e)
+            return
+        total = sum(deleted.values())
+        if total:
+            log.info("relay: retention removed %d relayed row(s) older "
+                     "than %.1f days: %s", total, days,
+                     ", ".join(f"{k}={v}" for k, v in deleted.items() if v))
 
     def _flush(self, flows: list[LiveFlow], *, now: float) -> None:
         for fl in flows:
