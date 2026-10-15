@@ -48,6 +48,7 @@ class DeviceClassifier:
     _nvr_set: set[str] = field(default_factory=set)
     _camera_nets: list = field(default_factory=list)
     _allow_nets: list = field(default_factory=list)
+    _lan_nets: list = field(default_factory=list)
     # learned roles persist for the lifetime of the daemon (and SQLite holds
     # the across-restart memory).
     _learned: dict[str, str] = field(default_factory=dict)
@@ -65,6 +66,25 @@ class DeviceClassifier:
             ipaddress.ip_network(c, strict=False)
             for c in self.network.manufacturer_allowlist
         ]
+        self._lan_nets = list(_LAN_NETWORKS) + [
+            ipaddress.ip_network(c, strict=False)
+            for c in self.network.lan_subnets
+        ]
+
+    def is_lan(self, ip: str) -> bool:
+        """True if `ip` is local for THIS deployment.
+
+        The built-in private ranges plus whatever `[network].lan_subnets`
+        adds. Prefer this over the module-level `is_lan()` anywhere a
+        classification decision is being made — the module function cannot
+        see the operator's configuration, so on a network numbered out of
+        public space it calls every local device foreign.
+        """
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(addr in n for n in self._lan_nets)
 
     def role_for(self, ip: str) -> str:
         # 1) explicit config wins

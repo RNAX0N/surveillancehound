@@ -32,6 +32,61 @@ from surveillancehound.store import HoundStore  # noqa: E402
 import make_synthetic_camera_pcap as mk  # noqa: E402
 
 
+def _check_lan_subnets() -> None:
+    """[network].lan_subnets must widen what counts as local.
+
+    Not every deployment numbers its cameras out of RFC-1918. On a network
+    using provider-assigned public space, the built-in private ranges call
+    every local device foreign, so ordinary camera-to-NVR traffic classifies
+    as telemetry_offnet and raises a MEDIUM alert for each flow. That is a
+    flood of false positives, and it makes the manufacturer allowlist
+    pointless because everything already looks off-network.
+    """
+    from surveillancehound.classify import FlowClassifier
+    from surveillancehound.config import load_from_dict
+    from surveillancehound.discover import DeviceClassifier, is_lan
+    from surveillancehound.flows import LiveFlow
+
+    def classify_with(lan_subnets):
+        cfg = load_from_dict({
+            "capture": {"pcap_file": "x.pcap"},
+            "network": {
+                "camera_ips": ["117.111.101.2"],
+                "nvr_ips": ["88.255.5.11"],
+                "lan_subnets": lan_subnets,
+            },
+        })
+        devices = DeviceClassifier(network=cfg.network)
+        fc = FlowClassifier(
+            network=cfg.network, thresholds=cfg.thresholds, devices=devices,
+        )
+        fl = LiveFlow(
+            proto="tcp", ep_a=("117.111.101.2", 554), ep_b=("88.255.5.11", 40000),
+            first_ts=1000.0, last_ts=1010.0, packets=50, bytes=50000,
+        )
+        fl.bytes_a_to_b, fl.bytes_b_to_a = 49000, 1000
+        return devices, fc.classify(fl).classification
+
+    devices, cls = classify_with([])
+    assert cls == "telemetry_offnet", cls
+    assert devices.is_lan("88.255.5.11") is False
+
+    devices, cls = classify_with(["117.111.0.0/16", "88.255.0.0/16"])
+    assert cls == "lan_normal", (
+        f"camera-to-NVR traffic inside a configured lan_subnet should be "
+        f"lan_normal, got {cls}"
+    )
+    assert devices.is_lan("88.255.5.11") is True
+    # a range NOT listed stays foreign
+    assert devices.is_lan("203.0.113.9") is False
+
+    # the module-level helper is unchanged — existing callers and the
+    # default deployment must behave exactly as before
+    assert is_lan("10.0.0.1") is True
+    assert is_lan("117.111.101.2") is False
+    print("  lan_subnets: widens 'local' without changing the default")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -149,6 +204,7 @@ def main() -> int:
               f"packets={cam.packet_count} bytes={cam.byte_count}")
 
         store.close()
+        _check_lan_subnets()
         print("\nHOUND END-TO-END VERIFICATION PASSED")
     return 0
 

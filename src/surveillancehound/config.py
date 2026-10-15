@@ -17,6 +17,7 @@ Schema (see hound.toml.example):
   camera_subnets  = ["192.168.10.0/24"]                  # cameras live here
   nvr_ips         = ["192.168.10.10"]                    # known NVR(s)
   manufacturer_allowlist = ["203.0.113.0/24"]            # vendor cloud CIDRs
+  lan_subnets     = ["100.64.0.0/10"]                    # extra ranges to treat as local
 
   [thresholds]
   bulk_inbound_bytes      = 1_048_576    # toward-camera total to flag bulk-inbound
@@ -102,6 +103,12 @@ class NetworkCfg:
     camera_subnets: list[str] = field(default_factory=list)
     nvr_ips: list[str] = field(default_factory=list)
     manufacturer_allowlist: list[str] = field(default_factory=list)
+    # Extra ranges to treat as local, ON TOP OF the built-in private ones.
+    # Not every deployment numbers its cameras out of RFC-1918 — an operator
+    # using provider-assigned public space internally would otherwise have
+    # every camera classified as off-network, which turns ordinary traffic
+    # into telemetry_offnet noise and makes the allowlist meaningless.
+    lan_subnets: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -375,6 +382,7 @@ def _from_dict(data: dict) -> HoundCfg:
         camera_subnets=_networks(net, "camera_subnets"),
         nvr_ips=_addresses(net, "nvr_ips"),
         manufacturer_allowlist=_networks(net, "manufacturer_allowlist"),
+        lan_subnets=_networks(net, "lan_subnets"),
     )
     thresholds = ThresholdCfg(
         bulk_inbound_bytes=int(th.get("bulk_inbound_bytes", 1_048_576)),

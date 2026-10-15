@@ -31,7 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from surveillancehound.config import NetworkCfg, ThresholdCfg
-from surveillancehound.discover import DeviceClassifier, is_lan
+from surveillancehound.discover import DeviceClassifier
 from surveillancehound.flows import LiveFlow
 
 
@@ -82,7 +82,7 @@ class FlowClassifier:
             camera_role = role_a if role_a == role_b else "mixed"
 
         peer_ip, peer_port = peer_ep
-        peer_on_lan = is_lan(peer_ip)
+        peer_on_lan = self.devices.is_lan(peer_ip)
         peer_allowlisted = self.devices.is_on_manufacturer_allowlist(peer_ip)
 
         if role_a == "camera" and role_b == "camera":
@@ -131,7 +131,7 @@ class FlowClassifier:
             )
 
         # neither endpoint is a camera
-        if peer_on_lan and is_lan(cam_ep[0]):
+        if peer_on_lan and self.devices.is_lan(cam_ep[0]):
             return self._mk("lan_normal", "info", cam_ep, peer_ep,
                             bytes_to_camera, bytes_from_camera,
                             "LAN-only traffic between non-camera devices.")
