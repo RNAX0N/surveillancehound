@@ -1,291 +1,241 @@
 # SurveillanceHound
 
-Always-running NVR / IP-camera network monitor. Sits on the wire (NVR host,
-firewall, or a switch SPAN/mirror port), watches the surveillance segment, and
-flags activity the surveillance threat model cares about — without disturbing
-the recordings.
+A network monitor for IP cameras and NVRs. You point it at the segment your
+cameras live on — the NVR's host, your firewall, or a switch mirror port — and
+it watches the traffic for the things that actually matter on a camera network.
+It never touches the recordings and it never talks to your cameras.
 
-**What it watches for**
+It reads packet headers only. No payloads, no DNS lookups, no video. That's a
+deliberate limit, not a missing feature: the daemon physically cannot leak your
+footage or credentials because it never reads them.
 
-- **`bulk_inbound`** — a large transfer *toward* a camera (model-weight push,
-  firmware update). HIGH.
-- **`control_channel_suspect`** — a long-lived / chatty session from a camera
-  to a public host on a non-routine port. MEDIUM.
-- **`telemetry_offnet`** — a camera talks to a public host that is *not* in the
-  manufacturer allowlist. MEDIUM.
-- **`behavioral_anomaly`** — *(opt-in `[baseline]`)* a camera's per-flow stats
-  drift > N σ from its learned per-(weekday, hour) envelope. MEDIUM.
-- **`new_device`** — an IP that has never been observed on the segment shows up.
-- **`new_peer`** — a known camera is now talking to a brand-new endpoint.
-- **`camera_offline`** — a known camera has been silent for too long. MEDIUM.
-- **`camera_recovered`** — a camera that was offline is sending traffic again,
-  with the outage duration. INFO.
-- **`camera_never_seen`** — a camera listed in `[network]` has *never* been
-  observed, and the startup grace period has elapsed: powered down before the
-  monitor started, wrong IP, or on a segment this sensor can't see. MEDIUM.
-- **`capture_stalled`** — zero packets of any kind for `capture_stall_seconds`.
-  The sensor itself is blind, so nothing else is being detected either.
-  Per-camera offline alerts are suppressed while stalled. HIGH.
+Zero runtime dependencies. Python 3.11+ and the standard library, nothing else.
+It runs on an NVR box, a Raspberry Pi, or a firewall without pulling in pip.
 
-**How it's built**
+## What it flags
 
-- Pure-Python pcap / pcapng parser (no scapy, no dpkt).
-- Live capture via `tcpdump` as a subprocess (universal; no libpcap binding).
-- SQLite stores devices, flows, alerts, learned baselines, snapshot index,
-  and the notification audit log.
-- Per-camera Welford baselining (opt-in) — deterministic, auditable, no model
-  files.
-- Per-camera ring-buffer packet capture (opt-in) — dumps a pcap of the
-  suspicious window to disk on alert, openable in Wireshark.
-- Notifications: `stdout`, `logfile` (size-rotating), `jsonlines`
-  (size-rotating), `webhook` (Slack / Discord / Teams / PagerDuty / generic),
-  `syslog` (RFC 5424 UDP/TCP — Security Onion / Graylog / Splunk / pfSense /
-  OPNsense / any SIEM), `email` (SMTP/STARTTLS), `ftp` / `ftps` — pick any
-  combination per `[[notify]]` block.
-- Local read-only web dashboard with a dark futuristic theme — pure stdlib
-  HTTP server, no external assets.
-- Zero runtime Python dependencies. Python 3.11+ for stdlib `tomllib`.
+The interesting ones first:
 
-## Install
+`bulk_inbound` (high) — somebody pushed a large file *to* a camera from off-net.
+That's the shape of a firmware flash or a model-weight drop, and it's the single
+most important thing on this list.
+
+`control_channel_suspect` (medium) — a camera is holding a long-lived or chatty
+session with a public host on an unusual port. Cameras shouldn't maintain
+C2-shaped connections.
+
+`telemetry_offnet` (medium) — a camera is talking to a public host that isn't in
+your manufacturer allowlist. Sometimes that's the vendor cloud you forgot to
+allowlist. Sometimes it isn't.
+
+`behavioral_anomaly` (medium, opt-in) — this camera's traffic doesn't match what
+this camera normally does at this hour on this weekday.
+
+Then the housekeeping ones: `new_device`, `new_peer`, `camera_offline`,
+`camera_recovered`, `camera_never_seen`, and `capture_stalled`. The last one
+means the sensor itself went blind — see [Uptime](#uptime-monitoring).
+
+## Quick start
 
 ```bash
-cd SurveillanceHound
-pip install -e .            # makes the `hound` CLI available
-# or, no install:
-PYTHONPATH=src python -m surveillancehound.cli ...
+pip install -e .                    # or skip it: PYTHONPATH=src python -m surveillancehound.cli
+cp hound.toml.example /etc/hound.toml
+$EDITOR /etc/hound.toml             # at minimum: [capture].interface and [network].camera_ips
+hound config-check /etc/hound.toml  # catches typos before you rely on it
+hound run /etc/hound.toml
 ```
 
-Live capture needs `tcpdump` on PATH and the capability to capture — either
-run as root, or grant the cap once:
+Live capture needs `tcpdump` and permission to use it. Either run as root or
+grant the capability once:
 
 ```bash
 sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)
 ```
 
-## Configure
-
-Copy `hound.toml.example` to (say) `/etc/hound.toml` and edit:
-
-- `[capture] interface` — the NIC the surveillance traffic crosses, OR
-  `pcap_file = ...` for offline replay.
-- `[network] camera_ips / camera_subnets / nvr_ips` — what's what on this LAN.
-- `[network] manufacturer_allowlist` — your vendor's cloud CIDRs (so legit
-  vendor telemetry doesn't pour out alerts).
-- `[[notify]]` blocks — every channel you want to dispatch through.
-- `[baseline]` — opt in to per-camera anomaly detection.
-- `[snapshot]` — opt in to per-camera pcap snapshots on alert.
-- `[web]` — opt in to the local dashboard.
-
-Validate before running:
-
-```bash
-hound config-check /etc/hound.toml
-```
-
-## Run
-
-```bash
-hound run /etc/hound.toml         # always-running daemon (SIGTERM to stop)
-hound replay /etc/hound.toml      # same loop against a pcap_file
-hound alerts /etc/hound.toml --limit 100 -v
-hound flows /etc/hound.toml --class bulk_inbound --limit 20
-hound devices /etc/hound.toml
-hound uptime /etc/hound.toml [--window 86400] [--outages]
-hound baselines /etc/hound.toml [--camera IP | --reset IP | --reset-all]
-hound snapshots /etc/hound.toml
-hound prune /etc/hound.toml --flows-days 30 --alerts-days 90
-hound web /etc/hound.toml [--host 0.0.0.0 --port 8080]
-```
-
-A hardened `systemd` unit is included at `deploy/hound.service` (drops to a
-DynamicUser with only `CAP_NET_RAW`+`CAP_NET_ADMIN`, ProtectSystem=strict, etc.):
+There's a hardened systemd unit in `deploy/hound.service` — it runs as a
+DynamicUser with only `CAP_NET_RAW` and `CAP_NET_ADMIN`, `ProtectSystem=strict`,
+`MemoryDenyWriteExecute=yes`:
 
 ```bash
 sudo cp deploy/hound.service /etc/systemd/system/
-sudo systemctl daemon-reload
 sudo systemctl enable --now hound
 journalctl -u hound -f
 ```
 
-## Firewall plugins
+## Running on a firewall
 
-Drop-in plugins for the two most common open-source firewalls:
+If your firewall already sees the camera traffic, that's the natural place for
+this to live.
 
-- **OPNsense** — `deploy/opnsense/` ships a full MVC plugin (model +
-  controllers + configd actions + a Python config renderer invoked from
-  configd). Adds **Services → SurveillanceHound** with a settings form,
-  an embedded live dashboard tab, and start/stop/restart/reload
-  controls. See `deploy/opnsense/README.md`.
-- **pfSense** — `deploy/pfsense/` is a legacy-style `<packagegui>`
-  package: `hound.xml` + `hound.inc` (renderer + install hooks) +
-  `hound.php` (the dashboard page). See `deploy/pfsense/README.md`.
+**OPNsense** — install it from the plugin catalogue:
 
-Both plugins render `/usr/local/etc/hound.toml` from the form on save
-and bounce the daemon. Both have validation tests under
-`tests/verify_plugins.py` (XML well-formedness, `sh -n` on rc.d
-scripts, PHP structural lint, AND the renderers' outputs are parsed by
-`tomllib` and round-tripped through `surveillancehound.config.load_from_dict`
-— so the plugins' output is guaranteed to be valid Hound config, not
-just syntactically valid PHP/XML).
+```sh
+fetch -o /usr/local/etc/pkg/repos/hound-repo.pub \
+  https://rnax0n.github.io/surveillancehound/opnsense/hound-repo.pub
+fetch -o /usr/local/etc/pkg/repos/hound.conf \
+  https://rnax0n.github.io/surveillancehound/opnsense/hound.conf
+pkg update && pkg install os-hound
+```
 
-## SIEM integration (Wazuh, Security Onion, Splunk, Graylog, …)
+Or do it from the GUI: **System → Firmware → Plugins**, tick **Show community
+plugins**, find `os-hound`, hit the **+**. (The checkbox is needed because
+OPNsense hides third-party plugins by default until they're installed. Your
+firmware also has to be current — OPNsense refuses to install any plugin while
+core is behind.) Either way you get **Services → SurveillanceHound** in the
+menu, with a settings form and the live dashboard embedded in the page.
 
-Two paths work with any modern SIEM; pick whichever fits your topology:
+**pfSense** — `deploy/pfsense/` is a legacy `<packagegui>` package. See the
+README in there.
 
-1. **JSON file + agent** — `[[notify]] type = "jsonlines"` writes one
-   JSON object per line to a rotating log file. A SIEM agent
-   (`wazuh-agent`, `filebeat`, `vector`, `fluent-bit`, …) tails it.
-2. **Syslog → manager** — `[[notify]] type = "syslog"` ships RFC 5424
-   over UDP or TCP (RFC 6587 octet-counting). Structured-data block
-   carries `kind` / `severity` / `device_ip` as parsed fields so SIEM
-   decoders extract them without regex.
+Both plugins write `/usr/local/etc/hound.toml` from the form and restart the
+daemon on save.
 
-For Wazuh specifically, `deploy/wazuh/` ships ready-to-install
-artifacts:
+## CLI
 
-- `hound-rules.xml` — custom Wazuh rules in the operator-defined
-  100200+ range, with MITRE ATT&CK tagging (T1190 / T1071 / T1041 /
-  T1095 / T1542 / T1499 / T1078) and sustained-attack correlation rules.
-- `hound-decoder.xml` — RFC 5424 sub-decoder for the syslog path (the
-  jsonlines path uses Wazuh's built-in `json` decoder, no custom needed).
-- `localfile-snippet.xml` — drop into `/var/ossec/etc/ossec.conf` to
-  tail Hound's jsonlines as JSON.
-
-See `deploy/wazuh/README.md` for both install paths + a
-`wazuh-logtest` snippet for verification.
-
-## Web dashboard
-
-`hound web <config>` serves a single-page dashboard at
-`http://127.0.0.1:8080/` (override with `--host`/`--port` or `[web]` config).
-It is **read-only** — no write endpoints, no auth, no sessions; bind to
-localhost-only by default and front it with your own reverse proxy + auth if
-you want it reachable elsewhere.
-
-The dashboard:
-
-- Live counters for cameras / NVRs / 24h alerts / baselines / snapshots
-- Color-coded alert stream (severity-tinted left bars + neon glow)
-- Recent flows with directional byte counters
-- Per-camera baseline buckets, grouped by weekday + hour
-- One-click `.pcap` downloads of any saved snapshot
-- A built-in help modal (auto-opens on first visit) that explains every
-  alert kind, severity, and operator workflow
-
-All CSS and JS is embedded — zero external requests, no CDN fetches, no
-fonts pulled from the internet. Stays inside the offline-by-default contract.
+```bash
+hound run <config>                 # the daemon
+hound replay <config>              # same pipeline against a pcap, for forensics
+hound alerts <config> --limit 100
+hound flows <config> --class bulk_inbound
+hound devices <config>
+hound uptime <config> [--outages]
+hound baselines <config> [--camera IP | --reset IP | --reset-all]
+hound snapshots <config>
+hound prune <config> --flows-days 30 --alerts-days 90
+hound web <config>
+```
 
 ## Uptime monitoring
 
-Per-camera liveness, outage history, and availability — enabled by default
-(`[uptime]`).
+Per-camera liveness, outage history and availability, on by default.
 
 ```bash
-hound uptime /etc/hound.toml                      # state + availability table
-hound uptime /etc/hound.toml --outages            # the downtime history
-curl -s localhost:8080/api/uptime | jq .          # same data, JSON
+hound uptime /etc/hound.toml
+hound uptime /etc/hound.toml --outages
+curl -s localhost:8080/api/uptime | jq .
 ```
 
-**Detection is passive.** A camera counts as up because packets from it were
-observed on the monitored interface. Nothing is probed — no ICMP, no TCP
-connect, no ONVIF keepalive. A camera that is powered and recording but no
-longer visible to this sensor (moved VLAN, mirror/SPAN port reconfigured)
-is indistinguishable from one that is powered down, and every surface says so
-rather than claiming liveness is verified. Active probing is on the roadmap;
-see `DevNotes.md`.
+**This is passive.** A camera counts as up because packets from it showed up on
+the wire. Nothing is pinged or port-scanned. So a camera that's powered on and
+recording happily, but has been moved to a VLAN this sensor can't see, looks
+exactly like one that's unplugged. Every screen says so rather than claiming the
+camera is "verified up". Active probing is on the roadmap — see `DevNotes.md`.
 
-Three things make the inference trustworthy enough to alert on:
+Three things keep that inference honest enough to page someone about:
 
-- **Cameras are seeded from config.** Every IP in `[network].camera_ips` /
-  `nvr_ips` is registered at startup, so one that was already powered down
-  before the daemon started raises `camera_never_seen` instead of being
-  silently absent from a table of things that look fine.
-- **The capture has a dead-man's-switch.** Zero packets of *any* kind for
-  `capture_stall_seconds` raises one `capture_stalled` (HIGH) and suppresses
-  the per-camera offline storm. A dead tcpdump and every camera failing at
-  once look identical from the inside; the difference matters enormously to
-  whoever is on call.
-- **Availability only counts watched time.** Outage spans are intersected
-  with recorded monitor sessions, so a daemon that was stopped for a day is
-  never charged to a camera as downtime. With no observation at all the figure
-  is `n/a`, never a fabricated 0% or 100%.
+Cameras get registered from your config at startup, so one that was already dead
+before the daemon booted raises `camera_never_seen` instead of just being absent
+from a table that otherwise looks fine.
 
-Outages live in their own table, and an *open* row is the camera's down-state —
-so a restart resumes an outage mid-flight rather than forgetting it or
-re-alerting. Alert dedup keys carry the outage id, which means a camera that
-flaps down → up → down inside `dedup_window_seconds` reports both outages
-instead of having the second one swallowed.
+There's a dead-man's-switch on the capture. If *no* packets arrive at all for
+`capture_stall_seconds`, you get one `capture_stalled` (high) and the per-camera
+offline alerts are suppressed. A wedged tcpdump and a dead PoE switch look
+identical from inside the daemon, and sending you twelve "camera offline" pages
+when the real answer is "your sensor is blind" is worse than useless.
+
+Availability only counts time the monitor was actually watching. Outage spans
+get intersected with recorded monitor sessions, so a daemon that was stopped
+overnight doesn't bill that to your cameras. If there's no observation at all
+you get `n/a`, not a made-up 0% or 100%.
+
+Outages live in their own table and an open row *is* the camera's down state, so
+restarting the daemon resumes an outage instead of forgetting it or re-alerting.
+Dedup keys carry the outage id, so a camera that flaps down/up/down inside the
+dedup window reports both outages instead of silently swallowing the second.
+
+## Web dashboard
+
+`hound web <config>` puts a single-page dashboard on `127.0.0.1:8080`. It's
+read-only — no write endpoints, no auth, no sessions. If you want it reachable
+from elsewhere, put your own reverse proxy and auth in front of it.
+
+You get live counters, a severity-coded alert stream, recent flows with
+directional byte counts, the uptime panel, per-camera baseline buckets, and
+one-click pcap downloads for saved snapshots. There's a help modal that opens on
+first visit and explains every alert kind.
+
+All the CSS and JS is inlined. No CDN, no web fonts, no external requests —
+same offline-by-default rule as the daemon.
 
 ## Behavioral baselining
 
-Two models share the same lifecycle (learn per-(camera, weekday, hour)
-bucket, gate alerts behind `min_samples`, persist to SQLite, fire
-`behavioral_anomaly`). Pick one via `[baseline].model`:
+Opt in with `[baseline]`. Two models, same lifecycle: learn a per-(camera,
+weekday, hour) bucket, hold fire until `min_samples`, persist to SQLite, raise
+`behavioral_anomaly`.
 
-- **`model = "welford"`** (default) — running per-feature `(mean, variance)`
-  via Welford's algorithm. Fires when a single feature exceeds
-  `z_threshold` standard deviations. Deterministic, auditable, O(1) per
-  bucket.
-- **`model = "hstree"`** — streaming **Half-Space Forest** (Tan, Ting, Liu —
-  *Fast Anomaly Detection for Streaming Data*, IJCAI 2011). A real
-  multivariate ML anomaly detector implemented in pure stdlib (just
-  `random` + `struct`). An ensemble of random projection trees scores
-  each flow against a learned reference window. Catches *joint* anomalies
-  Welford misses by construction — flows where every feature is
-  individually normal but their combination is rare. Honors the same
-  "zero runtime deps, offline-by-default" constraints as the rest of the
-  daemon (no PyTorch / onnxruntime / scikit-learn).
+`welford` (default) keeps a running mean and variance per feature and fires when
+one feature crosses `z_threshold` standard deviations. Deterministic, auditable,
+O(1) per bucket, and you can read the state straight out of the database.
 
-Tuning the HS-Forest: `hstree_n_trees` (default 8), `hstree_depth` (6),
-`hstree_window_size` (250 — samples before reference rollover), and
-`hstree_score_threshold` (0.7 in [0, 1]; higher = fewer alerts).
+`hstree` is a streaming Half-Space Forest (Tan, Ting & Liu, *Fast Anomaly
+Detection for Streaming Data*, IJCAI 2011) — an ensemble of random projection
+trees scoring each flow against a learned reference window. It catches joint
+anomalies that Welford misses by construction: flows where every individual
+feature looks normal but the combination is rare. Implemented in pure stdlib
+(`random` and `struct`), because pulling in PyTorch would defeat the point.
 
-Inspect or reset learned baselines via the CLI (works for both models):
+Tune it with `hstree_n_trees` (8), `hstree_depth` (6), `hstree_window_size`
+(250), `hstree_score_threshold` (0.7, higher means fewer alerts).
 
 ```bash
-hound baselines /etc/hound.toml                  # dumps Welford + HS-Forest
 hound baselines /etc/hound.toml --camera 10.0.0.5
-hound baselines /etc/hound.toml --reset 10.0.0.5 # stop the daemon first!
-hound baselines /etc/hound.toml --reset-all
+hound baselines /etc/hound.toml --reset-all     # stop the daemon first
 ```
 
 ## Forensic snapshots
 
-When `[snapshot].enabled = true`, the daemon keeps the last
-`window_seconds` of raw packets per camera in a RAM ring buffer. On any
-alert at severity ≥ `min_severity`, the matching camera's buffer is dumped
-to `<store_dir>/snapshots/<alert_id>.pcap` — open it in Wireshark for the
-full pre-alert context, not just the alert summary.
+With `[snapshot].enabled = true` the daemon keeps the last `window_seconds` of
+raw packets per camera in a RAM ring buffer. When an alert fires at or above
+`min_severity`, that camera's buffer gets written to
+`<store_dir>/snapshots/<alert_id>.pcap`. Open it in Wireshark and you have the
+whole conversation leading up to the alert, not just the summary line.
 
-```bash
-hound snapshots /etc/hound.toml --limit 20
-```
+The dashboard links them for download.
 
-The dashboard exposes snapshot pcaps as direct download links.
+## SIEM
 
-## What it does NOT do
+Two ways in, pick whichever matches your setup:
 
-- It does not record or transcode video. The NVR keeps doing that.
-- It does not inspect packet payloads. Headers only — that's the threat model.
-- It does not perform DNS resolution; alerts identify hosts by IP. Use your
-  firewall logs alongside if you need names.
-- It does not probe your cameras. Uptime is inferred from observed traffic,
-  never from a ping or a port check, so "offline" strictly means "not visible
-  to this sensor."
-- It does not validate C2PA / cryptographic provenance. That stays offline in
-  the sibling footageanalyzer project.
-- It does not phone home, fetch external assets, or load remote ML models.
-  Everything runs locally with the Python standard library.
+1. `[[notify]] type = "jsonlines"` writes one JSON object per line to a rotating
+   file. Point wazuh-agent, filebeat, vector or fluent-bit at it.
+2. `[[notify]] type = "syslog"` ships RFC 5424 over UDP or TCP. The
+   structured-data block carries `kind`, `severity` and `device_ip` as real
+   fields, so decoders don't have to regex the message.
+
+`deploy/wazuh/` has ready-made rules (operator range 100200+, MITRE ATT&CK
+tagged, with correlation rules for sustained activity), an RFC 5424 decoder for
+the syslog path, and an `ossec.conf` snippet for the jsonlines path.
+
+Other notify channels: `stdout`, `logfile`, `webhook` (Slack, Discord, Teams,
+PagerDuty or generic), `email` over SMTP/STARTTLS, and `ftp`/`ftps`. Stack as
+many `[[notify]]` blocks as you want, each with its own minimum severity.
+
+## What it deliberately doesn't do
+
+- Record or transcode video. Your NVR already does that.
+- Read packet payloads. Headers only — that's the threat model, not a TODO.
+- Resolve DNS. Alerts name hosts by IP; correlate with firewall logs if you need
+  names.
+- Probe your cameras. "Offline" strictly means "not visible to this sensor."
+- Check C2PA or cryptographic provenance. That lives in the sibling
+  footageanalyzer project.
+- Phone home, fetch remote assets, or download models. Everything is local.
 
 ## Tests
 
-No pytest harness — six focused end-to-end scripts:
+No pytest. Six end-to-end scripts, each of which exercises the real pipeline:
 
 ```bash
 PYTHONPATH=src python tests/verify_hound_end_to_end.py        # core daemon
-PYTHONPATH=src:tests python tests/verify_baseline.py          # baseliner
-PYTHONPATH=src:tests python tests/verify_snapshots_and_cli.py # snapshots + web + CLI
-PYTHONPATH=src python tests/verify_channels.py                # syslog + email + ftp + audit
-PYTHONPATH=src:tests python tests/verify_uptime.py            # liveness + outages + availability
-PYTHONPATH=src:tests python tests/verify_plugins.py           # opnsense + pfsense + wazuh
+PYTHONPATH=src:tests python tests/verify_baseline.py          # both baseline models
+PYTHONPATH=src:tests python tests/verify_snapshots_and_cli.py # snapshots, web, CLI
+PYTHONPATH=src python tests/verify_channels.py                # notify channels + audit log
+PYTHONPATH=src:tests python tests/verify_uptime.py            # liveness, outages, availability
+PYTHONPATH=src:tests python tests/verify_plugins.py           # opnsense, pfsense, wazuh
 ```
+
+There's also a disposable OPNsense VM rig under `deploy/dev/opnsense-vm/` that
+boots real OPNsense in QEMU and validates the plugin against it — `make help` in
+that directory. It exists because the Python tests can't cover Phalcon routing,
+configd actions, or the handful of FreeBSD packaging details that only show up
+on a real box.

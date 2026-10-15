@@ -121,7 +121,25 @@ jobs:
         run: |
           mkdir -p site/opnsense
           cp -a dist/repo/* site/opnsense/
-          echo "os-hound pkg repository" > site/index.html
+          # Ship the client-side repo config too, so installing is two
+          # fetches and a pkg install rather than "copy this from the repo
+          # and edit the URL by hand".
+          cp deploy/opnsense/pkg/hound.conf.sample site/opnsense/hound.conf
+          cat > site/index.html <<'HTML'
+          <!doctype html><meta charset="utf-8">
+          <title>SurveillanceHound pkg repository</title>
+          <h1>SurveillanceHound &mdash; OPNsense package repository</h1>
+          <p>On the firewall:</p>
+          <pre>
+          fetch -o /usr/local/etc/pkg/repos/hound-repo.pub \
+            https://rnax0n.github.io/surveillancehound/opnsense/hound-repo.pub
+          fetch -o /usr/local/etc/pkg/repos/hound.conf \
+            https://rnax0n.github.io/surveillancehound/opnsense/hound.conf
+          pkg update &amp;&amp; pkg install os-hound
+          </pre>
+          <p>Then <b>Services &rarr; SurveillanceHound</b>. Source:
+          <a href="https://github.com/RNAX0N/surveillancehound">github.com/RNAX0N/surveillancehound</a></p>
+          HTML
       - name: Upload Pages artifact
         if: ${{ steps.gate.outputs.have_key == 'true' }}
         uses: actions/upload-pages-artifact@v3

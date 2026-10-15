@@ -334,6 +334,55 @@ def _check_opnsense_interface_resolution() -> None:
     print("  OPNsense renderer: interface alias resolves to the real device")
 
 
+def _check_opnsense_pkg_build_script() -> None:
+    """Guard the two packaging defects that made os-hound unusable.
+
+    Neither is visible from Python, and neither was caught by five rounds of
+    VM testing, because the dev rig drops its own /usr/local/bin/hound shim
+    over the package's — so `service hound onestart` never once exercised
+    the wrapper that actually ships. These are cheap static assertions on
+    build-pkg.sh; they are not a substitute for building the package, but
+    they do fail loudly if someone removes either line.
+    """
+    script = (
+        Path(__file__).resolve().parent.parent
+        / "deploy/opnsense/pkg/build-pkg.sh"
+    ).read_text()
+
+    # 1. service(8) runs rc scripts with PATH=/sbin:/bin:/usr/sbin:/usr/bin —
+    #    no /usr/local/bin, which is where FreeBSD puts python3. Without the
+    #    prepend the wrapper cannot find any interpreter and daemon(8) -r
+    #    spins a restart loop logging "python 3.11+ not found" on a box with
+    #    python3 installed.
+    assert 'PATH="/usr/local/bin:/usr/local/sbin:$PATH"' in script, (
+        "build-pkg.sh: the CLI wrapper no longer prepends /usr/local/bin to "
+        "PATH — the packaged service will not find python3 under service(8)"
+    )
+    wrapper_start = script.index("cat > \"$STAGE/usr/local/bin/hound\"")
+    wrapper_end = script.index("WRAP\n", wrapper_start)
+    wrapper = script[wrapper_start:wrapper_end]
+    assert "PATH=" in wrapper, (
+        "the PATH prepend must be INSIDE the shipped wrapper, not merely "
+        "somewhere in the build script"
+    )
+
+    # 2. firmware/register.php only records a plugin in config.xml when a
+    #    file under /usr/local/opnsense/version/ carries product_id == the
+    #    package name. Without it the plugin never becomes "configured",
+    #    the UI labels it "(orphaned)", and sync.subr.sh will NOT reinstall
+    #    it after a firmware upgrade — the durability a subscribed repo is
+    #    supposed to buy silently does not apply.
+    assert '"$STAGE/usr/local/opnsense/version/hound"' in script, (
+        "build-pkg.sh no longer stages /usr/local/opnsense/version/hound — "
+        "the plugin will not register and will not survive firmware upgrades"
+    )
+    assert '"product_id": "${PKGNAME}"' in script, (
+        "the version metadata must carry product_id == the package name, or "
+        "register.php silently skips it"
+    )
+    print("  OPNsense pkg: wrapper PATH prepend + plugin registration staged")
+
+
 def _check_opnsense_renderer_error_path() -> None:
     """Missing config block should fail loudly, not silently emit garbage."""
     mod = _load_opnsense_renderer()
@@ -730,6 +779,7 @@ def main() -> int:
     print("=== OPNsense renderer ===")
     _check_opnsense_renderer()
     _check_opnsense_interface_resolution()
+    _check_opnsense_pkg_build_script()
     _check_opnsense_renderer_error_path()
     print()
     print("=== pfSense renderer ===")

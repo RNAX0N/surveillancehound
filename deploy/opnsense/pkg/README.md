@@ -37,19 +37,47 @@ release file is exactly that. **Tier C fixes this**: once the firewall has a
 configured, signed repo for `os-hound`, the package is a first-class citizen of
 `pkg upgrade` and the update process keeps it.
 
+## Does it show up in System → Firmware → Plugins?
+
+Yes. This was verified on a real OPNsense 26.1.6 box, and the answer matters
+because it is the difference between "a package you install over SSH" and "a
+plugin". OPNsense's `FirmwareController::infoAction()` filters the plugin list
+on nothing but the `os-` name prefix — there is **no repository allowlist**, so
+a plugin from a third-party repo is listed like any other.
+
+Two caveats that will otherwise waste your afternoon:
+
+- Repository provenance sets the **tier**. Anything not from `OPNsense` or
+  `SunnyValley` is tier 4, and tier-4 rows are hidden until you tick **Show
+  community plugins** — unless they are already installed or configured, in
+  which case they show unconditionally.
+- OPNsense refuses to install *any* plugin while core is behind its repo
+  ("Installation out of date..."). Update the firmware first. This is generic
+  OPNsense behaviour, nothing to do with this package.
+
+The plugin also has to register itself, or none of the durability below is
+real. `firmware/register.php` only records a plugin in `config.xml` when a file
+under `/usr/local/opnsense/version/` carries `product_id` equal to the package
+name. `build-pkg.sh` stages that file; without it the UI shows the plugin as
+"(orphaned)" and `sync.subr.sh` will not reinstall it after a firmware upgrade.
+
 ## Tier C — subscribe a firewall to the repo (recommended)
 
 1. The release workflow publishes a **signed pkg repository** to GitHub Pages at
    `https://rnax0n.github.io/surveillancehound/opnsense/` (only if you've set the
-   signing-key secret — see below).
+   signing-key secret — see below). It publishes the client-side `hound.conf`
+   alongside the catalogue, so there is nothing to hand-edit.
 2. On the firewall:
    ```sh
    fetch -o /usr/local/etc/pkg/repos/hound-repo.pub \
      https://rnax0n.github.io/surveillancehound/opnsense/hound-repo.pub
-   cp hound.conf.sample /usr/local/etc/pkg/repos/hound.conf   # edit RNAX0N in the url
+   fetch -o /usr/local/etc/pkg/repos/hound.conf \
+     https://rnax0n.github.io/surveillancehound/opnsense/hound.conf
    pkg update
    pkg install os-hound
    ```
+   Or, once the repo is configured, install it from the GUI: **System →
+   Firmware → Plugins**, tick **Show community plugins**, pick `os-hound`.
 3. Thereafter `pkg upgrade` updates `os-hound` like any other package.
 
 ## One-time signing-key setup (enables Tier C)
