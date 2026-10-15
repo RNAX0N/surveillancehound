@@ -11,14 +11,14 @@ Ansible — no extra deps beyond what a stock Arch / Debian box already has.
 
 | | |
 |---|---|
-| OPNsense version | **26.1.6** (`nano-amd64`) — `vars.sh` is the single source of truth |
+| OPNsense version | **26.1.6** by default (`serial-amd64`) — `vars.sh` is the single source of truth. Set `OPNSENSE_VERSION` for another one (26.7 is verified: FreeBSD 15.1, PHP 8.5) |
 | Mirror | `mirrors.nycbug.org` (pkgsrc-friendly, https, no auth) |
 | Image flavor | nano — pre-installed root FS, boots straight to a login prompt on serial |
 | Hypervisor | QEMU `x86_64` + KVM acceleration |
 | Memory / CPU | 1 GB / 1 vCPU (enough for `wazuh-logtest`-class workloads; bump in `vars.sh` if you push it) |
 | Disk | 8 GB qcow2 (raw image is ~3 GB; the grow gives room for `pkg install python311`) |
-| Networking | QEMU user-mode (SLIRP) with two host-side forwards: `localhost:2222 → guest:22` (SSH), `localhost:8443 → guest:443` (UI) |
-| Console | UNIX socket at `var/console.sock` — attach with `socat - UNIX-CONNECT:var/console.sock` |
+| Networking | QEMU user-mode (SLIRP) with three host-side forwards: `2222 → 22` (SSH), `8443 → 443` (UI), `8080 → 8080` (`hound web`). Non-default versions get a version-derived offset — see *Running more than one version* |
+| Console | UNIX socket at `<state dir>/console.sock` — attach with `make console` |
 | Root password | `hound-dev` (set on first boot; **dev/test only** — never expose this VM beyond localhost) |
 
 ## Quick start
@@ -39,6 +39,41 @@ make teardown     # stop + delete the qcow2 (keeps the original .img.bz cache)
 
 `make validate` is the only target that returns a non-zero exit on failure; the rest
 print human progress.
+
+## Running more than one version
+
+Every target honours `OPNSENSE_VERSION`. The state directory and all three host
+port forwards are derived from it, so two versions can be up at once and neither
+touches the other's disk, SSH key or API key:
+
+```bash
+make status                           # the default instance: var/, ssh 2222
+OPNSENSE_VERSION=26.7 make fetch      # cache/ is shared; filenames carry the version
+OPNSENSE_VERSION=26.7 make disk       # → var-26.7/opnsense.qcow2
+OPNSENSE_VERSION=26.7 make boot       # → ssh 2892, ui 9113, dash 8750
+OPNSENSE_VERSION=26.7 make first-boot
+OPNSENSE_VERSION=26.7 make status     # prints this instance's ports + paths
+```
+
+| | state dir | ssh | ui | dash |
+|---|---|---|---|---|
+| 26.1.6 (`RIG_BASE_VERSION`) | `var/` | 2222 | 8443 | 8080 |
+| 26.7 | `var-26.7/` | 2892 | 9113 | 8750 |
+
+The offset is `(major mod 10) * 100 + minor * 10` (26.7 → 670); override it with
+`PORT_OFFSET=<n>`, or pin individual ports with `HOST_SSH_PORT` / `HOST_HTTPS_PORT`
+/ `HOST_DASH_PORT`. The base version deliberately keeps the original paths and
+ports so an instance built before this existed needs no migration.
+
+Mind two things when adding a version:
+
+- the mirror directory is the release *series*, not always the full version —
+  26.7's image is `.../26.7/OPNsense-26.7-serial-amd64.img.bz2` and there is no
+  26.7.7 image. Set `OPNSENSE_RELEASE_DIR` if the two ever diverge further.
+- a fresh image's **webgui** password is OPNsense's default (`opnsense`);
+  `first-boot.sh` only rotates the *system* password that SSH uses. Never reset
+  the webgui password with PHP `local_user_set()` — it wipes
+  `/root/.ssh/authorized_keys` and locks the rig out of SSH.
 
 **The rig is key-only on purpose.** `ssh-wrap.sh` passes `BatchMode=yes`,
 `PreferredAuthentications=publickey` and `NumberOfPasswordPrompts=0`, so a
@@ -68,11 +103,13 @@ deploy/dev/opnsense-vm/
 │   ├── ssh-wrap.sh           ssh/scp helpers wired to the right key + port
 │   ├── plugin-drop.sh        scp deploy/opnsense/src + pkg install python311
 │   └── validate.sh           runs all Phalcon + configd assertions
-├── var/                      runtime state (qemu.pid, console.sock, ssh_key, logs)
+├── var/                      runtime state of the base instance (qemu.pid, console.sock, ssh_key, logs)
+├── var-<version>/            same, per non-default OPNSENSE_VERSION
+├── scripts/status.sh         what `make status` prints
 └── cache/                    downloaded image artifacts (gitignored)
 ```
 
-`var/` and `cache/` are gitignored — nothing here is checked in beyond the scripts
+`var/`, `var-*/` and `cache/` are gitignored — nothing here is checked in beyond the scripts
 themselves.
 
 ## What's actually being validated
@@ -97,7 +134,7 @@ genuinely can't reach:
 This VM exists for plugin validation, **not** for general OPNsense use:
 
 - Root password is a hard-coded dev string in `vars.sh`. Don't reuse it.
-- SSH is bound to `127.0.0.1:2222` on the host — never to a routable interface.
+- SSH is bound to `127.0.0.1` on the host (port 2222 for the base instance) — never to a routable interface.
 - The QEMU NIC is user-mode (SLIRP); the guest can reach the internet but the
   outside world cannot reach the guest except via the explicit `hostfwd` rules.
 - `make teardown` deletes the qcow2 but leaves `cache/` so re-creation is fast.

@@ -31,10 +31,10 @@ mv "${IMAGE_BZ_PATH}.part" "${IMAGE_BZ_PATH}"
 # need to compromise both. Good enough for a dev rig.)
 echo "[fetch] verifying against published checksum file"
 curl --fail --location --silent \
-     --output "${CACHE_DIR}/checksums.sha256" \
+     --output "${CHECKSUMS_PATH}" \
      "${OPNSENSE_CHECKSUMS_URL}"
 # OPNsense ships checksums in BSD format: "SHA256 (file) = hash"
-EXPECTED="$(grep -F "(${OPNSENSE_IMAGE_BZ})" "${CACHE_DIR}/checksums.sha256" | sed -E 's/.* = //')"
+EXPECTED="$(grep -F "(${OPNSENSE_IMAGE_BZ})" "${CHECKSUMS_PATH}" | sed -E 's/.* = //')"
 ACTUAL="$(sha256sum "${IMAGE_BZ_PATH}" | awk '{print $1}')"
 if [[ -z "${EXPECTED}" ]]; then
     echo "[fetch] WARNING: ${OPNSENSE_IMAGE_BZ} not listed in checksums file" >&2

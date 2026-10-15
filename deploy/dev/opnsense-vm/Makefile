@@ -6,11 +6,20 @@ RIG   := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
 .PHONY: help fetch disk boot stop teardown first-boot ssh plugin-drop validate package-test status console
 
+# Every target honours OPNSENSE_VERSION. Each version gets its own state dir
+# and its own host port forwards (see "Instance scoping" in vars.sh), so two
+# versions can be up at the same time:
+#   make boot                            # 26.1.6 → var/      , ssh 2222
+#   OPNSENSE_VERSION=26.7 make boot      # 26.7   → var-26.7/ , ssh 2892
+# `make status` prints the ports of the instance you selected.
+
 help:  ## show this help
 	@awk 'BEGIN{FS=":.*##"; printf "\nTargets:\n"} /^[a-z][a-zA-Z0-9_-]+:.*##/ {printf "  \033[1m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@echo "  (prefix any target with OPNSENSE_VERSION=<x.y[.z]> to act on that instance;"
+	@echo "   the default is 26.1.6 and keeps var/ + ports 2222/8443/8080)"
 	@echo
 
-fetch:        ## download + verify the OPNsense nano image (~300 MB, one-time)
+fetch:        ## download + verify the OPNsense serial image (~550 MB, one-time per version)
 	@$(RIG)/scripts/fetch-image.sh
 
 disk:         ## decompress + convert to qcow2, resize to 8 GB (one-time)
@@ -22,10 +31,10 @@ boot:         ## start the VM in the background
 stop:         ## graceful shutdown via QEMU monitor (falls back to kill)
 	@$(RIG)/scripts/stop.sh
 
-teardown:     ## stop + delete the qcow2 (cache/ is preserved)
+teardown:     ## stop + delete this instance's qcow2 (cache/ is preserved)
 	@$(RIG)/scripts/stop.sh || true
-	@rm -f $(RIG)/var/opnsense.qcow2 $(RIG)/var/*.sock $(RIG)/var/qemu.pid
-	@echo "teardown complete; cache/ preserved"
+	@source $(RIG)/vars.sh && rm -f "$$VAR_DIR"/opnsense.qcow2 "$$VAR_DIR"/*.sock "$$VAR_DIR"/qemu.pid \
+	  && echo "teardown complete for $$OPNSENSE_VERSION ($$VAR_DIR); cache/ preserved"
 
 first-boot:   ## drive the console to enable SSH + set root pw (one-time per fresh disk)
 	@$(RIG)/scripts/first-boot.sh
@@ -33,9 +42,10 @@ first-boot:   ## drive the console to enable SSH + set root pw (one-time per fre
 ssh:          ## interactive shell on the VM
 	@$(RIG)/scripts/ssh-wrap.sh ssh
 
-console:      ## attach to the live serial console (ctrl-o then "q" to detach in socat)
-	@echo "attaching to $(RIG)/var/console.sock — Ctrl-] then Ctrl-D to detach"
-	@socat - UNIX-CONNECT:$(RIG)/var/console.sock
+console:      ## attach to the live serial console (Ctrl-] then Ctrl-D to detach)
+	@source $(RIG)/vars.sh \
+	  && echo "attaching to $$CONSOLE_SOCK — Ctrl-] then Ctrl-D to detach" \
+	  && socat - UNIX-CONNECT:"$$CONSOLE_SOCK"
 
 plugin-drop:  ## scp deploy/opnsense/src/ over + pkg install python311
 	@$(RIG)/scripts/plugin-drop.sh
@@ -46,17 +56,5 @@ validate:     ## run all Phalcon + configd assertions; exits non-zero on failure
 package-test: ## build the os-hound .txz in the VM, pkg add it, assert it works (KEEP=1 to leave installed)
 	@$(RIG)/scripts/package-test.sh
 
-status:       ## show what's running
-	@if [ -f $(RIG)/var/qemu.pid ] && kill -0 "$$(cat $(RIG)/var/qemu.pid)" 2>/dev/null; then \
-	   echo "VM:       running (pid $$(cat $(RIG)/var/qemu.pid))"; \
-	else echo "VM:       stopped"; fi
-	@if [ -S $(RIG)/var/console.sock ]; then echo "console:  $(RIG)/var/console.sock"; fi
-	@if [ -f $(RIG)/var/opnsense.qcow2 ]; then \
-	   echo "disk:     $$(du -h $(RIG)/var/opnsense.qcow2 | cut -f1) at $(RIG)/var/opnsense.qcow2"; \
-	else echo "disk:     not built (make disk)"; fi
-	@if [ -f $(RIG)/cache/OPNsense-*.img.bz ]; then \
-	   echo "image:    $$(du -h $(RIG)/cache/OPNsense-*.img.bz | cut -f1) cached"; \
-	else echo "image:    not fetched (make fetch)"; fi
-	@if command -v ssh >/dev/null && nc -z 127.0.0.1 2222 2>/dev/null; then \
-	   echo "ssh:      open on 127.0.0.1:2222"; \
-	else echo "ssh:      not reachable yet"; fi
+status:       ## show this instance's paths, ports, disk and VM state
+	@$(RIG)/scripts/status.sh

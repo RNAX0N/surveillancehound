@@ -1,8 +1,11 @@
 cache/
 var/
+var-*/
 *.qcow2
 *.img
 *.img.bz
+*.img.bz2
+*.sha256
 *.sock
 *.pid
 ssh_key
