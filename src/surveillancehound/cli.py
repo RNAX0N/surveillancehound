@@ -32,6 +32,15 @@ Subcommands:
       OPNsense plugin, whose pages run under a Content-Security-Policy
       that blocks cross-origin iframes.
 
+  hound sensors <config.toml> [--forget ID]
+      Relay sensors this collector knows about: whether each is still
+      reporting, its clock skew, and how much it has sent.
+
+  hound relay <config.toml>
+      Relay health. On an agent: spool depth, last successful push, last
+      error — it reads the spool, not the network, so it still answers when
+      the link is down. On a collector: the TLS fingerprint to pin.
+
   hound baselines <config.toml> [--camera IP | --reset IP | --reset-all]
       Inspect learned per-camera baselines, or wipe them. NOTE: stop the
       daemon before --reset — it holds Welford state in RAM.
@@ -325,6 +334,9 @@ def cmd_export(args: argparse.Namespace) -> int:
         report = store.uptime_report(window, now)
         alerts = store.list_alerts(limit=args.limit)
         flows = store.recent_flows(limit=args.limit)
+        sensors = store.list_remote_sensors()
+        remote_up = store.remote_uptime_report(
+            now, cfg.relay.sensor_timeout_seconds)
         doc = {
             "now": now,
             "window_seconds": window,
@@ -342,7 +354,14 @@ def cmd_export(args: argparse.Namespace) -> int:
                 "nvrs": sum(1 for d in devices if d.role == "nvr"),
                 "alerts_24h": sum(1 for a in alerts if a.ts >= now - 86400),
             },
-            "uptime": [r.__dict__ for r in report],
+            "uptime": [dict(r.__dict__, sensor="local") for r in report],
+            "remote_uptime": remote_up,
+            "remote_alerts": store.list_remote_alerts(limit=args.limit),
+            "sensors": [
+                dict(x.__dict__,
+                     reporting=(now - x.last_seen) <= cfg.relay.sensor_timeout_seconds)
+                for x in sensors
+            ],
             "alerts": [a.__dict__ for a in alerts],
             "devices": [d.__dict__ for d in devices],
             "flows": [f.__dict__ for f in flows],
@@ -352,6 +371,98 @@ def cmd_export(args: argparse.Namespace) -> int:
     json.dump(doc, sys.stdout, default=str)
     sys.stdout.write("\n")
     return 0
+
+
+def cmd_sensors(args: argparse.Namespace) -> int:
+    """Relay sensors known to this collector."""
+    cfg = _cfg(args.config)
+    now = time.time()
+    store = HoundStore(path=cfg.store.path)
+    try:
+        if args.forget:
+            gone = store.forget_remote_sensor(args.forget)
+            total = sum(gone.values())
+            if not total:
+                print(f"no sensor named {args.forget!r}")
+                return 1
+            print(f"forgot {args.forget!r}: "
+                  + ", ".join(f"{k}={v}" for k, v in gone.items() if v))
+            return 0
+
+        rows = store.list_remote_sensors()
+        if not rows:
+            print("no relay sensors have reported yet")
+            return 0
+        timeout = cfg.relay.sensor_timeout_seconds
+        print(f"{'sensor':16s} {'state':14s} {'last batch':12s} {'skew':>8s} "
+              f"{'batches':>8s} {'records':>9s}")
+        for r in rows:
+            age = now - r.last_seen
+            state = "reporting" if age <= timeout else "NOT REPORTING"
+            print(f"{r.sensor_id:16s} {state:14s} {_dur(age) + ' ago':12s} "
+                  f"{r.clock_skew:+7.1f}s {r.batches:8d} {r.records:9d}")
+        print()
+        print("A sensor that stops reporting does not mean its cameras are "
+              "down — it means this collector cannot see that segment. Its "
+              "camera rows read 'unknown' rather than their last state.")
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_relay(args: argparse.Namespace) -> int:
+    """Relay health. Must work with the link down — that is when it is needed."""
+    cfg = _cfg(args.config)
+    r = cfg.relay
+    if r.mode == "off":
+        print("relay: off (single sensor). Set [relay].mode to agent or "
+              "collector to enable.")
+        return 0
+
+    if r.is_collector:
+        print(f"relay: collector on {r.listen_host}:{r.listen_port}")
+        fp = _cert_fingerprint(r.cert_file)
+        if fp:
+            print(f"  certificate fingerprint: {fp}")
+            print("  paste that into the agent's [relay].tls_fingerprint")
+        else:
+            print(f"  certificate: NOT READABLE at {r.cert_file!r} — the "
+                  f"listener will not start until it exists")
+        print(f"  configured sensors: {[x.id for x in r.sensors] or 'none'}")
+        return 0
+
+    # agent: read the spool, never the network
+    from surveillancehound.relay import AgentState, Spool
+    base = Path(cfg.store.path).parent / "relay"
+    state = AgentState.load(base)
+    spool = Spool(base, r.spool_max_bytes, r.spool_max_age_seconds)
+    st = spool.stats(time.time())
+    print(f"relay: agent {r.sensor_id!r} -> {r.url}")
+    print(f"  instance      {state.instance_id}")
+    print(f"  next sequence {state.next_seq}")
+    if state.last_push_ts:
+        print(f"  last push     {_dur(time.time() - state.last_push_ts)} ago")
+    else:
+        print("  last push     never")
+    print(f"  spooled       {st.pending} batch(es), {st.bytes / 1024:.1f} KiB, "
+          f"oldest {_dur(st.oldest_age)}")
+    if st.dropped_size or st.dropped_age or st.dropped_stale:
+        print(f"  dropped       {st.dropped_size} over size, "
+              f"{st.dropped_age} over age, {st.dropped_stale} rejected")
+    if state.last_error:
+        print(f"  last error    {state.last_error}")
+    return 0
+
+
+def _cert_fingerprint(path: str) -> str:
+    """sha256 fingerprint of a PEM certificate, or '' if unreadable."""
+    import hashlib
+    import ssl as _ssl
+    try:
+        der = _ssl.PEM_cert_to_DER_cert(Path(path).read_text())
+    except (OSError, ValueError):
+        return ""
+    return "sha256:" + hashlib.sha256(der).hexdigest()
 
 
 def cmd_baselines(args: argparse.Namespace) -> int:
@@ -588,6 +699,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_e.add_argument("--limit", type=int, default=100,
                      help="max alert and flow rows to include")
     p_e.set_defaults(func=cmd_export)
+
+    p_sn = sub.add_parser("sensors", help="relay sensors known to this collector")
+    p_sn.add_argument("config")
+    p_sn.add_argument("--forget", metavar="ID",
+                      help="delete a sensor and everything it ever sent")
+    p_sn.set_defaults(func=cmd_sensors)
+
+    p_rl = sub.add_parser("relay", help="relay health (works with the link down)")
+    p_rl.add_argument("config")
+    p_rl.set_defaults(func=cmd_relay)
 
     p_b = sub.add_parser("baselines", help="inspect or reset learned baselines")
     p_b.add_argument("config")

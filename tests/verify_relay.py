@@ -397,6 +397,11 @@ def _check_remote_store(tmp: Path) -> None:
             "a dead sensor's cameras must read unknown, never the up they "
             "last claimed"
         )
+        assert stale["availability"] is None, (
+            "a dead sensor's availability figure is as stale as its state; "
+            "rendering the last number as current is the same fabrication "
+            "as inventing one from no observation"
+        )
 
         # dedup lookups are scoped to remote_alerts
         assert store.remote_alert_last_at(

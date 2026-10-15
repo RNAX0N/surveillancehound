@@ -200,6 +200,16 @@ class _Handler(BaseHTTPRequestHandler):
                 store.list_outages(since=now - seconds, limit=200)
                 if want_outages else []
             )
+            # Relayed rows are kept separate all the way to the client, so
+            # the Sensor column is always truthful about provenance.
+            remote_cameras = store.remote_uptime_report(
+                now, self.cfg.relay.sensor_timeout_seconds)
+            sensors = [
+                dict(x.__dict__,
+                     reporting=(now - x.last_seen)
+                     <= self.cfg.relay.sensor_timeout_seconds)
+                for x in store.list_remote_sensors()
+            ]
         finally:
             store.close()
         stall_window = self.cfg.uptime.capture_stall_seconds
@@ -217,7 +227,9 @@ class _Handler(BaseHTTPRequestHandler):
             "window_seconds": seconds,
             "now": now,
             "evidence": "passive",
-            "cameras": [c.__dict__ for c in cameras],
+            "cameras": [dict(c.__dict__, sensor="local") for c in cameras],
+            "remote_cameras": remote_cameras,
+            "sensors": sensors,
             "outages": [o.__dict__ for o in outages],
             "monitor": {
                 "source": session.source if session else "",
@@ -694,6 +706,7 @@ main {
 .pill.up { color: var(--ok); }
 .pill.down { color: var(--bad); }
 .pill.never_seen { color: var(--warn); }
+.pill.unknown { color: var(--fg-mute); }
 .panel-note {
   padding: 10px 18px 14px;
   font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
@@ -1028,9 +1041,18 @@ function renderUptime(u) {
         + `<span>last heartbeat ${m.heartbeat_ts ? fmtAgo(m.heartbeat_ts) : "never"}</span>`;
   }
   mon += `<span>window ${fmtDur(u.window_seconds)}</span>`;
+  (u.sensors || []).forEach(sx => {
+    const cls = sx.reporting ? "ok" : "bad";
+    const label = sx.reporting ? "reporting" : "NOT REPORTING";
+    mon += `<span class="mon-state ${cls}">${escapeHTML(sx.sensor_id)}: ${label}</span>`;
+  });
   $("monitor-line").innerHTML = mon;
 
-  const cams = u.cameras || [];
+  // local rows first, then each relay sensor's. They are kept distinct
+  // rather than merged by address: the NVR is visible to both sensors and
+  // their availability is computed over different monitored windows, so
+  // collapsing them would invent a number neither sensor reported.
+  const cams = (u.cameras || []).concat(u.remote_cameras || []);
   const down = cams.filter(c => c.state !== "up").length;
   $("c-uptime").textContent = down
     ? `${down} of ${cams.length} not up` : `${cams.length} up`;
@@ -1041,16 +1063,16 @@ function renderUptime(u) {
   }
   // The two `opt` cells are dropped together with their columns at the
   // narrow breakpoint; keep the counts in step or rows shift out of line.
-  const head = ['state', 'ip', '', 'last seen', 'down for', 'avail']
+  const head = ['state', 'ip', 'sensor', 'last seen', 'down for', 'avail']
     .map((h, i) => `<div class="head${i === 2 || i === 3 ? ' opt' : ''}">${h}</div>`)
     .join("");
   $("uptime").innerHTML = '<div class="uptime-grid">' + head + cams.map(c => `
     <div class="cell"><span class="pill ${escapeHTML(c.state)}">${escapeHTML(c.state.replace("_", " "))}</span></div>
     <div class="cell ip">${escapeHTML(c.ip)}</div>
-    <div class="cell dim opt">${escapeHTML(c.role)}${num(c.outage_count) ? " · " + num(c.outage_count) + " outage" + (num(c.outage_count) === 1 ? "" : "s") : ""}</div>
+    <div class="cell dim opt">${escapeHTML(c.sensor || c.sensor_id || "local")}${num(c.outage_count) ? " · " + num(c.outage_count) + " outage" + (num(c.outage_count) === 1 ? "" : "s") : ""}</div>
     <div class="cell dim opt">${c.last_seen ? fmtAgo(c.last_seen) : "never"}</div>
     <div class="cell num">${fmtDur(c.current_downtime)}</div>
-    <div class="cell num">${c.availability === null ? "n/a" : (c.availability * 100).toFixed(2) + "%"}</div>
+    <div class="cell num">${(c.stale || c.availability === null) ? "n/a" : (num(c.availability) * 100).toFixed(2) + "%"}</div>
   `).join("") + '</div>';
 }
 

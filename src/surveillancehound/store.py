@@ -1161,6 +1161,10 @@ class HoundStore:
             if (now - d["reported_at"]) > stale_after:
                 d["state"] = "unknown"
                 d["stale"] = True
+                # Its availability is as stale as its state. Reporting the
+                # last figure as though it were current is the same
+                # fabrication as inventing one from no observation.
+                d["availability"] = None
             else:
                 d["stale"] = False
             out.append(d)
