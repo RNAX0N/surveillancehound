@@ -46,11 +46,18 @@ class DashboardController extends ApiControllerBase
         $raw = trim($backend->configdpRun('hound dashboard', [(string)$limit]));
 
         if ($raw === '') {
+            // configd returns an empty string for a `script_output` action
+            // whose command exited non-zero (it runs them with check=True and
+            // throws the output away), and for an action it does not know.
+            // Both mean "ask configd, not us" — so name the one command the
+            // operator can run to see the real reason.
             return [
                 'status' => 'failed',
                 'message' => gettext(
-                    'No response from the hound backend. Is the service ' .
-                    'installed and has it been started at least once?'
+                    'No response from the hound backend. Check that the ' .
+                    'plugin is fully installed (configd knows the "hound ' .
+                    'dashboard" action) and run "configctl hound dashboard ' .
+                    '10" from a shell to see what it reports.'
                 ),
             ];
         }
@@ -65,6 +72,13 @@ class DashboardController extends ApiControllerBase
                 'message' => gettext('Unexpected response from hound:') . ' ' .
                     substr($raw, 0, 300),
             ];
+        }
+
+        // `hound export` reports its own failures inside the document (and
+        // exits 0 so configd does not swallow them) — do not overwrite that
+        // with 'ok', or a real, explained error renders as an empty panel.
+        if (!empty($doc['status']) && $doc['status'] !== 'ok') {
+            return $doc;
         }
 
         $doc['status'] = 'ok';

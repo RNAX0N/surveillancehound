@@ -193,6 +193,47 @@ def _check_snapshots_cli(cfg_path: Path) -> None:
     print("  CLI: hound snapshots renders rows")
 
 
+def _check_export_cli(cfg_path: Path, missing_path: Path) -> None:
+    env = {"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"}
+    out = subprocess.run(
+        [sys.executable, "-m", "surveillancehound.cli",
+         "export", str(cfg_path), "--limit", "5"],
+        capture_output=True, text=True, check=True, env=env,
+    )
+    doc = json.loads(out.stdout)
+    assert doc.get("status") is None, doc.get("status")
+    assert "counts" in doc and "monitor" in doc, sorted(doc)
+
+    # Missing config: the OPNsense dashboard reads this command through a
+    # configd `script_output` action, which runs with check=True — a non-zero
+    # exit makes configd discard stdout and the UI shows "No response from the
+    # hound backend" instead of the real reason. So this one command reports
+    # its failure in the document and still exits 0.
+    out = subprocess.run(
+        [sys.executable, "-m", "surveillancehound.cli",
+         "export", str(missing_path), "--limit", "5"],
+        capture_output=True, text=True, env=env,
+    )
+    assert out.returncode == 0, (
+        f"export with a missing config exited {out.returncode}; configd "
+        f"swallows the output of a failing script_output action"
+    )
+    doc = json.loads(out.stdout)
+    assert doc["status"] == "failed", doc
+    assert "save the settings" in doc["message"], doc["message"]
+    assert doc["config_path"] == str(missing_path), doc
+
+    # Every other subcommand must keep failing loudly on a missing config.
+    out = subprocess.run(
+        [sys.executable, "-m", "surveillancehound.cli",
+         "alerts", str(missing_path)],
+        capture_output=True, text=True, env=env,
+    )
+    assert out.returncode != 0, "hound alerts must exit non-zero without a config"
+    print("  CLI: hound export emits a structured error (exit 0) for a "
+          "missing config; other subcommands still exit non-zero")
+
+
 def _check_web(cfg: HoundCfg) -> None:
     _Handler.cfg = cfg
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
@@ -414,6 +455,7 @@ def main() -> int:
         _check_baselines_cli(cfg_path)
         _check_snapshots_cli(cfg_path)
         _check_uptime_cli(cfg_path)
+        _check_export_cli(cfg_path, root / "does-not-exist.toml")
         _check_web(cfg)
         _check_web_https(cfg, root)
         _check_web_cfg_validation()

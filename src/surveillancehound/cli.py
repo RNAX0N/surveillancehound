@@ -286,7 +286,31 @@ def cmd_export(args: argparse.Namespace) -> int:
     One command returning one document, deliberately: each configd round
     trip spawns a process, so five endpoints would be five of them on every
     refresh.
+
+    Failure is reported IN the document (status/message) and the exit code
+    stays 0, unlike every other subcommand. A front-end that can only see
+    stdout has no other channel: OPNsense's configd runs `script_output`
+    actions with `check=True`, so a non-zero exit makes configd discard the
+    output entirely and hand the caller an empty string. That is how a fresh
+    install — no /usr/local/etc/hound.toml until the first Save — turned into
+    "No response from the hound backend" in the dashboard tab instead of
+    "save the settings first".
     """
+    cfg_path = Path(args.config)
+    if not cfg_path.is_file():
+        json.dump(
+            {
+                "status": "failed",
+                "message": (
+                    f"no configuration at {args.config} — save the settings "
+                    f"once to generate it, then start the service"
+                ),
+                "config_path": str(args.config),
+            },
+            sys.stdout,
+        )
+        sys.stdout.write("\n")
+        return 0
     cfg = _cfg(args.config)
     window = (
         args.window if args.window is not None
