@@ -14,6 +14,13 @@ if [[ ! -f "${SSH_KEY}" ]]; then
     exit 1
 fi
 
+# BatchMode + PreferredAuthentications: this rig is key-only, so a key
+# failure must fail FAST and loudly. Without them ssh falls back to
+# password auth, and on a desktop that spawns ssh-askpass — a GUI password
+# prompt, on a developer's screen, from an automated run that then hangs
+# forever waiting on it. That happened: a password reset on the VM wiped
+# /root/.ssh/authorized_keys and left a prompt up for 40 minutes.
+# Never give an unattended script a path to an interactive credential ask.
 SSH_OPTS=(
     -i "${SSH_KEY}"
     -p "${HOST_SSH_PORT}"
@@ -21,6 +28,9 @@ SSH_OPTS=(
     -o UserKnownHostsFile=/dev/null
     -o LogLevel=ERROR
     -o ConnectTimeout=10
+    -o BatchMode=yes
+    -o PreferredAuthentications=publickey
+    -o NumberOfPasswordPrompts=0
 )
 
 cmd="${1:-ssh}"; shift || true
@@ -39,6 +49,9 @@ case "${cmd}" in
             -o UserKnownHostsFile=/dev/null
             -o LogLevel=ERROR
             -o ConnectTimeout=10
+            -o BatchMode=yes
+            -o PreferredAuthentications=publickey
+            -o NumberOfPasswordPrompts=0
         )
         # Translate "vm:..." → root@127.0.0.1:... for either side
         args=()

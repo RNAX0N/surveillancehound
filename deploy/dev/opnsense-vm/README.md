@@ -40,6 +40,18 @@ make teardown     # stop + delete the qcow2 (keeps the original .img.bz cache)
 `make validate` is the only target that returns a non-zero exit on failure; the rest
 print human progress.
 
+**The rig is key-only on purpose.** `ssh-wrap.sh` passes `BatchMode=yes`,
+`PreferredAuthentications=publickey` and `NumberOfPasswordPrompts=0`, so a
+key failure fails immediately instead of falling back to password auth —
+which on a desktop spawns an `ssh-askpass` GUI prompt and hangs the run
+forever waiting on a human. If you see "Permission denied (publickey)",
+re-run `make first-boot`; do not type a password.
+
+**Do not reset the VM's root webgui password with PHP `local_user_set()`.**
+It wipes `/root/.ssh/authorized_keys` and resets root's shell, locking the
+rig out of SSH. Recovery is via the serial console
+(`socat - UNIX-CONNECT:var/console.sock`).
+
 ## Files
 
 ```
