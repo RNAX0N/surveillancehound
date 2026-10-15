@@ -122,7 +122,7 @@ prefix = "/usr/local"
 categories = ["security"]
 licenselogic = "single"
 licenses = ["PROPRIETARY"]
-desc = "SurveillanceHound watches the surveillance segment (camera VLAN / NVR uplink / SPAN port) for bulk transfers toward a camera, control-channel-shaped sessions, off-allowlist telemetry, new devices/peers, silent cameras, and behavioral anomalies. Adds Services > SurveillanceHound to the OPNsense UI. Headers only — no payload, no DNS, no video."
+desc = "SurveillanceHound watches the surveillance segment (camera VLAN / NVR uplink / SPAN port) for bulk transfers toward a camera, control-channel-shaped sessions, off-allowlist telemetry, new devices/peers, and behavioral anomalies. Tracks per-camera uptime passively (offline, recovered, never-seen, plus a capture dead-man's-switch) with outage history and availability. Adds Services > SurveillanceHound to the OPNsense UI. Headers only — no payload, no DNS, no video."
 scripts {
   "post-install" = "${PI}"
   "pre-deinstall" = "${PRD}"

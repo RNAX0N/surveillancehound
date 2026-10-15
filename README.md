@@ -17,7 +17,15 @@ the recordings.
   drift > N σ from its learned per-(weekday, hour) envelope. MEDIUM.
 - **`new_device`** — an IP that has never been observed on the segment shows up.
 - **`new_peer`** — a known camera is now talking to a brand-new endpoint.
-- **`camera_offline`** — a known camera has been silent for too long.
+- **`camera_offline`** — a known camera has been silent for too long. MEDIUM.
+- **`camera_recovered`** — a camera that was offline is sending traffic again,
+  with the outage duration. INFO.
+- **`camera_never_seen`** — a camera listed in `[network]` has *never* been
+  observed, and the startup grace period has elapsed: powered down before the
+  monitor started, wrong IP, or on a segment this sensor can't see. MEDIUM.
+- **`capture_stalled`** — zero packets of any kind for `capture_stall_seconds`.
+  The sensor itself is blind, so nothing else is being detected either.
+  Per-camera offline alerts are suppressed while stalled. HIGH.
 
 **How it's built**
 
@@ -82,6 +90,7 @@ hound replay /etc/hound.toml      # same loop against a pcap_file
 hound alerts /etc/hound.toml --limit 100 -v
 hound flows /etc/hound.toml --class bulk_inbound --limit 20
 hound devices /etc/hound.toml
+hound uptime /etc/hound.toml [--window 86400] [--outages]
 hound baselines /etc/hound.toml [--camera IP | --reset IP | --reset-all]
 hound snapshots /etc/hound.toml
 hound prune /etc/hound.toml --flows-days 30 --alerts-days 90
@@ -166,6 +175,47 @@ The dashboard:
 All CSS and JS is embedded — zero external requests, no CDN fetches, no
 fonts pulled from the internet. Stays inside the offline-by-default contract.
 
+## Uptime monitoring
+
+Per-camera liveness, outage history, and availability — enabled by default
+(`[uptime]`).
+
+```bash
+hound uptime /etc/hound.toml                      # state + availability table
+hound uptime /etc/hound.toml --outages            # the downtime history
+curl -s localhost:8080/api/uptime | jq .          # same data, JSON
+```
+
+**Detection is passive.** A camera counts as up because packets from it were
+observed on the monitored interface. Nothing is probed — no ICMP, no TCP
+connect, no ONVIF keepalive. A camera that is powered and recording but no
+longer visible to this sensor (moved VLAN, mirror/SPAN port reconfigured)
+is indistinguishable from one that is powered down, and every surface says so
+rather than claiming liveness is verified. Active probing is on the roadmap;
+see `DevNotes.md`.
+
+Three things make the inference trustworthy enough to alert on:
+
+- **Cameras are seeded from config.** Every IP in `[network].camera_ips` /
+  `nvr_ips` is registered at startup, so one that was already powered down
+  before the daemon started raises `camera_never_seen` instead of being
+  silently absent from a table of things that look fine.
+- **The capture has a dead-man's-switch.** Zero packets of *any* kind for
+  `capture_stall_seconds` raises one `capture_stalled` (HIGH) and suppresses
+  the per-camera offline storm. A dead tcpdump and every camera failing at
+  once look identical from the inside; the difference matters enormously to
+  whoever is on call.
+- **Availability only counts watched time.** Outage spans are intersected
+  with recorded monitor sessions, so a daemon that was stopped for a day is
+  never charged to a camera as downtime. With no observation at all the figure
+  is `n/a`, never a fabricated 0% or 100%.
+
+Outages live in their own table, and an *open* row is the camera's down-state —
+so a restart resumes an outage mid-flight rather than forgetting it or
+re-alerting. Alert dedup keys carry the outage id, which means a camera that
+flaps down → up → down inside `dedup_window_seconds` reports both outages
+instead of having the second one swallowed.
+
 ## Behavioral baselining
 
 Two models share the same lifecycle (learn per-(camera, weekday, hour)
@@ -219,6 +269,9 @@ The dashboard exposes snapshot pcaps as direct download links.
 - It does not inspect packet payloads. Headers only — that's the threat model.
 - It does not perform DNS resolution; alerts identify hosts by IP. Use your
   firewall logs alongside if you need names.
+- It does not probe your cameras. Uptime is inferred from observed traffic,
+  never from a ping or a port check, so "offline" strictly means "not visible
+  to this sensor."
 - It does not validate C2PA / cryptographic provenance. That stays offline in
   the sibling footageanalyzer project.
 - It does not phone home, fetch external assets, or load remote ML models.
@@ -226,12 +279,13 @@ The dashboard exposes snapshot pcaps as direct download links.
 
 ## Tests
 
-No pytest harness — five focused end-to-end scripts:
+No pytest harness — six focused end-to-end scripts:
 
 ```bash
 PYTHONPATH=src python tests/verify_hound_end_to_end.py        # core daemon
 PYTHONPATH=src:tests python tests/verify_baseline.py          # baseliner
 PYTHONPATH=src:tests python tests/verify_snapshots_and_cli.py # snapshots + web + CLI
 PYTHONPATH=src python tests/verify_channels.py                # syslog + email + ftp + audit
+PYTHONPATH=src:tests python tests/verify_uptime.py            # liveness + outages + availability
 PYTHONPATH=src:tests python tests/verify_plugins.py           # opnsense + pfsense + wazuh
 ```

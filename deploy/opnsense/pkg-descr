@@ -7,6 +7,12 @@ non-routine ports (control-channel-shaped), off-allowlist telemetry,
 new devices, new peers, silent cameras, and behavioral anomalies vs each
 camera's learned per-(weekday, hour) baseline.
 
+Per-camera uptime tracking: outage history, availability over a window,
+recovery alerts, alerting on configured cameras never seen at all, and a
+capture dead-man's-switch that reports when the sensor itself goes blind
+instead of blaming every camera at once. Detection is passive — inferred
+from observed traffic, never probed.
+
 Per-camera ring buffer + on-alert pcap snapshots for forensic review.
 Pluggable notification channels: stdout, logfile, jsonlines, webhook,
 syslog (RFC 5424 UDP/TCP), email (SMTP), FTP/FTPS. A built-in read-only
