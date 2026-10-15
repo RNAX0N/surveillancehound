@@ -382,6 +382,40 @@ def _check_opnsense_pkg_build_script() -> None:
     )
     print("  OPNsense pkg: wrapper PATH prepend + plugin registration staged")
 
+    # 3. OSVERSION must track the ABI major. It was hardcoded to 1400000, so
+    #    every --abi produced a FreeBSD:14 package regardless — which is how
+    #    an OPNsense 26.7 box (FreeBSD 15.1) rejects the whole repository
+    #    with "wrong architecture: FreeBSD:14:amd64 instead of
+    #    FreeBSD:15:amd64". OPNsense changes base between majors, so this
+    #    must never be a constant again.
+    assert "OSVERSION=1400000" not in script, (
+        "build-pkg.sh hardcodes OSVERSION=1400000 again — every --abi will "
+        "emit a FreeBSD:14 package and newer OPNsense will refuse the repo"
+    )
+    assert "OSVERSION=${ABI_MAJOR}00000" in script, (
+        "build-pkg.sh must derive OSVERSION from the ABI major version"
+    )
+
+    # 4. The published repo is per-ABI and hound.conf must point pkg at
+    #    .../${ABI}, or a firewall on a different base fetches the wrong
+    #    catalogue.
+    conf = (
+        Path(__file__).resolve().parent.parent
+        / "deploy/opnsense/pkg/hound.conf.sample"
+    ).read_text()
+    assert "/opnsense/${ABI}" in conf, (
+        "hound.conf.sample must use ${ABI} in the url, or firewalls on a "
+        "different FreeBSD base pull a catalogue they cannot install from"
+    )
+    wf = (
+        Path(__file__).resolve().parent.parent
+        / ".github/workflows/build-opnsense-pkg.yml"
+    ).read_text()
+    for abi in ("FreeBSD:14:amd64", "FreeBSD:15:amd64"):
+        assert abi in wf, f"workflow no longer publishes a catalogue for {abi}"
+    print("  OPNsense pkg: OSVERSION tracks ABI; repo published per-ABI")
+
+
 
 def _check_opnsense_renderer_error_path() -> None:
     """Missing config block should fail loudly, not silently emit garbage."""

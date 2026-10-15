@@ -15,6 +15,7 @@
 #     --version X.Y.Z     package version (default: from pyproject.toml / git tag)
 #     --out DIR           output dir for the .txz (default: ./dist)
 #     --repo              also build a pkg repository under <out>/repo
+#                         (override the location with REPO_SUBDIR=...)
 #     --sign KEYFILE      RSA private key to sign the repo catalog (implies --repo)
 #     --abi ABI           override pkg ABI (default: host, e.g. FreeBSD:14:amd64)
 #
@@ -160,7 +161,17 @@ MANI
 # --- build ------------------------------------------------------------------
 mkdir -p "$OUT"
 ABI_ARGS=""
-[ -n "$ABI_OVERRIDE" ] && ABI_ARGS="-o ABI=$ABI_OVERRIDE -o OSVERSION=1400000"
+if [ -n "$ABI_OVERRIDE" ]; then
+    # OSVERSION must match the ABI major or pkg rejects its own output.
+    # Hardcoding 1400000 silently produced FreeBSD:14 packages for every
+    # --abi, which is how a FreeBSD:15 box ends up refusing the repo with
+    # "wrong architecture: FreeBSD:14:amd64 instead of FreeBSD:15:amd64".
+    ABI_MAJOR=$(echo "$ABI_OVERRIDE" | cut -d: -f2)
+    case "$ABI_MAJOR" in
+        ''|*[!0-9]*) die "cannot parse major version from ABI: $ABI_OVERRIDE" ;;
+    esac
+    ABI_ARGS="-o ABI=$ABI_OVERRIDE -o OSVERSION=${ABI_MAJOR}00000"
+fi
 say "pkg create (abi: ${ABI_OVERRIDE:-$(pkg config ABI)})"
 # Default format = the universal `.pkg` (zstd) — exactly what OPNsense ships.
 # Modern pkg names every package `<name>-<version>.pkg` regardless of the
@@ -175,7 +186,7 @@ pkg info -F "$PKG" 2>/dev/null | sed 's/^/    /' || true
 
 # --- optional: signed repository --------------------------------------------
 if [ "$BUILD_REPO" = "1" ]; then
-    REPODIR="$OUT/repo"
+    REPODIR="${REPO_SUBDIR:-$OUT/repo}"
     say "building pkg repository → $REPODIR"
     rm -rf "$REPODIR"; mkdir -p "$REPODIR"
     cp "$PKG" "$REPODIR/"

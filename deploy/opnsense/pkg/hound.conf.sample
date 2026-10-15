@@ -20,6 +20,12 @@
 # OPNsense refuses to install ANY plugin while core is behind its repo, so run
 # the firmware update first if the install is rejected.
 #
+# ${ABI} is expanded by pkg itself, so one config works on every OPNsense
+# base. 26.7 moved to FreeBSD 15, 25.x and 26.1 are FreeBSD 14, and each
+# firewall fetches only the catalogue matching its own. A fixed URL here is
+# how you get "pkg: wrong architecture: FreeBSD:14:amd64 instead of
+# FreeBSD:15:amd64" after a major upgrade.
+#
 # Plain HTTP would also be fine here: the catalogue is signed, so transport
 # integrity is not what protects you.
 #
@@ -27,7 +33,7 @@
 # updates.
 
 hound: {
-  url: "https://rnax0n.github.io/surveillancehound/opnsense",
+  url: "https://rnax0n.github.io/surveillancehound/opnsense/${ABI}",
   mirror_type: "none",
   signature_type: "pubkey",
   pubkey: "/usr/local/etc/pkg/repos/hound-repo.pub",

@@ -138,10 +138,19 @@ The package ABI must match the firewall. Set `FREEBSD_VERSION` in the workflow
 
 | OPNsense | FreeBSD base | ABI |
 |----------|--------------|-----|
-| 25.x / 26.x | 14 | `FreeBSD:14:amd64` |
+| 26.7+ | 15.1 | `FreeBSD:15:amd64` |
+| 25.x / 26.1 | 14 | `FreeBSD:14:amd64` |
 | 24.x | 13 | `FreeBSD:13:amd64` |
 
-(Your dev rig pins OPNsense 26.1.6 → FreeBSD 14, which the workflow defaults to.)
+The release workflow publishes a separate catalogue per ABI (see `ABIS` in
+the workflow) and `hound.conf` points pkg at `.../${ABI}`, so a firewall
+fetches only the one matching its own base. Get this wrong and `pkg update`
+fails with `wrong architecture: FreeBSD:14:amd64 instead of FreeBSD:15:amd64`.
+Adding a new base means adding it to `ABIS` — the package has no dependencies,
+so one build VM emits every ABI and only the metadata differs.
+
+(The dev rig pins OPNsense 26.1.6 → FreeBSD 14. Note it is a major base behind
+current OPNsense, so it cannot catch an ABI regression for 26.7+ on its own.)
 
 ## Tier D — getting it into official `opnsense/plugins`
 

@@ -33,9 +33,16 @@ permissions:
 
 env:
   FREEBSD_VERSION: '14.2'        # the FreeBSD release the build VM boots
-  ABI: 'FreeBSD:14:amd64'        # pkg ABI baked into the package — match your OPNsense
-  # ^ keep the major version of ABI in sync with FREEBSD_VERSION above.
-  #   OPNsense 25.x/26.x → FreeBSD:14:amd64 ; OPNsense 24.x → FreeBSD:13:amd64
+  ABI: 'FreeBSD:14:amd64'        # ABI for the release asset (Tier B `pkg add`)
+  # The repository publishes EVERY abi in ABIS, each under its own
+  # subdirectory, because hound.conf points pkg at .../${ABI}. A firewall
+  # then fetches the catalogue matching its own base and nothing else.
+  #   OPNsense 24.x        → FreeBSD:13:amd64
+  #   OPNsense 25.x / 26.1 → FreeBSD:14:amd64
+  #   OPNsense 26.7+       → FreeBSD:15:amd64  (26.7 moved to FreeBSD 15.1)
+  # The package is pure Python/shell/PHP with no dependencies, so one build
+  # VM can emit any ABI — only the metadata differs.
+  ABIS: 'FreeBSD:14:amd64 FreeBSD:15:amd64'
 
 jobs:
   build:
@@ -112,15 +119,21 @@ jobs:
           usesh: true
           run: |
             set -eu
-            sh deploy/opnsense/pkg/build-pkg.sh \
-              --version "${{ needs.build.outputs.version }}" \
-              --out dist --abi "${{ env.ABI }}" \
-              --repo --sign repo-sign.key
+            for abi in ${{ env.ABIS }}; do
+              echo "=== building repo for $abi ==="
+              REPO_SUBDIR="dist/repo/$abi" sh deploy/opnsense/pkg/build-pkg.sh \
+                --version "${{ needs.build.outputs.version }}" \
+                --out "dist/$abi" --abi "$abi" \
+                --repo --sign repo-sign.key
+            done
       - name: Stage Pages site
         if: ${{ steps.gate.outputs.have_key == 'true' }}
         run: |
           mkdir -p site/opnsense
           cp -a dist/repo/* site/opnsense/
+          # the pubkey is identical for every ABI; publish one at the top
+          # level too so the fetch URL in the docs stays ABI-independent
+          cp dist/repo/*/hound-repo.pub site/opnsense/hound-repo.pub
           # Ship the client-side repo config too, so installing is two
           # fetches and a pkg install rather than "copy this from the repo
           # and edit the URL by hand".
