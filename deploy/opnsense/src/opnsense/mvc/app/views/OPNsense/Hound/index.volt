@@ -589,7 +589,22 @@ $(document).ready(function() {
                         brand-new endpoint.</li>
                     <li><code>camera_offline</code> — MEDIUM. Camera silent
                         for longer than the silence threshold.</li>
+                    <li><code>camera_recovered</code> — INFO. A camera that
+                        was offline is being seen again.</li>
+                    <li><code>camera_never_seen</code> — MEDIUM. A configured
+                        camera has never been observed at all: powered down
+                        before the monitor started, wrong IP in the config,
+                        or on a segment this sensor cannot see.</li>
+                    <li><code>capture_stalled</code> — HIGH. Zero packets
+                        captured — the sensor is blind (dead tcpdump, mirror
+                        port down), and per-camera offline alerts are
+                        suppressed until it recovers.</li>
                 </ul>
+                <p>Liveness is <strong>passive</strong>:
+                    a camera counts as up because packets from it crossed the
+                    listen interface. Nothing is probed, so "offline" means
+                    "not visible to this sensor", which is not always the same
+                    as "powered down".</p>
             </div>
 
             <div class="hound-note">

@@ -63,6 +63,52 @@
 
     <field>
         <type>header</type>
+        <label>Uptime monitoring</label>
+    </field>
+    <field>
+        <id>thresholds.silence_seconds</id>
+        <label>Silence threshold (seconds)</label>
+        <type>text</type>
+        <help>A camera with no observed packets for this long raises
+              camera_offline. Detection is PASSIVE — Hound only watches
+              traffic that crosses the listen interface, it never probes
+              or pings the camera. A camera that is still powered and
+              recording but no longer visible to this sensor (VLAN moved,
+              mirror port reconfigured) looks exactly like one that is
+              powered down. Default 600.</help>
+    </field>
+    <field>
+        <id>uptime.enabled</id>
+        <label>Track per-camera uptime</label>
+        <type>checkbox</type>
+        <help>Record outage history and availability per camera, derived
+              from observed traffic only (PASSIVE — no probing). Adds the
+              camera_recovered, camera_never_seen and capture_stalled
+              alert kinds. On by default.</help>
+    </field>
+    <field>
+        <id>uptime.startup_grace_seconds</id>
+        <label>Startup grace (seconds)</label>
+        <type>text</type>
+        <help>After the daemon starts, wait this long before alerting on a
+              configured camera that has not been seen yet — otherwise
+              every restart would fire camera_never_seen for cameras that
+              are simply idle. 0 inherits the silence threshold above.
+              Default 600.</help>
+    </field>
+    <field>
+        <id>uptime.capture_stall_seconds</id>
+        <label>Capture stall timeout (seconds)</label>
+        <type>text</type>
+        <help>Dead-man's switch: if ZERO packets at all are captured for
+              this long, the sensor is blind, so one capture_stalled alert
+              fires and per-camera offline alerts are suppressed until
+              capture recovers. Without it a dead tcpdump looks identical
+              to every camera failing at once. 0 disables. Default 120.</help>
+    </field>
+
+    <field>
+        <type>header</type>
         <label>Behavioral baselining (opt-in)</label>
     </field>
     <field>

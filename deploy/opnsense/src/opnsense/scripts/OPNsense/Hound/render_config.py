@@ -88,6 +88,8 @@ def render(model_root: ET.Element) -> str:
     b = model_root.find("baseline") or ET.Element("baseline")
     s = model_root.find("snapshot") or ET.Element("snapshot")
     w = model_root.find("web") or ET.Element("web")
+    t = model_root.find("thresholds") or ET.Element("thresholds")
+    u = model_root.find("uptime") or ET.Element("uptime")
 
     iface = _xtext(g, "interface")
     snaplen = _xtext(g, "snaplen", "96")
@@ -105,6 +107,14 @@ def render(model_root: ET.Element) -> str:
     sn_enabled = _toml_bool(_xtext(s, "enabled", "0"))
     sn_window = _xtext(s, "window_seconds", "60.0")
     sn_minsev = _xtext(s, "min_severity", "medium")
+
+    # Silence threshold drives camera_offline; it is also the fallback the
+    # uptime tracker inherits when startup_grace_seconds is 0.
+    silence_seconds = _xtext(t, "silence_seconds", "600.0")
+
+    up_enabled = _toml_bool(_xtext(u, "enabled", "1"))
+    up_grace = _xtext(u, "startup_grace_seconds", "600.0")
+    up_stall = _xtext(u, "capture_stall_seconds", "120.0")
 
     web_enabled = _toml_bool(_xtext(w, "enabled", "1"))
     web_host = _xtext(w, "host", "127.0.0.1")
@@ -144,6 +154,9 @@ def render(model_root: ET.Element) -> str:
         f"nvr_ips                = {nvr_ips}",
         f"manufacturer_allowlist = {allow}",
         "",
+        "[thresholds]",
+        f"silence_seconds = {float(silence_seconds)}",
+        "",
         "[store]",
         'path = "/var/lib/hound/hound.sqlite"',
         "",
@@ -166,6 +179,13 @@ def render(model_root: ET.Element) -> str:
         "poll_interval_seconds  = 5.0",
         f"cert_file              = {_toml_quote(web_cert)}",
         f"key_file               = {_toml_quote(web_key)}",
+        "",
+        "# Uptime monitoring is PASSIVE: a camera counts as up because packets",
+        "# from it were seen on the monitored interface. Nothing is probed.",
+        "[uptime]",
+        f"enabled               = {up_enabled}",
+        f"startup_grace_seconds = {float(up_grace)}",
+        f"capture_stall_seconds = {float(up_stall)}",
         "",
         "# default notifications — extend in /etc/hound.toml.local",
         "[[notify]]",

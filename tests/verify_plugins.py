@@ -182,6 +182,10 @@ def _opnsense_synthetic_config(**overrides) -> str:
         "web_enabled": "1",
         "web_host": "127.0.0.1",
         "web_port": "8765",
+        "silence_seconds": "900.0",
+        "uptime_enabled": "1",
+        "startup_grace_seconds": "300.0",
+        "capture_stall_seconds": "45.0",
     }
     defaults.update(overrides)
     d = defaults
@@ -215,6 +219,14 @@ def _opnsense_synthetic_config(**overrides) -> str:
         <host>{d['web_host']}</host>
         <port>{d['web_port']}</port>
       </web>
+      <thresholds>
+        <silence_seconds>{d['silence_seconds']}</silence_seconds>
+      </thresholds>
+      <uptime>
+        <enabled>{d['uptime_enabled']}</enabled>
+        <startup_grace_seconds>{d['startup_grace_seconds']}</startup_grace_seconds>
+        <capture_stall_seconds>{d['capture_stall_seconds']}</capture_stall_seconds>
+      </uptime>
     </Hound>
   </OPNsense>
 </opnsense>
@@ -232,6 +244,10 @@ def _check_opnsense_renderer() -> None:
             "nvr_ips": "", "manufacturer_allowlist": "",
             "baseline_enabled": "0", "snapshot_enabled": "0",
             "web_enabled": "0",
+            # uptime off entirely; stall detector disabled (0) and grace
+            # set to 0, which means "inherit thresholds.silence_seconds"
+            "uptime_enabled": "0", "startup_grace_seconds": "0",
+            "capture_stall_seconds": "0",
         },
         # special characters that need TOML escaping (backslash + quote)
         {
@@ -240,7 +256,8 @@ def _check_opnsense_renderer() -> None:
             "nvr_ips": "", "manufacturer_allowlist": "",
         },
         # boolean strings the model might emit ("1"/"0", "on"/"off", "true"/"false")
-        {"baseline_enabled": "true", "snapshot_enabled": "on", "web_enabled": "yes"},
+        {"baseline_enabled": "true", "snapshot_enabled": "on", "web_enabled": "yes",
+         "uptime_enabled": "on"},
     ]
     for i, overrides in enumerate(cases):
         with tempfile.TemporaryDirectory() as td:
@@ -253,7 +270,7 @@ def _check_opnsense_renderer() -> None:
             data = tomllib.loads(out_path.read_text())
             # required structural assertions: every section present
             for section in ("capture", "network", "store", "baseline",
-                            "snapshot", "web"):
+                            "snapshot", "web", "thresholds", "uptime"):
                 assert section in data, (
                     f"case {i}: missing [{section}] in output",
                 )
@@ -262,7 +279,14 @@ def _check_opnsense_renderer() -> None:
             assert isinstance(data["baseline"]["enabled"], bool)
             assert isinstance(data["snapshot"]["enabled"], bool)
             assert isinstance(data["web"]["enabled"], bool)
+            assert isinstance(data["uptime"]["enabled"], bool)
             assert isinstance(data["capture"]["snaplen"], int)
+            # numeric uptime knobs must be TOML floats, not strings
+            for key in ("startup_grace_seconds", "capture_stall_seconds"):
+                assert isinstance(data["uptime"][key], float), (
+                    f"case {i}: uptime.{key} not a float"
+                )
+            assert isinstance(data["thresholds"]["silence_seconds"], float)
             assert data["store"]["path"] == "/var/lib/hound/hound.sqlite"
             # at least one notify channel always present (default stdout)
             assert isinstance(data.get("notify"), list)
@@ -435,6 +459,28 @@ def _check_cross_consistency() -> None:
         assert loaded.snapshot.enabled
         assert loaded.web.enabled
         assert any(n.type == "stdout" for n in loaded.notify)
+        # uptime surface: form values survive render -> tomllib -> loader
+        assert loaded.uptime.enabled is True
+        assert loaded.uptime.startup_grace_seconds == 300.0
+        assert loaded.uptime.capture_stall_seconds == 45.0
+        assert loaded.thresholds.silence_seconds == 900.0
+        # grace_for() prefers the explicit grace when non-zero
+        assert loaded.uptime.grace_for(loaded.thresholds) == 300.0
+
+    # disabled/zero variant: 0 grace means "inherit silence_seconds"
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "config.xml"
+        cfg.write_text(_opnsense_synthetic_config(
+            uptime_enabled="0", startup_grace_seconds="0",
+            capture_stall_seconds="0", silence_seconds="1200.0",
+        ))
+        out = Path(td) / "hound.toml"
+        mod.main(["render_config.py", str(cfg), str(out)])
+        loaded = load_from_dict(tomllib.loads(out.read_text()))
+        assert loaded.uptime.enabled is False
+        assert loaded.uptime.capture_stall_seconds == 0.0
+        assert loaded.thresholds.silence_seconds == 1200.0
+        assert loaded.uptime.grace_for(loaded.thresholds) == 1200.0
 
     pf_out = _pf_render_toml(
         iface="igb1", bpf="", snaplen=96,
