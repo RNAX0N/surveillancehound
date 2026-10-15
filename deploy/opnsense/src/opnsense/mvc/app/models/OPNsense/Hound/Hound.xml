@@ -42,8 +42,7 @@
                 <Required>N</Required>
                 <MinimumValue>10.0</MinimumValue>
                 <MaximumValue>604800.0</MaximumValue>
-                <ValidationMessage>Seconds of silence before a camera is
-                    reported offline (10 - 604800).</ValidationMessage>
+                <ValidationMessage>Seconds of silence before a camera is reported offline (10 - 604800).</ValidationMessage>
             </silence_seconds>
         </thresholds>
         <uptime>
@@ -56,16 +55,14 @@
                 <Required>N</Required>
                 <MinimumValue>0</MinimumValue>
                 <MaximumValue>604800.0</MaximumValue>
-                <ValidationMessage>Grace period after daemon start, in
-                    seconds. 0 inherits the silence threshold.</ValidationMessage>
+                <ValidationMessage>Grace period after daemon start, in seconds (0 - 604800). 0 inherits the silence threshold.</ValidationMessage>
             </startup_grace_seconds>
             <capture_stall_seconds type="NumericField">
                 <default>120.0</default>
                 <Required>N</Required>
                 <MinimumValue>0</MinimumValue>
                 <MaximumValue>604800.0</MaximumValue>
-                <ValidationMessage>Seconds with zero captured packets before
-                    capture_stalled fires. 0 disables it.</ValidationMessage>
+                <ValidationMessage>Seconds with zero captured packets before capture_stalled fires (0 - 604800). 0 disables it.</ValidationMessage>
             </capture_stall_seconds>
         </uptime>
         <baseline>
