@@ -322,12 +322,78 @@ def _check_ui_endpoints_exist() -> None:
     print(f"  endpoints: all {len(called)} /api/hound/* calls in the view resolve")
 
 
+
+def _check_enable_is_wired() -> None:
+    """Ticking Enable must actually enable and start the service.
+
+    The box set general.enabled in config.xml and rendered hound.toml, but
+    nothing ever wrote rc.conf's hound_enable, and reload.sh restarted the
+    daemon only when that was already YES. So the tick-box was decorative:
+    the service was never enabled, never started, and did not survive a
+    reboot. `service hound status` reported "not running" with no log file
+    at all, because it had genuinely never run once.
+    """
+    reload_sh = (
+        ROOT / "deploy/opnsense/src/opnsense/scripts/OPNsense/Hound/reload.sh"
+    ).read_text()
+
+    assert "--print-enabled" in reload_sh, (
+        "reload.sh no longer asks the model whether Enable is ticked"
+    )
+    assert "sysrc hound_enable=YES" in reload_sh, (
+        "reload.sh must set hound_enable=YES, or the service is never "
+        "enabled and will not come back after a reboot"
+    )
+    assert "sysrc hound_enable=NO" in reload_sh, (
+        "reload.sh must clear hound_enable when Enable is unticked"
+    )
+    # rc.subr's `restart` is a no-op on a stopped service, which is exactly
+    # the first-enable case this bug lived in.
+    assert "onerestart" in reload_sh, (
+        "reload.sh must use onerestart; plain restart does nothing when the "
+        "service is not already running"
+    )
+
+    renderer = (
+        ROOT / "deploy/opnsense/src/opnsense/scripts/OPNsense/Hound/render_config.py"
+    ).read_text()
+    assert "--print-enabled" in renderer, (
+        "render_config.py must support --print-enabled for reload.sh"
+    )
+
+    # and it must actually report both states
+    mod = _load_renderer()
+    import io
+    import contextlib
+    with tempfile.TemporaryDirectory() as td:
+        for raw, want in (("1", "YES"), ("0", "NO")):
+            cfg = Path(td) / "c.xml"
+            cfg.write_text(
+                '<?xml version="1.0"?><opnsense>'
+                "<interfaces><lan><if>igb9</if></lan></interfaces>"
+                "<OPNsense><Hound><general>"
+                f"<enabled>{raw}</enabled><interface>lan</interface>"
+                "</general></Hound></OPNsense></opnsense>"
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = mod.main([
+                    "render_config.py", str(cfg),
+                    str(Path(td) / "o.toml"), "--print-enabled",
+                ])
+            assert rc == 0, f"--print-enabled returned {rc}"
+            got = buf.getvalue().strip()
+            assert got == want, f"enabled={raw!r} reported {got!r}, want {want!r}"
+    print("  enable: ticking Enable sets hound_enable and starts the service")
+
+
 def main() -> int:
     print("=== OPNsense field wiring ===")
     _check_inventories()
     _check_round_trip()
     _check_interface_is_resolved()
     _check_ui_endpoints_exist()
+    _check_enable_is_wired()
     print("\nOPNSENSE FIELD VERIFICATION PASSED")
     return 0
 

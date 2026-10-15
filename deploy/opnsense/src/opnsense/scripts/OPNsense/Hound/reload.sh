@@ -50,7 +50,21 @@ if grep -q "^cert_file *= *\"${CERT_FILE}\"" /usr/local/etc/hound.toml 2>/dev/nu
     fi
 fi
 
-# only restart if currently enabled
-if [ "$(sysrc -n hound_enable 2>/dev/null)" = "YES" ]; then
+# Put rc.conf in step with the Enable tick-box, then act on it.
+#
+# This used to read hound_enable and restart only when it was already YES —
+# but nothing ever set it. The operator ticked Enable, the config rendered,
+# and the daemon was never enabled, never started, and did not come back
+# after a reboot either. `service hound status` said "not running" with no
+# log file, because it had genuinely never run.
+ENABLED=$("${PY}" "${SCRIPT_DIR}/render_config.py" --print-enabled 2>/dev/null || echo NO)
+
+if [ "${ENABLED}" = "YES" ]; then
+    sysrc hound_enable=YES >/dev/null 2>&1 || true
+    # onerestart rather than restart: rc.subr's restart is a no-op when the
+    # service was not already running, which is exactly the first-enable case.
     /usr/local/etc/rc.d/hound onerestart
+else
+    sysrc hound_enable=NO >/dev/null 2>&1 || true
+    /usr/local/etc/rc.d/hound onestop >/dev/null 2>&1 || true
 fi

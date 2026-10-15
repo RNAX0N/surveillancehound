@@ -256,8 +256,15 @@ def render(model_root: ET.Element, config_path: Path | None = None) -> str:
 
 
 def main(argv: list[str]) -> int:
-    config_path = Path(argv[1]) if len(argv) > 1 else _CONFIG
-    out_path = Path(argv[2]) if len(argv) > 2 else _OUT
+    # --print-enabled: report whether the operator has ticked Enable, and
+    # write nothing. reload.sh uses it to keep rc.conf's hound_enable in
+    # step with the model. Without that the tick-box was decorative: it
+    # set general.enabled in config.xml, the daemon was never enabled and
+    # never started, and nothing said so.
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    print_enabled = "--print-enabled" in argv[1:]
+    config_path = Path(args[0]) if len(args) > 0 else _CONFIG
+    out_path = Path(args[1]) if len(args) > 1 else _OUT
     if not config_path.is_file():
         sys.stderr.write(f"config not found: {config_path}\n")
         return 1
@@ -274,6 +281,14 @@ def main(argv: list[str]) -> int:
             "enable the plugin in Services > SurveillanceHound first\n",
         )
         return 2
+    if print_enabled:
+        general = hound.find("general")
+        raw = _xtext(general, "enabled", "0") if general is not None else "0"
+        sys.stdout.write(
+            "YES\n" if _toml_bool(raw) == "true" else "NO\n"
+        )
+        return 0
+
     rendered = render(hound, config_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # atomic write so a half-rendered file never reaches the daemon
