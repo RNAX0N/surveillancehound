@@ -610,6 +610,13 @@ def cmd_config_check(args: argparse.Namespace) -> int:
           f"pcap_file={cfg.capture.pcap_file!r} bpf={cfg.capture.bpf!r}")
     print(f"  network: cameras={cfg.network.camera_ips} "
           f"subnets={cfg.network.camera_subnets} nvrs={cfg.network.nvr_ips}")
+    broad = config.overbroad_lan_subnets(cfg.network.lan_subnets)
+    if broad:
+        print(f"    WARNING: lan_subnets treats public range(s) "
+              f"{', '.join(broad)} as local.")
+        print("      Traffic to anything inside them is no longer scored as "
+              "off-network telemetry, and a relay agent will ship to them. "
+              "Narrow to the prefix you actually own.")
     print(f"  thresholds: bulk_inbound={cfg.thresholds.bulk_inbound_bytes:,} "
           f"long_lived={cfg.thresholds.long_lived_seconds:.0f}s "
           f"silence={cfg.thresholds.silence_seconds:.0f}s "

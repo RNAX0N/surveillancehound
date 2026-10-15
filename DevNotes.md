@@ -72,6 +72,44 @@ day?" judgement call. Anything needing a network round-trip has to be a
 separate, operator-triggered tool that reads the audit log and takes no
 action.
 
+## Why relay quarantine is enforced, not asserted
+
+Relayed records land in `remote_*` tables and must never reach the tables
+holding this box's own observations. The obvious way to get that is to write
+the ingest path carefully and review it. That is not enough, for a reason
+worth writing down.
+
+The property we need is about the code that *doesn't exist yet*. Ingest is
+careful today because it was written for this; the risk is the change six
+months from now that adds a convenience lookup, reuses a helper that happens
+to touch `devices`, or widens a query that was scoped by accident rather than
+by intent. A reviewer who does not know the invariant will not see the
+violation, and no test asserts a thing nobody thought to test.
+
+So the isolation is a machine check. The ingest connection installs a
+`sqlite3` authorizer that denies any write to a central table outright. A
+future change that tries one does not produce subtly corrupted state that
+shows up as a camera mysteriously changing role; it fails loudly, in the test
+suite, with the table name in the message.
+
+Two details that matter if you touch this:
+
+- The authorizer **records** the violation and returns `SQLITE_DENY`, rather
+  than raising from inside the callback. An exception thrown in an authorizer
+  is swallowed by sqlite3 and turns into a generic failure that loses the
+  table name — exactly the information needed. It is re-raised on exit.
+- `verify_relay.py` proves the guard itself fires, by attempting a real
+  central write and asserting it is refused. A quarantine test that only
+  feeds hostile input and then checks the central tables are unchanged passes
+  just as happily when the authorizer is not installed at all.
+
+The same reasoning drives the other "enforced not intended" pieces here:
+every relayed value is re-validated on arrival rather than trusted to be
+what the wire claims, and relayed volume is capped by row count and free
+disk rather than by the assumption that a sensor holding a valid key behaves
+reasonably. Authentication establishes who is talking. It says nothing about
+whether that host is still yours.
+
 ## Known gaps
 
 `deploy/wazuh/hound-decoder.xml` uses patterns containing `\S+?`, `\d+` and

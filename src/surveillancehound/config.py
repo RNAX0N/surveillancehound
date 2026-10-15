@@ -369,6 +369,30 @@ KNOWN_SECTIONS = frozenset({
 })
 
 
+def overbroad_lan_subnets(nets: list[str]) -> list[str]:
+    """Public prefixes declared local that cover more than a /24.
+
+    Declaring a range local suppresses off-network telemetry scoring for
+    everything inside it and widens where a relay agent is willing to
+    ship a whole flow table. Private ranges are exempt — 10.0.0.0/8 is an
+    ordinary LAN and warning about it would just train operators to
+    ignore the warning. A broad PUBLIC range is the one that silently
+    turns a detection off.
+    """
+    out = []
+    for raw in nets:
+        try:
+            net = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            continue
+        if net.is_private or net.is_loopback or net.is_link_local:
+            continue
+        limit = 24 if net.version == 4 else 48
+        if net.prefixlen < limit:
+            out.append(str(net))
+    return out
+
+
 def unknown_sections(data: dict) -> list[str]:
     """Top-level keys the loader will ignore. Typos, or settings for a
     version that is not this one. Either way the operator should hear it."""

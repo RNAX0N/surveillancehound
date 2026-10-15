@@ -101,9 +101,17 @@ hound devices <config>
 hound uptime <config> [--outages]
 hound baselines <config> [--camera IP | --reset IP | --reset-all]
 hound snapshots <config>
+hound sensors <config>             # relayed sensors: last contact, reporting or not
+hound relay <config>               # relay health; on a collector, prints the cert pin
 hound prune <config> --flows-days 30 --alerts-days 90
+hound export <config>              # everything, including relayed rows
+hound config-check <config>        # validate, and report settings that do nothing
 hound web <config>
 ```
+
+`config-check` is worth running after any edit: it reports sections this
+version ignores, so a mistyped `[storage]` surfaces there rather than as a
+daemon that starts, looks healthy, and monitors nothing.
 
 ## Uptime monitoring
 
@@ -192,6 +200,77 @@ whole conversation leading up to the alert, not just the summary line.
 
 The dashboard links them for download.
 
+## Multiple sensors
+
+A common and awkward topology: the cameras sit behind the NVR, on switch ports
+or VLANs that never cross the firewall. A monitor on the firewall sees the NVR
+and nothing else, and a green dashboard then means "I can't see anything
+wrong", which is not the same as "nothing is wrong".
+
+Relay mode fixes that by putting a sensor where the traffic actually is. An
+**agent** runs the whole pipeline locally — capture, flows, discovery,
+classification, uptime, baselining — and ships its results to a **collector**,
+which is usually the firewall you already watch.
+
+```
+  camera VLANs ──▶ agent on the NVR host ──TLS──▶ collector on the firewall
+                   (sees the cameras)             (notifies, and shows both)
+```
+
+The agent dispatches **nothing**. Any `[[notify]]` block in its config is
+ignored, so one camera outage pages you once rather than once per sensor.
+
+```toml
+# on the agent
+[relay]
+mode            = "agent"
+sensor_id       = "frigate"
+url             = "https://10.0.0.1:18443/ingest/v1"
+key             = "<shared secret>"
+tls_fingerprint = ["sha256:..."]      # `hound relay` on the collector prints it
+
+# on the collector
+[relay]
+mode        = "collector"
+listen_host = "10.0.0.1"
+listen_port = 18443
+cert_file   = "/var/lib/hound/hound-ingest.crt"
+key_file    = "/var/lib/hound/hound-ingest.key"
+
+[[relay.sensor]]
+id  = "frigate"
+key = "<same shared secret>"
+```
+
+`hound sensors` lists every sensor and when it last reported. The dashboard
+gains a Sensor column, and a camera belonging to a sensor that has gone quiet
+reads `UNKNOWN` with no availability figure — not the `up` it last claimed,
+because that number is exactly as stale as the contact that produced it.
+
+On OPNsense all of this is in Services → SurveillanceHound; there is no need to
+hand-edit `hound.toml`, and in fact hand-edits there are overwritten on save.
+`deploy/agent/` has a Docker setup for the NVR side.
+
+### The trust model
+
+The agent runs on a camera-segment host, which is more likely to be compromised
+than the firewall. So the collector treats a correctly signed batch as
+authenticated, not as trusted:
+
+- Batches are signed with HMAC-SHA256 and the collector pins the agent's view
+  of its certificate. There is no CA — the pin *is* the trust decision, so
+  verify it out of band the first time.
+- Relayed records land in separate `remote_*` tables and **cannot** reach the
+  tables holding this box's own observations. That isolation is enforced by a
+  SQLite authorizer, not merely intended — see `DevNotes.md`.
+- Every relayed value is re-validated on arrival. Nothing from the wire is
+  trusted to be the type, range or character set it claims.
+- Volume is bounded by age (`remote_retention_days`), by row count
+  (`max_rows_per_sensor`) and by free disk (`min_free_disk_mb`), so a sensor
+  holding a valid key still cannot fill the disk local capture depends on.
+- If the collector is unreachable the agent spools to disk and replays later,
+  bounded by both size and age.
+
 ## SIEM
 
 Two ways in, pick whichever matches your setup:
@@ -223,7 +302,7 @@ many `[[notify]]` blocks as you want, each with its own minimum severity.
 
 ## Tests
 
-No pytest. Seven end-to-end scripts, each of which exercises the real pipeline:
+No pytest. Eight end-to-end scripts, each of which exercises the real pipeline:
 
 ```bash
 PYTHONPATH=src python tests/verify_hound_end_to_end.py        # core daemon
@@ -233,6 +312,7 @@ PYTHONPATH=src python tests/verify_channels.py                # notify channels 
 PYTHONPATH=src:tests python tests/verify_uptime.py            # liveness, outages, availability
 PYTHONPATH=src:tests python tests/verify_plugins.py           # opnsense, pfsense, wazuh
 PYTHONPATH=src:tests python tests/verify_opnsense_fields.py   # every plugin field round-trips
+PYTHONPATH=src:tests python tests/verify_relay.py             # relay: validation, quarantine, TLS
 ```
 
 There's also a disposable OPNsense VM rig under `deploy/dev/opnsense-vm/` that
