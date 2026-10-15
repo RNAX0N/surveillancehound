@@ -122,12 +122,25 @@ def main() -> int:
         print("  audit: every alert row records the channels it was delivered through")
 
         # --- dedup: a same-dedup-key alert within the window is suppressed ---
+        # Replay stamps alerts with PACKET time, not wall time, so a forensic
+        # replay dates its findings to when the traffic happened. Dedup has to
+        # be evaluated on that same clock — asking "is this suppressed right
+        # now?" against a capture from months ago is a different question.
         engine = AlertEngine(cfg=AlertsCfg(dedup_window_seconds=3600.0), store=store)
         bulk_dedup = bulk_alert.dedup_key
-        # mimicking a fresh emit attempt for the same dedup_key — should suppress
-        suppressed = engine._suppressed(bulk_dedup)  # noqa: SLF001
+        suppressed = engine._suppressed(bulk_dedup, bulk_alert.ts + 1.0)  # noqa: SLF001
         assert suppressed, "dedup did not suppress a same-key re-emit"
+        # ...and outside the window it is not suppressed
+        assert not engine._suppressed(bulk_dedup, bulk_alert.ts + 7200.0)  # noqa: SLF001
         print("  dedup: same-key re-emit suppressed within the window")
+
+        # --- the replay clock: a capture recorded months ago must NOT be
+        # reported as a storm of camera outages. This is the regression the
+        # packet-timestamp clock exists to prevent.
+        kinds = {a.kind for a in alerts}
+        for bogus in ("camera_offline", "camera_never_seen", "capture_stalled"):
+            assert bogus not in kinds, f"replay emitted bogus {bogus}: {kinds}"
+        print("  replay clock: no bogus offline/never-seen/stalled alerts")
 
         # --- devices: camera IP is in the store and classified ---
         cam = store.get_device(mk.CAMERA_IP)

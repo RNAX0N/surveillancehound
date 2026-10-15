@@ -2,8 +2,28 @@
 
 Pulls packets from `capture.stream_packets`, feeds them to the flow aggregator
 and the device classifier, periodically (every TICK seconds) flushes idle
-flows + checks for silent cameras, classifies each flushed flow, emits + dedups
-alerts, and dispatches notifications through every configured channel.
+flows + advances the uptime state machine, classifies each flushed flow,
+emits + dedups alerts, and dispatches notifications through every configured
+channel.
+
+**Two tick drivers, deliberately.** Live capture ticks from a watchdog
+thread; replay ticks inline from the packet loop. The reason is the capture
+dead-man's-switch: a tick driven from inside `for pkt in packets` cannot fire
+when the capture is dead, which is exactly when it needs to. The watchdog
+thread keeps ticking while the packet loop is blocked on a read that will
+never return, so `capture_stalled` can actually fire. Replay has no such
+failure mode and benefits from determinism, so it ticks inline off packet
+timestamps.
+
+Because of that thread, `_LOOP_LOCK` guards everything mutable the tick and
+the packet path share — `FlowAggregator`, `DeviceClassifier`,
+`UptimeTracker`, and the snapshot ring buffer are all single-threaded by
+design (`HoundStore` serializes itself, the rest do not).
+
+**Clock.** Live capture uses wall clock; replay uses the maximum packet
+timestamp seen so far. Replaying a capture recorded months ago must not
+report every camera as offline, and a forensic replay should report cameras
+that went silent *inside* the capture.
 
 Graceful shutdown on SIGINT / SIGTERM: a flag is flipped, the current packet
 batch finishes, all remaining flows are flushed (so nothing in-RAM is lost),
@@ -21,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -36,6 +57,7 @@ from surveillancehound.notify import Dispatcher, build_channel
 from surveillancehound.pcap import Packet
 from surveillancehound.snapshot import SnapshotEngine, snapshot_dir_for
 from surveillancehound.store import AlertRow, FlowRow, HoundStore, SnapshotRow
+from surveillancehound.uptime import Transition, UptimeTracker
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +70,7 @@ class RunStats:
     packets_seen: int = 0
     flows_flushed: int = 0
     alerts_emitted: int = 0
+    uptime_transitions: int = 0
     started_at: float = 0.0
     stopped_at: float | None = None
 
@@ -63,7 +86,10 @@ class Hound:
         self.classifier = FlowClassifier(
             network=cfg.network, thresholds=cfg.thresholds, devices=self.devices,
         )
-        self.alerts = AlertEngine(cfg=cfg.alerts, store=self.store)
+        self.alerts = AlertEngine(
+            cfg=cfg.alerts, store=self.store,
+            recovery_alerts=cfg.uptime.recovery_alerts,
+        )
         self.dispatcher = Dispatcher(
             [build_channel(c) for c in cfg.notify], store=self.store,
         )
@@ -97,8 +123,22 @@ class Hound:
                 cfg.snapshot.window_seconds, cfg.snapshot.min_severity,
                 snap_dir,
             )
+        # replay drives the clock from packet timestamps; live uses wall clock
+        self._replay = bool(cfg.capture.pcap_file)
+        self._clock_ts = 0.0
+        self.uptime: UptimeTracker | None = None
+        if cfg.uptime.enabled:
+            self.uptime = UptimeTracker(
+                cfg.uptime, cfg.thresholds, replay=self._replay,
+            )
         self.stats = RunStats()
         self._stop_flag = False
+        # guards everything the watchdog tick and the packet path share
+        self._loop_lock = threading.RLock()
+        self._packets_since_tick = 0
+        self._session_id: int | None = None
+        self._started = False
+        self._watchdog: threading.Thread | None = None
         # cameras seen this run; used to keep new_peer alerts tight
         self._known_peers_per_camera: dict[str, set[str]] = {}
         # bootstrap from the store so a restart doesn't re-alert on every device
@@ -133,26 +173,45 @@ class Hound:
         except CaptureError as e:
             log.error("capture failed to start: %s", e)
             return False
+        # Live capture can start its session immediately. Replay cannot: the
+        # clock is the packet timestamps, and none have been read yet, so the
+        # session would be stamped at epoch 0. It starts on the first packet.
+        if not self._replay:
+            self._begin_session(time.time())
+            self._start_watchdog()
+        clean = False
         try:
             self._loop(gen)
             # drain everything on shutdown so nothing is lost. Sort by
             # last_ts so the baseliner sees flows in time order regardless of
             # dict-iteration order — anomaly detection is order-sensitive.
-            self._flush(
-                sorted(self.flows.drain(), key=lambda f: f.last_ts),
-                now=time.time(),
-            )
-            if self.baseliner is not None:
-                self.baseliner.flush(self.store)
+            with self._loop_lock:
+                self._flush(
+                    sorted(self.flows.drain(), key=lambda f: f.last_ts),
+                    now=self._now(),
+                )
+                if self.baseliner is not None:
+                    self.baseliner.flush(self.store)
+                if self.uptime is not None:
+                    self.uptime.flush(self.store, self._now())
+            clean = True
             return True
         finally:
+            self._stop_flag = True
+            if self._watchdog is not None:
+                self._watchdog.join(timeout=_TICK_S * 2)
+            if self._session_id is not None:
+                self.store.end_monitor_session(
+                    self._session_id, self._now() or time.time(), clean,
+                )
             handle.close()
             self.store.close()
             self.stats.stopped_at = time.time()
             log.info(
-                "hound stopped: packets=%s flows_flushed=%s alerts=%s",
+                "hound stopped: packets=%s flows_flushed=%s alerts=%s "
+                "uptime_transitions=%s",
                 self.stats.packets_seen, self.stats.flows_flushed,
-                self.stats.alerts_emitted,
+                self.stats.alerts_emitted, self.stats.uptime_transitions,
             )
 
     # ----- internals -----
@@ -161,31 +220,87 @@ class Hound:
         log.info("hound: received signal %s — stopping", signum)
         self.stop()
 
+    # ----- clock + session -----
+
+    def _now(self) -> float:
+        """Current time on whichever clock this run uses."""
+        return self._clock_ts if self._replay else time.time()
+
+    def _begin_session(self, now: float) -> None:
+        source = self.cfg.capture.pcap_file or self.cfg.capture.interface
+        self._session_id = self.store.start_monitor_session(now, source)
+        if self.uptime is not None:
+            self.uptime.bootstrap(self.store, self.cfg.network, now)
+        self._started = True
+
+    def _start_watchdog(self) -> None:
+        """Tick from a thread so a dead capture still gets evaluated.
+
+        Ticking from inside the packet loop means no tick ever happens while
+        the capture is wedged — which is precisely the condition
+        `capture_stalled` exists to report.
+        """
+        def _run() -> None:
+            while not self._stop_flag:
+                time.sleep(_TICK_S)
+                if self._stop_flag:
+                    return
+                try:
+                    with self._loop_lock:
+                        self._tick(self._now())
+                except Exception:  # noqa: BLE001 - a tick must never kill the daemon
+                    log.exception("hound: tick failed")
+
+        self._watchdog = threading.Thread(
+            target=_run, name="hound-tick", daemon=True,
+        )
+        self._watchdog.start()
+
+    # ----- the loop -----
+
     def _loop(self, packets: Iterator[Packet]) -> None:
-        next_tick = time.time() + _TICK_S
+        next_tick = 0.0
         for pkt in packets:
             if self._stop_flag:
                 break
-            self.stats.packets_seen += 1
-            self._on_packet(pkt)
-            now = time.time()
-            if now >= next_tick:
-                self._tick(now)
-                next_tick = now + _TICK_S
+            with self._loop_lock:
+                self.stats.packets_seen += 1
+                self._packets_since_tick += 1
+                self._on_packet(pkt)
+                if not self._replay:
+                    continue  # the watchdog thread owns ticking when live
+                # replay ticks inline, off packet time, so a forensic replay
+                # is deterministic rather than dependent on how fast the
+                # file happens to be read
+                now = self._now()
+                if next_tick == 0.0:
+                    next_tick = now + _TICK_S
+                elif now >= next_tick:
+                    self._tick(now)
+                    next_tick = now + _TICK_S
 
     def _on_packet(self, pkt: Packet) -> None:
+        if pkt.ts and pkt.ts > self._clock_ts:
+            self._clock_ts = pkt.ts
+        if not self._started:
+            # replay: the first packet is what tells us what time it is
+            self._begin_session(self._now())
         self.devices.observe(pkt.src_ip, pkt.dst_ip, pkt.src_port, pkt.dst_port)
         self.flows.ingest(pkt)
-        now = time.time()
+        now = self._now()
         for ip in (pkt.src_ip, pkt.dst_ip):
             self._maybe_new_device(ip, now)
-        # snapshot ring buffer — append the raw record under any camera
-        # endpoint, so the buffer captures the conversation regardless of
-        # direction. No-op if snapshots disabled or this is pcapng input.
-        if self.snapshotter is not None:
-            for ip in (pkt.src_ip, pkt.dst_ip):
-                if self.devices.role_for(ip) == "camera":
-                    self.snapshotter.observe(ip, pkt.ts, pkt.raw_record)
+        # snapshot ring buffer + uptime liveness both key off the endpoint
+        # role, so resolve it once per endpoint rather than twice
+        for ip in (pkt.src_ip, pkt.dst_ip):
+            role = self.devices.role_for(ip)
+            if role == "camera" and self.snapshotter is not None:
+                # append the raw record under any camera endpoint so the
+                # buffer captures the conversation regardless of direction.
+                # No-op if snapshots disabled or this is pcapng input.
+                self.snapshotter.observe(ip, pkt.ts, pkt.raw_record)
+            if role in ("camera", "nvr") and self.uptime is not None:
+                self.uptime.touch(ip, pkt.ts or now)
 
     def _tick(self, now: float) -> None:
         # 1) evict idle flows and process them — sort by last_ts so the
@@ -196,8 +311,13 @@ class Hound:
         )
         if evicted:
             self._flush(evicted, now=now)
-        # 2) check for silent cameras
-        self._check_silence(now)
+        # 2) advance the liveness state machine. `saw_packets` is ANY packet,
+        #    not just camera traffic — it is what drives the dead-man's-switch
+        saw = self._packets_since_tick > 0
+        self._packets_since_tick = 0
+        if self.uptime is not None:
+            for tr in self.uptime.tick(self.store, now, saw_packets=saw):
+                self._on_transition(tr, now)
         # 3) write baselines back to disk on cadence (no-op if disabled)
         if self.baseliner is not None:
             self.baseliner.maybe_flush(self.store, now)
@@ -257,17 +377,29 @@ class Hound:
         if alert is not None:
             self._emit(alert)
 
-    def _check_silence(self, now: float) -> None:
-        ttl = self.cfg.thresholds.silence_seconds
-        for d in self.store.list_devices():
-            if d.role != "camera":
-                continue
-            if (now - d.last_seen) >= ttl:
-                a = self.alerts.camera_offline(d.ip, now - d.last_seen, now)
-                if a is not None:
-                    self._emit(a)
+    def _on_transition(self, tr: Transition, now: float) -> None:
+        """Handle one liveness transition from the uptime tracker."""
+        self.stats.uptime_transitions += 1
+        # A stall means the sensor is blind, not that the cameras are fine.
+        # Splitting the monitor session here is what keeps blind time out of
+        # the availability figures — otherwise a wedged capture would be
+        # reported as 100% camera uptime, which is worse than no figure.
+        if tr.kind == "stalled" and self._session_id is not None:
+            self.store.end_monitor_session(self._session_id, tr.since, False)
+            self._session_id = None
+        elif tr.kind == "stall_cleared":
+            source = self.cfg.capture.pcap_file or self.cfg.capture.interface
+            self._session_id = self.store.start_monitor_session(now, source)
 
-    def _emit(self, alert: Alert) -> None:
+        alert = self.alerts.from_transition(tr, now)
+        if alert is None:
+            log.debug("uptime: %s %s (no alert)", tr.kind, tr.camera_ip)
+            return
+        alert_id = self._emit(alert)
+        if tr.outage_id is not None and tr.kind in ("down", "never_seen"):
+            self.store.set_outage_alert(tr.outage_id, alert_id)
+
+    def _emit(self, alert: Alert) -> int:
         row = AlertRow(
             id=None, ts=alert.ts, device_ip=alert.device_ip, kind=alert.kind,
             severity=alert.severity, summary=alert.summary, detail=alert.detail,
@@ -290,3 +422,4 @@ class Hound:
                     packet_count=packet_count, created_at=alert.ts,
                 ))
         self.stats.alerts_emitted += 1
+        return alert_id
