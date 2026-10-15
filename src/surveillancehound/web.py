@@ -48,6 +48,11 @@ log = logging.getLogger(__name__)
 # can't actually contact the daemon process. Tunable via [web] in future.
 _LIVENESS_WINDOW_SECONDS = 600.0
 
+# The daemon rewrites monitor_heartbeat every tick (5s), so a heartbeat
+# older than this means the process is gone rather than merely idle. This
+# server cannot contact the daemon, so the heartbeat is the only evidence.
+_DAEMON_ALIVE_WINDOW_S = 30.0
+
 
 def _json(handler: BaseHTTPRequestHandler, status: int, payload) -> None:
     body = json.dumps(payload, default=_jsonable).encode()
@@ -198,7 +203,12 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             store.close()
         stall_window = self.cfg.uptime.capture_stall_seconds
-        running = session is not None and session.ended_at is None
+        # Liveness comes from the heartbeat, NOT from whether the session is
+        # open: a stall deliberately closes the session so blind time is
+        # excluded from availability, which would otherwise make a running
+        # but blind daemon report as stopped — exactly backwards, in exactly
+        # the situation the operator needs the truth.
+        running = hb_updated > 0.0 and (now - hb_updated) < _DAEMON_ALIVE_WINDOW_S
         stalled = bool(
             running and stall_window > 0 and last_activity > 0.0
             and (now - last_activity) > stall_window
@@ -1002,11 +1012,14 @@ function renderUptime(u) {
   } else if (m.running) {
     mon = '<span class="mon-state ok">watching</span>'
         + `<span>source ${escapeHTML(m.source)}</span>`
-        + `<span>since ${fmtTs(m.started_at)}</span>`;
+        + `<span>since ${fmtTs(m.started_at)}</span>`
+        + `<span>last packet ${m.last_activity_ts ? fmtAgo(m.last_activity_ts) : "never"}</span>`;
   } else {
-    mon = '<span class="mon-state bad">stopped</span>'
+    // "not running", not "stopped": the daemon may have crashed rather
+    // than been stopped, and the heartbeat cannot tell us which
+    mon = '<span class="mon-state bad">not running</span>'
         + `<span>source ${escapeHTML(m.source)}</span>`
-        + `<span>ended ${fmtAgo(m.ended_at)}</span>`;
+        + `<span>last heartbeat ${m.heartbeat_ts ? fmtAgo(m.heartbeat_ts) : "never"}</span>`;
   }
   mon += `<span>window ${fmtDur(u.window_seconds)}</span>`;
   $("monitor-line").innerHTML = mon;

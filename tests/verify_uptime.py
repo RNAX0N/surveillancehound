@@ -847,6 +847,52 @@ def _check_stall_readout_with_no_live_camera(tmp: Path) -> None:
         store.close()
 
 
+def _check_monitor_health_states(tmp: Path) -> None:
+    """Readers must distinguish running-but-blind from not-running.
+
+    A stall deliberately CLOSES the monitor session so blind time is
+    excluded from availability. Readers that inferred liveness from
+    `session.ended_at` therefore reported a daemon that was very much
+    running — just blind — as "stopped", which is the wrong answer in
+    exactly the situation the operator needs the right one. Liveness
+    comes from the heartbeat's updated_at, which keeps advancing every
+    tick while last_packet_at stays frozen.
+    """
+    from surveillancehound.cli import _monitor_health
+
+    cfg = load_from_dict({
+        "capture": {"interface": "igb0"},
+        "network": {"camera_ips": [CAM]},
+        "store": {"path": str(tmp / "health.sqlite")},
+        "uptime": {"capture_stall_seconds": 60.0},
+    })
+    now = T0 + 10_000
+    for label, hb_packet, hb_updated, close_session, expect in [
+        ("watching", now - 2, now - 2, False, (True, False)),
+        # the daemon is ticking (updated_at fresh) but no packets are
+        # arriving, and the stall already closed the session
+        ("blind", now - 300, now - 2, True, (True, True)),
+        ("dead", now - 600, now - 600, False, (False, False)),
+    ]:
+        path = tmp / f"health_{label}.sqlite"
+        cfg.store.path = path
+        store = HoundStore(path=path)
+        try:
+            sid = store.start_monitor_session(now - 3600, "igb0")
+            store.upsert_device(CAM, "camera", now - 5, 10, 100)
+            store.set_heartbeat(hb_packet, hb_updated)
+            if close_session:
+                store.end_monitor_session(sid, now - 240, False)
+            alive, blind, _last = _monitor_health(store, cfg, now)
+            assert (alive, blind) == expect, (
+                f"{label}: expected alive/blind {expect}, got {(alive, blind)}"
+            )
+        finally:
+            store.close()
+    print("  monitor health: watching / running-but-blind / not-running "
+          "all distinguished")
+
+
 def _check_capture_death_is_reported(tmp: Path) -> None:
     """tcpdump exiting must not look like a clean shutdown.
 
@@ -914,6 +960,7 @@ def main() -> int:
         _check_stall_suppression(tmp)
         _check_no_blame_without_evidence(tmp)
         _check_stall_readout_with_no_live_camera(tmp)
+        _check_monitor_health_states(tmp)
         _check_restart_resumes_outage(tmp)
         _check_restart_does_not_fake_recovery(tmp)
         _check_availability(tmp)

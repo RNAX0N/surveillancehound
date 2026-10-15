@@ -160,6 +160,33 @@ _PASSIVE_NOTE = (
 )
 
 
+# The daemon ticks every 5s, so a heartbeat older than this means the
+# process is gone, not merely idle. Reader processes cannot contact the
+# daemon, so this is the only way to tell.
+_DAEMON_ALIVE_WINDOW_S = 30.0
+
+
+def _monitor_health(store, cfg, now: float) -> tuple[bool, bool, float]:
+    """(daemon_alive, capture_blind, last_packet_ts), for readers.
+
+    Liveness comes from the heartbeat's `updated_at`, NOT from whether the
+    monitor session is open. A capture stall deliberately CLOSES the
+    session so blind time is excluded from availability, which would
+    otherwise make a daemon that is very much running — just blind —
+    report as "stopped", in precisely the situation where the operator
+    most needs to be told the truth.
+    """
+    hb_packet, hb_updated = store.heartbeat()
+    alive = hb_updated > 0.0 and (now - hb_updated) < _DAEMON_ALIVE_WINDOW_S
+    last_activity = hb_packet or store.latest_device_activity()
+    stall_window = cfg.uptime.capture_stall_seconds
+    blind = bool(
+        alive and stall_window > 0 and last_activity > 0.0
+        and (now - last_activity) > stall_window
+    )
+    return alive, blind, last_activity
+
+
 def cmd_uptime(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
     # `is not None`, not truthiness — `--window 0` is a real request, not an
@@ -175,22 +202,23 @@ def cmd_uptime(args: argparse.Namespace) -> int:
         if session is None:
             print("no monitor session recorded yet — has the daemon run?")
         else:
-            running = session.ended_at is None
-            state = "running" if running else "stopped"
-            stall_window = cfg.uptime.capture_stall_seconds
-            # the daemon's heartbeat: flow rows are written late (at
-            # eviction) and device rows only tick for camera/NVR roles, so
-            # both read stale exactly when every camera is dead
-            hb_packet, _hb_updated = store.heartbeat()
-            last_activity = hb_packet or store.latest_device_activity()
-            blind = (
-                running and stall_window > 0 and last_activity > 0.0
-                and (now - last_activity) > stall_window
+            alive, blind, last_activity = _monitor_health(store, cfg, now)
+            if not alive:
+                state = "NOT RUNNING"
+            elif blind:
+                state = "RUNNING BUT BLIND (capture stalled)"
+            else:
+                state = "watching"
+            seen = (
+                f"last packet {_dur(now - last_activity)} ago"
+                if last_activity > 0 else "no packets yet"
             )
             print(
-                f"monitor: {state} on {session.source!r} since "
+                f"monitor: {state}"
+                f"  ·  source {session.source!r}"
+                f"  ·  since "
                 f"{datetime.fromtimestamp(session.started_at):%Y-%m-%d %H:%M:%S}"
-                + ("  [CAPTURE MAY BE STALLED]" if blind else "")
+                f"  ·  {seen}"
             )
 
         if args.outages:
