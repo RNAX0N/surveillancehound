@@ -881,6 +881,49 @@ class HoundStore:
         return report
 
 
+
+    # ----- relay: incremental readers for the agent -----
+
+    def flows_since(self, after_id: int, limit: int = 5000) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM flows WHERE id > ? ORDER BY id LIMIT ?",
+                (int(after_id), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def alerts_since(self, after_id: int, limit: int = 5000) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM alerts WHERE id > ? ORDER BY id LIMIT ?",
+                (int(after_id), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def outages_changed_since(self, after_id: int, limit: int = 5000) -> list[dict]:
+        """New outages, plus any still open.
+
+        An open outage is re-sent each cycle so its eventual close lands as
+        an update on the collector; the (sensor_id, remote_id) key makes
+        that idempotent.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM outages
+                   WHERE id > ? OR up_at IS NULL
+                   ORDER BY id LIMIT ?""",
+                (int(after_id), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def devices_changed_since(self, since: float, limit: int = 5000) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM devices WHERE last_seen >= ? ORDER BY ip LIMIT ?",
+                (float(since), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # ----- relay: quarantined remote data -----
     #
     # Everything below writes ONLY remote_* tables. That is the whole

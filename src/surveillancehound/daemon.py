@@ -90,9 +90,16 @@ class Hound:
             cfg=cfg.alerts, store=self.store,
             recovery_alerts=cfg.uptime.recovery_alerts,
         )
-        self.dispatcher = Dispatcher(
-            [build_channel(c) for c in cfg.notify], store=self.store,
-        )
+        if cfg.relay.is_agent:
+            # An agent never notifies. The collector is the only notifier,
+            # so configuring channels at both ends would double-page.
+            self.dispatcher = Dispatcher([], store=self.store)
+            log.info("relay: agent mode — notifications are the collector's "
+                     "job, dispatch disabled here")
+        else:
+            self.dispatcher = Dispatcher(
+                [build_channel(c) for c in cfg.notify], store=self.store,
+            )
         self.baseliner: BaselineEngine | HSEngine | None = None
         if cfg.baseline.enabled:
             self.baseliner = make_engine(cfg.baseline)
@@ -130,6 +137,17 @@ class Hound:
         if cfg.uptime.enabled:
             self.uptime = UptimeTracker(
                 cfg.uptime, cfg.thresholds, replay=self._replay,
+            )
+        self.relay = None
+        self.ingest = None
+        if cfg.relay.is_agent:
+            from surveillancehound.relay import RelayClient
+            self.relay = RelayClient(cfg.relay, self.store, now=time.time)
+        elif cfg.relay.is_collector:
+            from surveillancehound.ingest import IngestServer
+            self.ingest = IngestServer(
+                cfg.relay, self.store, on_alerts=self._on_relayed_alerts,
+                now=time.time,
             )
         self.stats = RunStats()
         self._stop_flag = False
@@ -179,6 +197,10 @@ class Hound:
         if not self._replay:
             self._begin_session(time.time())
             self._start_watchdog()
+            if self.relay is not None:
+                self.relay.start()
+            if self.ingest is not None:
+                self.ingest.start()
         clean = False
         died = False
         try:
@@ -207,10 +229,18 @@ class Hound:
                     self.baseliner.flush(self.store)
                 if self.uptime is not None:
                     self.uptime.flush(self.store, self._now())
+            if self.relay is not None:
+                self.relay.final_flush()
             clean = not died
             return not died
         finally:
             self._stop_flag = True
+            # Stop the relay threads BEFORE taking the lock and closing the
+            # store, or an in-flight ingest resumes against a dead handle.
+            if self.relay is not None:
+                self.relay.stop()
+            if self.ingest is not None:
+                self.ingest.stop()
             if self._watchdog is not None:
                 self._watchdog.join(timeout=_TICK_S * 2)
             # Close out under the loop lock so no watchdog tick can be
@@ -451,6 +481,35 @@ class Hound:
         alert_id = self._emit(alert)
         if tr.outage_id is not None and tr.kind in ("down", "never_seen"):
             self.store.set_outage_alert(tr.outage_id, alert_id)
+
+    def _on_relayed_alerts(self, sensor_id: str, alerts: list[dict]) -> None:
+        """Dispatch alerts that arrived from a relay agent.
+
+        Deliberately not `_emit`. That writes `alerts`, updates it again via
+        set_alert_channels, records into `notifications` (whose alert_id
+        means alerts.id), and can make the snapshot engine overwrite a local
+        alert's pcap — four ways for a remote host to reach central state.
+        This path touches remote_* only.
+        """
+        now = time.time()
+        window = self.cfg.alerts.dedup_window_seconds
+        for raw in alerts:
+            key = f"{sensor_id}/{raw['dedup_key']}"
+            last = self.store.remote_alert_last_at(sensor_id, raw["dedup_key"])
+            if last is not None and (now - last) < window and raw["ts"] <= last:
+                continue
+            alert = Alert(
+                ts=raw["ts"], device_ip=raw["device_ip"], kind=raw["kind"],
+                severity=raw["severity"], summary=raw["summary"],
+                detail=raw["detail"], dedup_key=key, sensor=sensor_id,
+            )
+            remote_id = self.store.remote_alert_id_for(sensor_id, raw["remote_id"])
+            delivered = self.dispatcher.dispatch(alert, None)
+            for channel in delivered or []:
+                self.store.record_remote_notification(
+                    sensor_id, remote_id or 0, channel, True,
+                )
+            self.stats.alerts_emitted += 1
 
     def _emit(self, alert: Alert) -> int:
         row = AlertRow(

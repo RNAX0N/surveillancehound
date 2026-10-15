@@ -34,6 +34,7 @@ import logging
 import os
 import secrets
 import ssl
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -334,3 +335,200 @@ def post_batch(
         return resp.status, payload
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------
+# agent client
+# --------------------------------------------------------------------------
+
+class RelayClient:
+    """Collects this sensor's new records and pushes them to the collector.
+
+    Pushing happens on its own thread with the spool as the hand-off. Doing
+    it from the daemon tick would hold `_loop_lock` across a network call,
+    so a dead collector with a ten-second timeout would stall packet
+    processing for ten seconds out of every tick.
+    """
+
+    def __init__(self, cfg, store, now=time.time):
+        self.cfg = cfg
+        self.store = store
+        self.now = now
+        base = Path(store.path).parent / "relay"
+        self.state = AgentState.load(base)
+        self.spool = Spool(base, cfg.spool_max_bytes, cfg.spool_max_age_seconds)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # ----- collection -----
+
+    def collect(self) -> dict:
+        """Everything new since the last successful push."""
+        wm = self.state.watermark
+        flows = self.store.flows_since(wm.flow_id)
+        alerts = self.store.alerts_since(wm.alert_id)
+        outages = self.store.outages_changed_since(wm.outage_id)
+        devices = self.store.devices_changed_since(wm.reported_at)
+        uptime = self.store.uptime_report(
+            self.cfg_report_window(), self.now(),
+        )
+        return {
+            "devices": [
+                {"ip": d["ip"], "role": d["role"], "first_seen": d["first_seen"],
+                 "last_seen": d["last_seen"], "packet_count": d["packet_count"],
+                 "byte_count": d["byte_count"]}
+                for d in devices
+            ],
+            "flows": [
+                {"remote_id": f["id"], "src_ip": f["src_ip"],
+                 "src_port": f["src_port"], "dst_ip": f["dst_ip"],
+                 "dst_port": f["dst_port"], "proto": f["proto"],
+                 "first_seen": f["first_seen"], "last_seen": f["last_seen"],
+                 "packets": f["packets"], "bytes": f["bytes"],
+                 "bytes_to_camera": f["bytes_to_camera"],
+                 "bytes_from_camera": f["bytes_from_camera"],
+                 "tcp_flags_seen": f["tcp_flags_seen"],
+                 "classification": f["classification"]}
+                for f in flows
+            ],
+            "alerts": [
+                {"remote_id": a["id"], "ts": a["ts"], "device_ip": a["device_ip"],
+                 "kind": a["kind"], "severity": a["severity"],
+                 "summary": a["summary"], "detail": a["detail"],
+                 "dedup_key": a["dedup_key"]}
+                for a in alerts
+            ],
+            "outages": [
+                {"remote_id": o["id"], "camera_ip": o["camera_ip"],
+                 "down_since": o["down_since"], "up_at": o["up_at"],
+                 "last_seen_before": o["last_seen_before"], "cause": o["cause"]}
+                for o in outages
+            ],
+            "uptime": [
+                {"ip": u.ip, "role": u.role, "state": u.state,
+                 "last_seen": u.last_seen, "first_seen": u.first_seen,
+                 "down_since": u.down_since,
+                 "current_downtime": u.current_downtime,
+                 "outage_count": u.outage_count,
+                 "downtime_seconds": u.downtime_seconds,
+                 "monitored_seconds": u.monitored_seconds,
+                 "availability": u.availability}
+                for u in uptime
+            ],
+            "monitor": self._monitor(),
+        }, _advance(wm, flows, alerts, outages, self.now())
+
+    def cfg_report_window(self) -> float:
+        return 86400.0
+
+    def _monitor(self) -> dict:
+        last_packet, updated = self.store.heartbeat()
+        now = self.now()
+        return {
+            "alive": (now - updated) < 30.0 if updated else False,
+            "blind": bool(last_packet and (now - last_packet) > 120.0),
+            "last_activity_ts": last_packet,
+        }
+
+    # ----- pushing -----
+
+    def enqueue(self) -> int:
+        """Snapshot new records into the spool. Cheap; no network."""
+        with self._lock:
+            records, new_wm = self.collect()
+            if not any(records.get(k) for k in
+                       ("devices", "flows", "alerts", "outages", "uptime")):
+                return 0
+            seq = self.state.next_seq
+            body = build_batch(self.cfg.sensor_id, self.state.instance_id,
+                               seq, records, self.now())
+            self.spool.append(seq, body, self.now())
+            self.state.next_seq = seq + 1
+            self.state.watermark = new_wm
+            self.state.save()
+            return seq
+
+    def flush(self) -> bool:
+        """Try to deliver everything spooled. Returns True if the spool emptied."""
+        with self._lock:
+            pending = self.spool.pending(self.now())
+        ok = True
+        for seq, body in pending:
+            try:
+                # Re-stamp: a batch spooled during an outage is older than
+                # the collector's skew window allows.
+                fresh = restamp(body, self.now())
+                status, payload = post_batch(
+                    self.cfg.url, fresh, self.cfg.key, self.cfg.sensor_id,
+                    seq, self.cfg.tls_fingerprint,
+                )
+            except (RelayError, OSError, ssl.SSLError) as e:
+                self.state.last_error = str(e)[:300]
+                self.state.save()
+                return False
+            if status == 200:
+                self.spool.ack(seq)
+                self.state.last_push_ts = self.now()
+                self.state.last_error = ""
+                self.state.save()
+            elif status == 409:
+                # The collector is ahead of us — a wiped volume, or a
+                # duplicate. Fast-forward rather than retrying forever.
+                last = int(payload.get("last_seq", seq))
+                self.spool.drop(seq, f"collector already has seq {last}")
+                with self._lock:
+                    if self.state.next_seq <= last:
+                        self.state.next_seq = last + 1
+                        self.state.save()
+            elif status in (400, 401):
+                # Malformed or unauthorised: retrying cannot help.
+                self.spool.drop(seq, f"rejected with {status}: "
+                                     f"{payload.get('error', '')[:120]}")
+                self.state.last_error = f"{status}: {payload.get('error','')}"[:300]
+                self.state.save()
+            else:
+                self.state.last_error = f"{status}: {payload.get('error','')}"[:300]
+                self.state.save()
+                ok = False
+                break
+        return ok
+
+    # ----- thread -----
+
+    def start(self) -> None:
+        def _run():
+            while not self._stop.wait(self.cfg.batch_seconds):
+                try:
+                    self.enqueue()
+                    self.flush()
+                except Exception:       # noqa: BLE001 - never kill the agent
+                    log.exception("relay: push cycle failed")
+        self._thread = threading.Thread(target=_run, name="hound-relay",
+                                        daemon=True)
+        self._thread.start()
+        log.info("relay: agent %r pushing to %s every %gs",
+                 self.cfg.sensor_id, self.cfg.url, self.cfg.batch_seconds)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=15)
+            self._thread = None
+
+    def final_flush(self) -> None:
+        """Last attempt on clean shutdown so the tail is not lost."""
+        try:
+            self.enqueue()
+            self.flush()
+        except Exception:               # noqa: BLE001
+            log.exception("relay: final flush failed")
+
+
+def _advance(wm: Watermark, flows, alerts, outages, now: float) -> Watermark:
+    return Watermark(
+        flow_id=max([wm.flow_id] + [f["id"] for f in flows]),
+        alert_id=max([wm.alert_id] + [a["id"] for a in alerts]),
+        outage_id=max([wm.outage_id] + [o["id"] for o in outages]),
+        reported_at=now,
+    )

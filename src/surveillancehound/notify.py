@@ -447,9 +447,16 @@ class Dispatcher:
         self.channels = channels
         self.store = store
 
-    def dispatch(self, alert: Alert, alert_id: int) -> list[str]:
+    def dispatch(self, alert: Alert, alert_id: int | None) -> list[str]:
         """Push to every applicable channel. Returns the channel types that
-        accepted the alert (used for the alert row's notified_channels column)."""
+        accepted the alert (used for the alert row's notified_channels column).
+
+        `alert_id=None` means the caller owns the audit record — that is the
+        relayed path, which must write remote_notifications rather than
+        `notifications`, whose alert_id implicitly means alerts.id. Recording
+        a relayed delivery there would make the audit trail ambiguous and
+        remotely writable.
+        """
         delivered: list[str] = []
         for ch in self.channels:
             if not _passes_level(alert.severity, ch.level):
@@ -467,7 +474,8 @@ class Dispatcher:
             except Exception as e:  # noqa: BLE001
                 ok, err = False, f"{type(e).__name__}: {e}"
                 log.exception("notify %s errored", ch.type)
-            self.store.record_notification(alert_id, ch.type, ok, err)
+            if alert_id is not None:
+                self.store.record_notification(alert_id, ch.type, ok, err)
             if ok:
                 delivered.append(ch.type)
         return delivered

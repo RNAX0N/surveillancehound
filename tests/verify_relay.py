@@ -678,6 +678,151 @@ def _check_pinning(tmp: Path) -> None:
         store.close()
 
 
+
+# ---------------------------------------------------------------------------
+# end to end: a real agent pushing to a real collector over TLS
+# ---------------------------------------------------------------------------
+
+def _seed_agent_store(path: Path):
+    """An agent store with the kind of rows a live sensor would have."""
+    from surveillancehound.store import (
+        AlertRow, FlowRow, HoundStore, OutageRow,
+    )
+    st = HoundStore(path=path)
+    sid = st.start_monitor_session(T0 - 3600, "any")
+    st.end_monitor_session(sid, T0, True)
+    st.upsert_device("117.111.101.2", "camera", T0, 100, 10000)
+    st.upsert_device("117.111.102.2", "camera", T0 - 7200, 50, 5000)
+    st.set_heartbeat(T0, T0)
+    for i in range(3):
+        st.insert_flow(FlowRow(
+            src_ip="117.111.101.2", src_port=554, dst_ip="88.255.5.11",
+            dst_port=40000 + i, proto="tcp", first_seen=T0 - 10,
+            last_seen=T0, packets=10, bytes=1000, bytes_to_camera=100,
+            bytes_from_camera=900, tcp_flags_seen="PA",
+            classification="lan_normal"))
+    st.insert_alert(AlertRow(
+        id=None, ts=T0, device_ip="117.111.102.2", kind="camera_offline",
+        severity="medium", summary="camera 117.111.102.2 has been silent",
+        detail="d", dedup_key="camera_offline:117.111.102.2:1"))
+    oid = st.open_outage(OutageRow(
+        None, "117.111.102.2", T0 - 600, None, T0 - 660, "silence", None))
+    return st, oid
+
+
+def _check_end_to_end(tmp: Path) -> None:
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import HoundStore
+
+    port = _free_port()
+    clock = {"t": T0 + 10}
+    now = lambda: clock["t"]                                   # noqa: E731
+
+    collector_store = HoundStore(path=tmp / "collector.sqlite")
+    # give the collector its own state, which must survive untouched
+    collector_store.upsert_device("88.255.5.11", "nvr", T0, 9, 900)
+    before = _snapshot_central(collector_store)
+
+    dispatched = []
+    srv = IngestServer(_collector_cfg(port), collector_store,
+                       on_alerts=lambda sid, al: dispatched.append((sid, len(al))),
+                       now=now)
+    assert srv.start(), "collector did not start"
+
+    agent_store, _ = _seed_agent_store(tmp / "agent.sqlite")
+    agent_cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret",
+        url=f"https://127.0.0.1:{port}/ingest/v1",
+        tls_fingerprint=_pin(), batch_seconds=1.0,
+    )
+    client = RelayClient(agent_cfg, agent_store, now=now)
+
+    try:
+        seq = client.enqueue()
+        assert seq == 1, seq
+        assert client.flush() is True, f"push failed: {client.state.last_error}"
+
+        sensor = collector_store.get_remote_sensor("frigate")
+        assert sensor is not None and sensor.last_seq == 1
+        flows = collector_store.list_remote_flows()
+        alerts = collector_store.list_remote_alerts()
+        assert len(flows) == 3, f"expected 3 relayed flows, got {len(flows)}"
+        assert len(alerts) == 1 and alerts[0]["sensor_id"] == "frigate"
+        assert dispatched == [("frigate", 1)], dispatched
+        up = collector_store.remote_uptime_report(now(), 180)
+        assert {u["ip"] for u in up} == {"117.111.101.2", "117.111.102.2"}
+
+        # the collector's own tables are untouched
+        assert _snapshot_central(collector_store) == before, (
+            "relayed data modified the collector's own state"
+        )
+
+        # --- link goes down: the agent must spool, not lose data ---
+        srv.stop()
+        from surveillancehound.store import FlowRow
+        for i in range(2):
+            agent_store.insert_flow(FlowRow(
+                src_ip="117.111.103.2", src_port=554, dst_ip="88.255.5.11",
+                dst_port=50000 + i, proto="tcp", first_seen=T0, last_seen=T0 + 20,
+                packets=5, bytes=500, bytes_to_camera=50, bytes_from_camera=450,
+                tcp_flags_seen="PA", classification="lan_normal"))
+        clock["t"] += 30
+        client.enqueue()
+        assert client.flush() is False, "flush should fail with the link down"
+        assert client.spool.stats(now()).pending >= 1, "nothing was spooled"
+
+        # --- link returns, well outside the skew window ---
+        clock["t"] += 3600
+        srv2 = IngestServer(_collector_cfg(port), collector_store, now=now)
+        assert srv2.start(), "collector did not restart"
+        try:
+            assert client.flush() is True, (
+                f"spooled replay failed: {client.state.last_error}"
+            )
+            assert client.spool.stats(now()).pending == 0, "spool not drained"
+            assert len(collector_store.list_remote_flows()) == 5, (
+                "replayed flows did not arrive"
+            )
+            assert _snapshot_central(collector_store) == before
+        finally:
+            srv2.stop()
+
+        print("  end-to-end: 3 flows + 1 alert relayed over TLS; link drop "
+              "spooled and replayed an hour later; collector state untouched")
+    finally:
+        srv.stop()
+        agent_store.close()
+        collector_store.close()
+
+
+def _check_agent_is_silent(tmp: Path) -> None:
+    """Agent mode must not notify — the collector is the only notifier."""
+    from surveillancehound.config import load_from_dict
+    from surveillancehound.daemon import Hound
+
+    cfg = load_from_dict({
+        "capture": {"pcap_file": str(tmp / "none.pcap")},
+        "network": {"camera_ips": ["117.111.101.2"],
+                    "lan_subnets": ["88.255.0.0/16"]},
+        "store": {"path": str(tmp / "silent.sqlite")},
+        "notify": [{"type": "stdout", "level": "info"}],
+        "relay": {"mode": "agent", "sensor_id": "frigate", "key": "k",
+                  "url": "https://88.255.5.1:18443/ingest/v1",
+                  "tls_fingerprint": ["sha256:abc"]},
+    })
+    hound = Hound(cfg)
+    try:
+        assert hound.dispatcher.channels == [], (
+            "an agent configured a notify channel — it would page twice"
+        )
+        assert hound.relay is not None and hound.ingest is None
+    finally:
+        hound.store.close()
+    print("  agent mode: dispatch disabled, relay client constructed")
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -698,6 +843,10 @@ def main() -> int:
         _check_listener(Path(td))
         _check_listener_limits(Path(td))
         _check_pinning(Path(td))
+    print("=== end to end ===")
+    with tempfile.TemporaryDirectory() as td:
+        _check_agent_is_silent(Path(td))
+        _check_end_to_end(Path(td))
     print("\nRELAY VERIFICATION PASSED")
     return 0
 
