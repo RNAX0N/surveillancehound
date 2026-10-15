@@ -157,6 +157,22 @@ class CameraUptimeRow:
 
 
 @dataclass
+class RemoteSensorRow:
+    sensor_id: str
+    instance_id: str
+    first_seen: float
+    last_seen: float
+    last_seq: int
+    clock_skew: float
+    batches: int
+    records: int
+    bytes: int
+    mon_alive: bool
+    mon_blind: bool
+    mon_last_activity_ts: float
+
+
+@dataclass
 class BaselineRow:
     """One Welford bucket — per (camera_ip, weekday, hour, feature)."""
     camera_ip: str
@@ -311,7 +327,137 @@ CREATE TABLE IF NOT EXISTS monitor_heartbeat (
     last_packet_at  REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
+
+-- ---------------------------------------------------------------- relay --
+-- Records relayed from another sensor live ONLY in these tables. No code on
+-- the ingest path writes any of the nine tables above, which is what makes
+-- "a compromised agent cannot corrupt this instance's state" a structural
+-- property rather than a validation rule that could be bypassed. The test
+-- suite enforces it with a sqlite authorizer, not by assertion.
+CREATE TABLE IF NOT EXISTS remote_sensors (
+    sensor_id            TEXT PRIMARY KEY,
+    instance_id          TEXT NOT NULL DEFAULT '',
+    first_seen           REAL NOT NULL,
+    last_seen            REAL NOT NULL,
+    last_seq             INTEGER NOT NULL DEFAULT 0,
+    clock_skew           REAL NOT NULL DEFAULT 0.0,
+    batches              INTEGER NOT NULL DEFAULT 0,
+    records              INTEGER NOT NULL DEFAULT 0,
+    bytes                INTEGER NOT NULL DEFAULT 0,
+    mon_alive            INTEGER NOT NULL DEFAULT 0,
+    mon_blind            INTEGER NOT NULL DEFAULT 0,
+    mon_last_activity_ts REAL NOT NULL DEFAULT 0.0
+);
+
+CREATE TABLE IF NOT EXISTS remote_devices (
+    sensor_id    TEXT NOT NULL,
+    ip           TEXT NOT NULL,
+    role         TEXT NOT NULL DEFAULT 'other',
+    first_seen   REAL NOT NULL,
+    last_seen    REAL NOT NULL,
+    packet_count INTEGER NOT NULL DEFAULT 0,
+    byte_count   INTEGER NOT NULL DEFAULT 0,
+    ingested_at  REAL NOT NULL,
+    PRIMARY KEY (sensor_id, ip)
+);
+
+CREATE TABLE IF NOT EXISTS remote_flows (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    sensor_id         TEXT NOT NULL,
+    remote_id         INTEGER NOT NULL,
+    src_ip            TEXT NOT NULL,
+    src_port          INTEGER,
+    dst_ip            TEXT NOT NULL,
+    dst_port          INTEGER,
+    proto             TEXT NOT NULL,
+    first_seen        REAL NOT NULL,
+    last_seen         REAL NOT NULL,
+    packets           INTEGER NOT NULL,
+    bytes             INTEGER NOT NULL,
+    bytes_to_camera   INTEGER NOT NULL DEFAULT 0,
+    bytes_from_camera INTEGER NOT NULL DEFAULT 0,
+    tcp_flags_seen    TEXT NOT NULL DEFAULT '',
+    classification    TEXT NOT NULL DEFAULT 'normal',
+    ingested_at       REAL NOT NULL,
+    UNIQUE (sensor_id, remote_id)
+);
+CREATE INDEX IF NOT EXISTS idx_remote_flows_seen ON remote_flows(last_seen);
+
+CREATE TABLE IF NOT EXISTS remote_alerts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sensor_id   TEXT NOT NULL,
+    remote_id   INTEGER NOT NULL,
+    ts          REAL NOT NULL,
+    device_ip   TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL,
+    severity    TEXT NOT NULL,
+    summary     TEXT NOT NULL DEFAULT '',
+    detail      TEXT NOT NULL DEFAULT '',
+    dedup_key   TEXT NOT NULL,
+    ingested_at REAL NOT NULL,
+    UNIQUE (sensor_id, remote_id)
+);
+CREATE INDEX IF NOT EXISTS idx_remote_alerts_dedup ON remote_alerts(dedup_key, ts);
+CREATE INDEX IF NOT EXISTS idx_remote_alerts_ts ON remote_alerts(ts);
+
+-- Keyed on the agent's own row id so a close UPDATES its open row. Without
+-- that key a recovery either inserts a duplicate (double-counting the
+-- outage) or is dropped, leaving an outage open forever while the uptime
+-- snapshot says the camera is up.
+CREATE TABLE IF NOT EXISTS remote_outages (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    sensor_id        TEXT NOT NULL,
+    remote_id        INTEGER NOT NULL,
+    camera_ip        TEXT NOT NULL,
+    down_since       REAL NOT NULL,
+    up_at            REAL,
+    last_seen_before REAL NOT NULL DEFAULT 0.0,
+    cause            TEXT NOT NULL DEFAULT 'silence',
+    ingested_at      REAL NOT NULL,
+    UNIQUE (sensor_id, remote_id)
+);
+
+CREATE TABLE IF NOT EXISTS remote_uptime (
+    sensor_id         TEXT NOT NULL,
+    ip                TEXT NOT NULL,
+    role              TEXT NOT NULL DEFAULT 'camera',
+    state             TEXT NOT NULL,
+    last_seen         REAL NOT NULL DEFAULT 0.0,
+    first_seen        REAL NOT NULL DEFAULT 0.0,
+    down_since        REAL,
+    current_downtime  REAL NOT NULL DEFAULT 0.0,
+    outage_count      INTEGER NOT NULL DEFAULT 0,
+    downtime_seconds  REAL NOT NULL DEFAULT 0.0,
+    monitored_seconds REAL NOT NULL DEFAULT 0.0,
+    availability      REAL,
+    reported_at       REAL NOT NULL,
+    PRIMARY KEY (sensor_id, ip)
+);
+
+-- Relayed dispatch must not write `notifications`, whose alert_id
+-- implicitly means alerts.id — relayed ids collide with local ones and
+-- would make the audit trail ambiguous and attacker-writable.
+CREATE TABLE IF NOT EXISTS remote_notifications (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sensor_id       TEXT NOT NULL,
+    remote_alert_id INTEGER NOT NULL,
+    channel_type    TEXT NOT NULL,
+    attempted_at    REAL NOT NULL,
+    ok              INTEGER NOT NULL,
+    error           TEXT NOT NULL DEFAULT ''
+);
 """
+
+
+def _remote_sensor_row(r) -> RemoteSensorRow:
+    return RemoteSensorRow(
+        sensor_id=r["sensor_id"], instance_id=r["instance_id"],
+        first_seen=r["first_seen"], last_seen=r["last_seen"],
+        last_seq=r["last_seq"], clock_skew=r["clock_skew"],
+        batches=r["batches"], records=r["records"], bytes=r["bytes"],
+        mon_alive=bool(r["mon_alive"]), mon_blind=bool(r["mon_blind"]),
+        mon_last_activity_ts=r["mon_last_activity_ts"],
+    )
 
 
 def _outage_row(r) -> OutageRow:
@@ -733,6 +879,278 @@ class HoundStore:
                 availability=availability,
             ))
         return report
+
+
+    # ----- relay: quarantined remote data -----
+    #
+    # Everything below writes ONLY remote_* tables. That is the whole
+    # security property of relay mode, and it is enforced in the test suite
+    # by a sqlite authorizer rather than trusted here.
+
+    def get_remote_sensor(self, sensor_id: str) -> RemoteSensorRow | None:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM remote_sensors WHERE sensor_id = ?", (sensor_id,)
+            ).fetchone()
+        return _remote_sensor_row(r) if r is not None else None
+
+    def list_remote_sensors(self) -> list[RemoteSensorRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM remote_sensors ORDER BY sensor_id"
+            ).fetchall()
+        return [_remote_sensor_row(r) for r in rows]
+
+    def forget_remote_sensor(self, sensor_id: str) -> dict[str, int]:
+        """Drop a sensor and everything it ever sent.
+
+        A renamed or retired sensor would otherwise sit there forever as
+        'not reporting', with a frozen set of camera rows beside it.
+        """
+        deleted: dict[str, int] = {}
+        with self._lock, self._conn:
+            for table in ("remote_notifications", "remote_uptime",
+                          "remote_outages", "remote_alerts", "remote_flows",
+                          "remote_devices", "remote_sensors"):
+                cur = self._conn.execute(
+                    f"DELETE FROM {table} WHERE sensor_id = ?", (sensor_id,)
+                )
+                deleted[table] = cur.rowcount
+        return deleted
+
+    def ingest_remote_batch(
+        self, sensor_id: str, instance_id: str, seq: int, records: dict,
+        now: float, skew: float = 0.0, body_bytes: int = 0,
+    ) -> dict[str, int]:
+        """Write one validated batch. Atomic, including the seq bump.
+
+        Bumping the sequence separately from the rows would either lose a
+        batch permanently (bump, fail, agent retries, gets 409, drops it) or
+        double-insert on replay. One transaction avoids both.
+        """
+        counts: dict[str, int] = {}
+        with self._lock, self._conn:
+            for d in records.get("devices", []):
+                self._conn.execute(
+                    """INSERT INTO remote_devices
+                           (sensor_id, ip, role, first_seen, last_seen,
+                            packet_count, byte_count, ingested_at)
+                       VALUES (?,?,?,?,?,?,?,?)
+                       ON CONFLICT(sensor_id, ip) DO UPDATE SET
+                           role = excluded.role,
+                           last_seen = MAX(remote_devices.last_seen,
+                                           excluded.last_seen),
+                           packet_count = excluded.packet_count,
+                           byte_count = excluded.byte_count,
+                           ingested_at = excluded.ingested_at""",
+                    (sensor_id, d["ip"], d["role"], d["first_seen"],
+                     d["last_seen"], d["packet_count"], d["byte_count"], now),
+                )
+            counts["devices"] = len(records.get("devices", []))
+
+            for f in records.get("flows", []):
+                self._conn.execute(
+                    """INSERT INTO remote_flows
+                           (sensor_id, remote_id, src_ip, src_port, dst_ip,
+                            dst_port, proto, first_seen, last_seen, packets,
+                            bytes, bytes_to_camera, bytes_from_camera,
+                            tcp_flags_seen, classification, ingested_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(sensor_id, remote_id) DO NOTHING""",
+                    (sensor_id, f["remote_id"], f["src_ip"], f["src_port"],
+                     f["dst_ip"], f["dst_port"], f["proto"], f["first_seen"],
+                     f["last_seen"], f["packets"], f["bytes"],
+                     f["bytes_to_camera"], f["bytes_from_camera"],
+                     f["tcp_flags_seen"], f["classification"], now),
+                )
+            counts["flows"] = len(records.get("flows", []))
+
+            for a in records.get("alerts", []):
+                self._conn.execute(
+                    """INSERT INTO remote_alerts
+                           (sensor_id, remote_id, ts, device_ip, kind,
+                            severity, summary, detail, dedup_key, ingested_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(sensor_id, remote_id) DO NOTHING""",
+                    (sensor_id, a["remote_id"], a["ts"], a["device_ip"],
+                     a["kind"], a["severity"], a["summary"], a["detail"],
+                     a["dedup_key"], now),
+                )
+            counts["alerts"] = len(records.get("alerts", []))
+
+            for o in records.get("outages", []):
+                # upsert, so a recovery closes the open row instead of
+                # inserting a second one
+                self._conn.execute(
+                    """INSERT INTO remote_outages
+                           (sensor_id, remote_id, camera_ip, down_since,
+                            up_at, last_seen_before, cause, ingested_at)
+                       VALUES (?,?,?,?,?,?,?,?)
+                       ON CONFLICT(sensor_id, remote_id) DO UPDATE SET
+                           up_at = excluded.up_at,
+                           ingested_at = excluded.ingested_at""",
+                    (sensor_id, o["remote_id"], o["camera_ip"],
+                     o["down_since"], o["up_at"], o["last_seen_before"],
+                     o["cause"], now),
+                )
+            counts["outages"] = len(records.get("outages", []))
+
+            for u in records.get("uptime", []):
+                self._conn.execute(
+                    """INSERT INTO remote_uptime
+                           (sensor_id, ip, role, state, last_seen, first_seen,
+                            down_since, current_downtime, outage_count,
+                            downtime_seconds, monitored_seconds, availability,
+                            reported_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(sensor_id, ip) DO UPDATE SET
+                           role = excluded.role,
+                           state = excluded.state,
+                           last_seen = excluded.last_seen,
+                           first_seen = excluded.first_seen,
+                           down_since = excluded.down_since,
+                           current_downtime = excluded.current_downtime,
+                           outage_count = excluded.outage_count,
+                           downtime_seconds = excluded.downtime_seconds,
+                           monitored_seconds = excluded.monitored_seconds,
+                           availability = excluded.availability,
+                           reported_at = excluded.reported_at""",
+                    (sensor_id, u["ip"], u["role"], u["state"], u["last_seen"],
+                     u["first_seen"], u["down_since"], u["current_downtime"],
+                     u["outage_count"], u["downtime_seconds"],
+                     u["monitored_seconds"], u["availability"], now),
+                )
+            counts["uptime"] = len(records.get("uptime", []))
+
+            mon = records.get("monitor") or {}
+            total = sum(counts.values())
+            self._conn.execute(
+                """INSERT INTO remote_sensors
+                       (sensor_id, instance_id, first_seen, last_seen,
+                        last_seq, clock_skew, batches, records, bytes,
+                        mon_alive, mon_blind, mon_last_activity_ts)
+                   VALUES (?,?,?,?,?,?,1,?,?,?,?,?)
+                   ON CONFLICT(sensor_id) DO UPDATE SET
+                       instance_id = excluded.instance_id,
+                       last_seen = excluded.last_seen,
+                       last_seq = excluded.last_seq,
+                       clock_skew = excluded.clock_skew,
+                       batches = remote_sensors.batches + 1,
+                       records = remote_sensors.records + excluded.records,
+                       bytes = remote_sensors.bytes + excluded.bytes,
+                       mon_alive = excluded.mon_alive,
+                       mon_blind = excluded.mon_blind,
+                       mon_last_activity_ts = excluded.mon_last_activity_ts""",
+                (sensor_id, instance_id, now, now, seq, skew, total,
+                 body_bytes, 1 if mon.get("alive") else 0,
+                 1 if mon.get("blind") else 0,
+                 float(mon.get("last_activity_ts", 0.0))),
+            )
+        counts["total"] = total
+        return counts
+
+    def remote_alert_last_at(self, sensor_id: str, dedup_key: str) -> float | None:
+        """Dedup lookup for relayed alerts — against remote_alerts only.
+
+        Evaluating a relayed alert against the local `alerts` table would let
+        a relayed alert suppress a local one.
+        """
+        with self._lock:
+            r = self._conn.execute(
+                """SELECT MAX(ts) AS ts FROM remote_alerts
+                   WHERE sensor_id = ? AND dedup_key = ?""",
+                (sensor_id, dedup_key),
+            ).fetchone()
+        return r["ts"] if r is not None and r["ts"] is not None else None
+
+    def record_remote_notification(
+        self, sensor_id: str, remote_alert_id: int, channel_type: str,
+        ok: bool, error: str = "",
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO remote_notifications
+                       (sensor_id, remote_alert_id, channel_type,
+                        attempted_at, ok, error)
+                   VALUES (?,?,?,?,?,?)""",
+                (sensor_id, remote_alert_id, channel_type, time.time(),
+                 1 if ok else 0, error),
+            )
+
+    def remote_alert_id_for(self, sensor_id: str, remote_id: int) -> int | None:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT id FROM remote_alerts WHERE sensor_id = ? AND remote_id = ?",
+                (sensor_id, remote_id),
+            ).fetchone()
+        return r["id"] if r is not None else None
+
+    def list_remote_alerts(self, *, limit: int = 100) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM remote_alerts ORDER BY ts DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_remote_flows(self, *, limit: int = 100) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM remote_flows ORDER BY last_seen DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def remote_uptime_report(self, now: float, stale_after: float) -> list[dict]:
+        """Relayed camera state, stale-gated.
+
+        A sensor that stopped reporting leaves its last snapshot behind. The
+        honest rendering of that is `unknown` — NOT the `up` it last claimed,
+        which would show a dead segment as healthy.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM remote_uptime ORDER BY sensor_id, ip"
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if (now - d["reported_at"]) > stale_after:
+                d["state"] = "unknown"
+                d["stale"] = True
+            else:
+                d["stale"] = False
+            out.append(d)
+        return out
+
+    def remote_quota_usage(self, sensor_id: str) -> dict[str, int]:
+        with self._lock:
+            rows = {}
+            for table in ("remote_flows", "remote_alerts", "remote_outages"):
+                rows[table] = self._conn.execute(
+                    f"SELECT COUNT(*) AS n FROM {table} WHERE sensor_id = ?",
+                    (sensor_id,),
+                ).fetchone()["n"]
+        return rows
+
+    def prune_remote(self, older_than: float) -> dict[str, int]:
+        deleted: dict[str, int] = {}
+        with self._lock, self._conn:
+            deleted["remote_flows"] = self._conn.execute(
+                "DELETE FROM remote_flows WHERE last_seen < ?", (older_than,)
+            ).rowcount
+            deleted["remote_alerts"] = self._conn.execute(
+                "DELETE FROM remote_alerts WHERE ts < ?", (older_than,)
+            ).rowcount
+            deleted["remote_outages"] = self._conn.execute(
+                """DELETE FROM remote_outages
+                   WHERE up_at IS NOT NULL AND up_at < ?""", (older_than,)
+            ).rowcount
+            deleted["remote_notifications"] = self._conn.execute(
+                "DELETE FROM remote_notifications WHERE attempted_at < ?",
+                (older_than,),
+            ).rowcount
+        return deleted
 
     # ----- flows -----
 

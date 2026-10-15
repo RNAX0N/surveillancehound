@@ -289,7 +289,210 @@ def _check_key_never_printed() -> None:
     print("  config-check: reports the relay, never the key")
 
 
+
+# ---------------------------------------------------------------------------
+# quarantine: the security property, machine-checked
+# ---------------------------------------------------------------------------
+
+# Every table that existed before relay mode. Ingest must never write any of
+# them. v1 of the design listed six and missed four — notifications,
+# snapshots, monitor_heartbeat and baseline_forests — which is exactly how
+# relayed dispatch ended up able to write the audit trail.
+CENTRAL_TABLES = (
+    "devices", "flows", "alerts", "notifications", "baselines",
+    "baseline_forests", "snapshots", "outages", "monitor_sessions",
+    "monitor_heartbeat",
+)
+
+_WRITE_OPS = {
+    __import__("sqlite3").SQLITE_INSERT,
+    __import__("sqlite3").SQLITE_UPDATE,
+    __import__("sqlite3").SQLITE_DELETE,
+}
+
+
+class QuarantineBreach(AssertionError):
+    pass
+
+
+class forbid_central_writes:
+    """Fail if anything writes a non-remote_ table while this is active.
+
+    An assertion on row counts proves one table was not touched. An
+    authorizer proves *no* write reached *any* of them, including through a
+    path nobody thought to assert on — which is how all three real breaches
+    in this design were going to happen.
+
+    sqlite3 swallows an exception raised inside the authorizer and turns it
+    into a DENY, so violations are recorded and re-raised on exit; the DENY
+    also makes the offending statement fail loudly in the meantime.
+    """
+
+    def __init__(self, store):
+        self.store = store
+        self.violations: list[str] = []
+
+    def _auth(self, action, arg1, arg2, dbname, source):
+        import sqlite3
+        if action in _WRITE_OPS and arg1 and not str(arg1).startswith("remote_"):
+            if str(arg1) != "sqlite_sequence":
+                self.violations.append(str(arg1))
+                return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    def __enter__(self):
+        self.violations = []
+        self.store._conn.set_authorizer(self._auth)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.store._conn.set_authorizer(None)
+        if self.violations and exc_type is None:
+            raise QuarantineBreach(
+                f"wrote central table(s) {sorted(set(self.violations))} — "
+                f"relayed data must only ever touch remote_*"
+            )
+        return False
+
+
+def _snapshot_central(store) -> dict:
+    out = {}
+    for t in CENTRAL_TABLES:
+        rows = store._conn.execute(f"SELECT * FROM {t}").fetchall()
+        out[t] = [tuple(r) for r in rows]
+    return out
+
+
+def _check_remote_store(tmp: Path) -> None:
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "remote.sqlite")
+    try:
+        recs = V.validate_records(_good_records(), 100)
+        with forbid_central_writes(store):
+            counts = store.ingest_remote_batch(
+                "frigate", "inst-1", 1, recs, T0 + 100, skew=0.5, body_bytes=900)
+        assert counts["total"] == 5, counts
+
+        sensor = store.get_remote_sensor("frigate")
+        assert sensor.last_seq == 1 and sensor.batches == 1
+        assert sensor.mon_alive is True and sensor.instance_id == "inst-1"
+
+        # a recovery must close the open outage, not insert a second one
+        recs2 = V.validate_records(_good_records(), 100)
+        recs2["outages"][0]["up_at"] = T0 + 300
+        recs2["uptime"][0]["state"] = "up"
+        with forbid_central_writes(store):
+            store.ingest_remote_batch("frigate", "inst-1", 2, recs2, T0 + 300)
+        outages = store._conn.execute(
+            "SELECT remote_id, up_at FROM remote_outages").fetchall()
+        assert len(outages) == 1, f"outage duplicated: {[tuple(o) for o in outages]}"
+        assert outages[0]["up_at"] == T0 + 300, "recovery did not close the outage"
+        assert len(store._conn.execute("SELECT * FROM remote_uptime").fetchall()) == 1
+
+        # stale gating: a sensor that stopped reporting shows unknown, not up
+        assert store.remote_uptime_report(T0 + 310, 180)[0]["state"] == "up"
+        stale = store.remote_uptime_report(T0 + 99999, 180)[0]
+        assert stale["state"] == "unknown" and stale["stale"] is True, (
+            "a dead sensor's cameras must read unknown, never the up they "
+            "last claimed"
+        )
+
+        # dedup lookups are scoped to remote_alerts
+        assert store.remote_alert_last_at(
+            "frigate", "camera_offline:117.111.101.2:1") == T0
+        assert store.remote_alert_last_at("frigate", "nope") is None
+
+        gone = store.forget_remote_sensor("frigate")
+        assert gone["remote_sensors"] == 1 and store.list_remote_sensors() == []
+        print("  store: batch atomic, outage closes in place, stale gates to "
+              "unknown, forget is complete")
+    finally:
+        store.close()
+
+
+def _check_quarantine(tmp: Path) -> None:
+    """A hostile batch must not change one byte of central's own tables."""
+    from surveillancehound.store import AlertRow, HoundStore, OutageRow
+
+    store = HoundStore(path=tmp / "quarantine.sqlite")
+    try:
+        # give central some state of its own to protect
+        store.upsert_device("117.111.101.2", "camera", T0, 10, 1000)
+        local_alert_id = store.insert_alert(AlertRow(
+            id=None, ts=T0, device_ip="117.111.101.2", kind="camera_offline",
+            severity="medium", summary="local", detail="local",
+            dedup_key="camera_offline:117.111.101.2:1"))
+        store.record_notification(local_alert_id, "stdout", True)
+        store.open_outage(OutageRow(
+            None, "117.111.101.2", T0, None, T0, "silence", None))
+        store.start_monitor_session(T0, "igb0")
+        store.set_heartbeat(T0, T0)
+
+        before = _snapshot_central(store)
+
+        # a batch that names central's own camera, collides with its alert
+        # dedup key, and reuses its row ids
+        hostile = _good_records()
+        hostile["devices"][0]["ip"] = "117.111.101.2"
+        hostile["devices"][0]["role"] = "other"
+        hostile["alerts"][0]["device_ip"] = "117.111.101.2"
+        hostile["alerts"][0]["remote_id"] = local_alert_id
+        hostile["alerts"][0]["dedup_key"] = "camera_offline:117.111.101.2:1"
+        hostile["alerts"][0]["severity"] = "critical"
+        hostile["outages"][0]["camera_ip"] = "117.111.101.2"
+        recs = V.validate_records(hostile, 100)
+
+        with forbid_central_writes(store):
+            store.ingest_remote_batch("evil", "inst-x", 1, recs, T0 + 10)
+
+        after = _snapshot_central(store)
+        for table in CENTRAL_TABLES:
+            assert before[table] == after[table], (
+                f"hostile batch modified central's {table!r}"
+            )
+
+        # and it did land, quarantined
+        assert len(store.list_remote_alerts()) == 1
+        assert store.get_remote_sensor("evil") is not None
+
+        # a local alert with the colliding key is still emitted
+        assert store.last_alert_at("camera_offline:117.111.101.2:1") == T0
+        print(f"  quarantine: hostile batch left all {len(CENTRAL_TABLES)} "
+              f"central tables byte-identical")
+    finally:
+        store.close()
+
+
+def _check_authorizer_actually_catches() -> None:
+    """The guard must fail when something really does write central."""
+    import tempfile
+    from surveillancehound.store import AlertRow, HoundStore
+
+    with tempfile.TemporaryDirectory() as td:
+        store = HoundStore(path=Path(td) / "a.sqlite")
+        try:
+            guard = forbid_central_writes(store)
+            raised = False
+            try:
+                with guard:
+                    store.insert_alert(AlertRow(
+                        id=None, ts=T0, device_ip="1.2.3.4", kind="new_device",
+                        severity="info", summary="s", detail="d", dedup_key="k"))
+            except Exception:
+                pass          # the DENY itself also surfaces as an error
+            raised = "alerts" in guard.violations
+            assert raised, (
+                "the quarantine guard did not fire on a write to `alerts` — "
+                "it would not catch a real breach either"
+            )
+        finally:
+            store.close()
+    print("  quarantine guard: verified to fire on a real central write")
+
+
 def main() -> int:
+    import tempfile
     print("=== relay validation ===")
     _check_json_constants()
     _check_scalars()
@@ -298,6 +501,11 @@ def main() -> int:
     _check_dashboard_numeric_escaping()
     _check_relay_config()
     _check_key_never_printed()
+    print("=== quarantine ===")
+    _check_authorizer_actually_catches()
+    with tempfile.TemporaryDirectory() as td:
+        _check_remote_store(Path(td))
+        _check_quarantine(Path(td))
     print("\nRELAY VERIFICATION PASSED")
     return 0
 
