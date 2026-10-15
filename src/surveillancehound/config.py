@@ -359,6 +359,22 @@ def load_from_dict(data: dict) -> HoundCfg:
     return _from_dict(data)
 
 
+# Every section `_from_dict` reads. A key outside this set is accepted but
+# does nothing, which is the worst way for a config to be wrong: the
+# daemon starts, reports healthy, and silently omits whatever that section
+# was supposed to configure. `hound config-check` reports these.
+KNOWN_SECTIONS = frozenset({
+    "capture", "network", "thresholds", "alerts", "uptime", "store",
+    "baseline", "snapshot", "web", "notify", "relay",
+})
+
+
+def unknown_sections(data: dict) -> list[str]:
+    """Top-level keys the loader will ignore. Typos, or settings for a
+    version that is not this one. Either way the operator should hear it."""
+    return sorted(k for k in data if k not in KNOWN_SECTIONS)
+
+
 def _addresses(section: dict, key: str) -> list[str]:
     """Validate a list of bare IP addresses.
 

@@ -1,0 +1,51 @@
+# SurveillanceHound relay agent.
+#
+#   docker compose up -d --build
+#
+# Build context is the REPOSITORY ROOT, not this directory, because the
+# image copies src/. Run compose from here; the `context: ../..` below
+# handles it.
+
+services:
+  hound-agent:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    image: surveillancehound-agent:local
+    container_name: hound-agent
+    restart: unless-stopped
+
+    # Host networking is REQUIRED, not a convenience. A bridged container
+    # has its own netns and would see only its own veth — none of the
+    # camera VLANs. There is no port mapping because the agent listens on
+    # nothing; it only makes outbound connections to the collector.
+    network_mode: host
+
+    # CAP_NET_RAW is what tcpdump needs to open a capture socket.
+    # cap_drop: ALL first, so this is the ONLY capability the container
+    # holds. A monitor that reads every packet on the camera segment
+    # should not also be able to do anything else if it is subverted.
+    cap_drop: ["ALL"]
+    cap_add: ["NET_RAW"]
+
+    security_opt:
+      - no-new-privileges:true
+
+    volumes:
+      # Config, read-only: the agent never rewrites it.
+      - ./hound.toml:/etc/hound/hound.toml:ro
+      # Named volume, not a bind mount: this must survive `down` and
+      # re-create, or every restart re-fires new_device for every camera.
+      - hound-state:/var/lib/hound
+
+    # The daemon is the pid-1 process and handles SIGTERM by draining
+    # in-RAM flows and flushing the relay spool. Give it room to finish
+    # rather than losing the last window of observations.
+    stop_grace_period: 30s
+
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  hound-state:

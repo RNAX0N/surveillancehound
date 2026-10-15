@@ -67,9 +67,11 @@ import json
 import logging
 import sys
 import time
+import tomllib
 from datetime import datetime
 from pathlib import Path
 
+from surveillancehound import config
 from surveillancehound.config import HoundCfg, load
 from surveillancehound.daemon import Hound
 from surveillancehound.store import HoundStore
@@ -590,6 +592,20 @@ def cmd_web(args: argparse.Namespace) -> int:
 def cmd_config_check(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
     print(f"config: {args.config}")
+
+    # Surface sections the loader ignores. A mistyped section name is the
+    # worst class of config error: everything starts, nothing complains,
+    # and the settings simply never take effect.
+    try:
+        with open(args.config, "rb") as fh:
+            unknown = config.unknown_sections(tomllib.load(fh))
+    except (OSError, tomllib.TOMLDecodeError):
+        unknown = []
+    if unknown:
+        print(f"  WARNING: ignored unknown section(s): {', '.join(unknown)}")
+        print("    These are not read by this version. Anything you set in "
+              "them has no effect.")
+
     print(f"  capture: interface={cfg.capture.interface!r} "
           f"pcap_file={cfg.capture.pcap_file!r} bpf={cfg.capture.bpf!r}")
     print(f"  network: cameras={cfg.network.camera_ips} "
@@ -635,6 +651,15 @@ def cmd_config_check(args: argparse.Namespace) -> int:
                   f"retention={r.remote_retention_days:.0f}d")
     else:
         print("  relay: off (single sensor)")
+    if cfg.relay.is_agent:
+        # Listing channels here without this would promise notifications
+        # that agent mode never sends. An unconfigured [[notify]] is also
+        # auto-filled with a stdout channel, so the list is never empty
+        # and always looks like it will do something.
+        print(f"  notify: DISABLED — agent mode dispatches nothing; the "
+              f"collector notifies. {len(cfg.notify)} configured "
+              f"channel(s) will be ignored.")
+        return 0
     print(f"  notify ({len(cfg.notify)} channel(s)):")
     for n in cfg.notify:
         extra = ""

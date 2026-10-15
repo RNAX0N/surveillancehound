@@ -1,0 +1,90 @@
+# SurveillanceHound relay agent — example configuration.
+#
+# Copy to ./hound.toml, edit, then `docker compose up -d --build`.
+# This file is mounted read-only at /etc/hound/hound.toml.
+#
+# Validate before starting, so a typo surfaces here and not as silence:
+#   docker compose run --rm hound-agent config-check /etc/hound/hound.toml
+
+[capture]
+# The interface that can see camera traffic. With network_mode: host this
+# is a HOST interface name, not a container one.
+#
+# "any" works and captures every interface at once, but read the README
+# first: with per-camera VLAN interfaces you will double-count traffic
+# that crosses two of them, which inflates byte counts and can trip
+# bulk-transfer alerts that nothing really caused. Name the interface you
+# mean where you can.
+interface = "eth0"
+snaplen   = 96               # headers only; this is the threat model
+
+[network]
+# Every camera this sensor is responsible for. Addresses only —
+# hostnames are rejected at load, because the daemon never resolves
+# names and a hostname here would silently match nothing.
+camera_ips     = ["192.168.10.11", "192.168.10.12"]
+camera_subnets = ["192.168.10.0/24"]
+nvr_ips        = ["192.168.10.10"]
+
+# Which prefixes count as "this network". Anything outside these and
+# outside RFC-1918 is off-network and gets the strict treatment.
+#
+# If your collector sits on a tunnel or carrier-assigned range that LOOKS
+# public but is genuinely yours, list that prefix here too. The agent
+# refuses to ship a whole flow table to an address outside private space,
+# and this is the right way to tell it the address is in fact internal —
+# preferable to allow_any_destination, which disables the check entirely
+# instead of describing your network.
+lan_subnets = [
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "88.255.5.0/24",          # tunnel to the collector — edit or remove
+]
+
+[thresholds]
+# How long a camera may be silent before camera_offline fires. Cameras
+# that stream continuously can use a short window; ones that only talk on
+# motion need a window longer than their quiet periods.
+silence_seconds = 600.0
+
+[uptime]
+enabled               = true
+capture_stall_seconds = 120.0   # dead-man's-switch: 0 disables
+
+[store]
+# Must be inside the named volume from docker-compose.yml. If this is
+# lost, the daemon re-fires new_device for every camera on next start.
+path = "/var/lib/hound/hound.sqlite"
+
+[relay]
+mode = "agent"
+
+# Unique per sensor. It appears on every relayed row and in the
+# collector's dashboard; two agents must never share one.
+sensor_id = "frigate"
+
+# The collector's ingest endpoint, as an IP literal.
+url = "https://88.255.5.1:18443/ingest/v1"
+
+# Shared secret; the same string goes in the collector's
+# [[relay.sensor]] block for this id. Every batch is signed with it.
+# Generate one with:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+key = "CHANGE-ME"
+
+# Pin the collector's certificate. That cert is self-signed, so there is
+# no CA to validate against and the fingerprint IS the trust decision.
+# Get it by running `hound relay <config>` on the collector. Without
+# this, the agent will not connect.
+tls_fingerprint = ["sha256:CHANGE-ME"]
+
+batch_seconds = 30.0
+
+# If the collector is unreachable, observations spool to disk and replay
+# when it returns. Both caps apply; whichever is hit first starts
+# dropping the oldest.
+spool_max_bytes       = 67108864     # 64 MB
+spool_max_age_seconds = 86400.0      # 24 h
+
+# NOTE: an agent deliberately dispatches NOTHING. Any [[notify]] block
+# here is ignored — the collector is the only thing that notifies, so a
+# single camera outage does not page you once per sensor.
