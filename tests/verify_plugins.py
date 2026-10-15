@@ -968,7 +968,22 @@ def _check_opnsense_form_ids() -> None:
     Core plugins all use fully-qualified ids (dnsmasq's are "dnsmasq.enable"
     etc.). This check asserts the prefix AND that the remainder resolves to a
     real node in the model XML, which also catches renamed/typo'd fields.
+
+    It also asserts the widget matches the model field type. A list-valued
+    model field (CSVListField) serializes as an option dictionary, which only
+    a <select> can consume: rendered as <type>text</type> the saved value
+    shows up as an empty box, and the next Save writes that emptiness back.
+    Core renders them as select_multiple + tokenize + allownew (see Monit's
+    httpdAllow).
     """
+    # model field type -> the form widget types that can actually carry it
+    widgets_for = {
+        "CSVListField": {"select_multiple"},
+        "BooleanField": {"checkbox"},
+        "InterfaceField": {"dropdown", "select_multiple"},
+        "OptionField": {"dropdown", "select_multiple"},
+        "ModelRelationField": {"dropdown", "select_multiple"},
+    }
     ctl_root = OPNSENSE / "src/opnsense/mvc/app/controllers/OPNsense"
     mdl_root = OPNSENSE / "src/opnsense/mvc/app/models/OPNsense"
     checked = 0
@@ -980,15 +995,16 @@ def _check_opnsense_form_ids() -> None:
         items = ET.parse(model_xml).getroot().find("items")
         assert items is not None, f"{model_xml}: no <items> element"
         known = {
-            f"{section.tag}.{field.tag}"
+            f"{section.tag}.{field.tag}": field.get("type", "")
             for section in items
             for field in section
         }
         for form_xml in sorted((plug / "forms").glob("*.xml")):
-            for node in ET.parse(form_xml).getroot().iter("id"):
-                field_id = (node.text or "").strip()
-                if not field_id:
+            for field in ET.parse(form_xml).getroot().iter("field"):
+                node = field.find("id")
+                if node is None or not (node.text or "").strip():
                     continue
+                field_id = node.text.strip()
                 checked += 1
                 head, _, rest = field_id.partition(".")
                 assert head == model_name and rest, (
@@ -1003,9 +1019,22 @@ def _check_opnsense_form_ids() -> None:
                     f"{form_xml}: field id {field_id!r} has no matching node "
                     f"in {model_xml} (known: {sorted(known)})"
                 )
+                allowed = widgets_for.get(known[rest])
+                if not allowed:
+                    continue
+                widget = (field.findtext("type") or "").strip()
+                assert widget in allowed, (
+                    f"{form_xml}: {field_id} is a {known[rest]} in "
+                    f"{model_xml.name} but the form renders it as "
+                    f"<type>{widget or '(none)'}</type>. A {known[rest]} is "
+                    f"serialized as an option dictionary, so only "
+                    f"{sorted(allowed)} can display it — any other widget "
+                    f"shows the saved value as blank and writes that blank "
+                    f"back on the next Save."
+                )
     assert checked, f"no form field ids found under {ctl_root}"
-    print(f"  OPNsense forms: {checked} field id(s) fully qualified and "
-          f"present in the model XML")
+    print(f"  OPNsense forms: {checked} field id(s) fully qualified, present "
+          f"in the model XML, and rendered by a compatible widget")
 
 
 def main() -> int:

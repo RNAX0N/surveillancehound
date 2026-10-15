@@ -61,26 +61,35 @@
     <field>
         <id>hound.network.camera_ips</id>
         <label>Camera IPs</label>
-        <type>text</type>
-        <help>Comma-separated camera IPs.</help>
+        <type>select_multiple</type>
+        <style>tokenize</style>
+        <allownew>true</allownew>
+        <help>One IP per entry. Type a value and press enter to add it.</help>
     </field>
     <field>
         <id>hound.network.camera_subnets</id>
         <label>Camera subnets</label>
-        <type>text</type>
-        <help>Comma-separated CIDRs. Anything in here is treated as a camera
+        <type>select_multiple</type>
+        <style>tokenize</style>
+        <allownew>true</allownew>
+        <help>One CIDR per entry. Anything in here is treated as a camera
               unless also listed as an NVR.</help>
     </field>
     <field>
         <id>hound.network.nvr_ips</id>
         <label>NVR IPs</label>
-        <type>text</type>
+        <type>select_multiple</type>
+        <style>tokenize</style>
+        <allownew>true</allownew>
     </field>
     <field>
         <id>hound.network.manufacturer_allowlist</id>
         <label>Manufacturer allowlist (CIDRs)</label>
-        <type>text</type>
-        <help>The vendor cloud your cameras legitimately talk to.</help>
+        <type>select_multiple</type>
+        <style>tokenize</style>
+        <allownew>true</allownew>
+        <help>One CIDR per entry: the vendor cloud your cameras legitimately
+              talk to.</help>
     </field>
 
     <field>
