@@ -263,3 +263,35 @@ keep      = 5
 # ftp_use_tls  = false
 # level        = "high"
 # timeout      = 15.0
+
+# ── Multi-sensor relay (optional, off by default) ──────────────────────────
+# Lets a second sensor — typically one watching a camera segment that never
+# crosses this box — analyse its own traffic and ship the results here.
+#
+# The agent runs the whole pipeline locally and dispatches NOTHING; the
+# collector is the only thing that notifies. Relayed records are quarantined
+# in remote_* tables and can never overwrite this instance's own state.
+#
+# This is the one part of the daemon that talks to another host on its own
+# initiative. It is LAN-local: the destination must be an IP literal inside
+# private space or [network].lan_subnets unless you explicitly override it.
+#
+# [relay]
+# mode            = "agent"
+# sensor_id       = "frigate"
+# url             = "https://88.255.5.1:18443/ingest/v1"
+# key             = "<shared secret, same on both ends>"
+# tls_fingerprint = ["sha256:<run `hound relay` on the collector>"]
+#
+# ...or, on the box that receives:
+#
+# [relay]
+# mode        = "collector"
+# listen_host = "88.255.5.1"     # a named address; 0.0.0.0 is refused
+# listen_port = 18443
+# cert_file   = "/var/lib/hound/hound-ingest.crt"
+# key_file    = "/var/lib/hound/hound-ingest.key"
+#
+# [[relay.sensor]]
+# id  = "frigate"
+# key = "<same shared secret>"

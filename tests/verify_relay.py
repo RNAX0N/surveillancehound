@@ -203,6 +203,92 @@ def _check_dashboard_numeric_escaping() -> None:
     print("  dashboard: numeric interpolations coerced, not trusted")
 
 
+
+# ---------------------------------------------------------------------------
+# config guards
+# ---------------------------------------------------------------------------
+
+def _check_relay_config() -> None:
+    """The guards that separate a relay from an exfiltration channel."""
+    from surveillancehound.config import load_from_dict
+
+    base = {"capture": {"pcap_file": "x.pcap"},
+            "network": {"lan_subnets": ["88.255.0.0/16"]}}
+
+    def load(relay):
+        return load_from_dict({**base, "relay": relay})
+
+    def rejects(relay, what):
+        try:
+            load(relay)
+        except ValueError:
+            return
+        raise AssertionError(f"accepted {what} — should have been refused")
+
+    assert load({}).relay.mode == "off", "relay must default to off"
+
+    agent = {"mode": "agent", "sensor_id": "frigate", "key": "k",
+             "url": "https://88.255.5.1:18443/ingest/v1",
+             "tls_fingerprint": "sha256:abc"}
+    cfg = load(agent)
+    assert cfg.relay.is_agent and cfg.relay.tls_fingerprint == ["sha256:abc"]
+
+    rejects({**agent, "url": "https://collector.lan:18443/x"},
+            "a hostname in relay.url (the daemon does no DNS)")
+    rejects({**agent, "url": "https://203.0.113.9:18443/x"},
+            "an off-network relay destination")
+    assert load({**agent, "url": "https://203.0.113.9:18443/x",
+                 "allow_any_destination": True}).relay.is_agent
+    rejects({k: v for k, v in agent.items() if k != "tls_fingerprint"},
+            "agent mode with no pinned fingerprint")
+    rejects({k: v for k, v in agent.items() if k != "key"},
+            "agent mode with no shared key")
+
+    coll = {"mode": "collector", "listen_host": "88.255.5.1",
+            "sensor": [{"id": "frigate", "key": "k"}]}
+    assert load(coll).relay.key_for("frigate") == "k"
+    assert load(coll).relay.key_for("nope") is None
+    rejects({**coll, "listen_host": "0.0.0.0"},
+            "a collector listening on every interface")
+    assert load({**coll, "listen_host": "0.0.0.0",
+                 "listen_allow_any": True}).relay.is_collector
+    rejects({"mode": "collector", "listen_host": "88.255.5.1"},
+            "a collector with no sensors")
+    rejects({**coll, "sensor": [{"id": "a", "key": "k"}, {"id": "a", "key": "j"}]},
+            "duplicate sensor ids")
+    rejects({"mode": "sideways"}, "an unknown relay mode")
+    print("  config: 12 relay guards hold; mode defaults to off")
+
+
+def _check_key_never_printed() -> None:
+    """config-check prints every other section; it must not print the key."""
+    import io
+    import contextlib
+    import tempfile
+    from surveillancehound import cli
+
+    secret = "s3cr3t-relay-key-do-not-print"
+    with tempfile.TemporaryDirectory() as td:
+        cfg_path = Path(td) / "h.toml"
+        cfg_path.write_text(
+            '[capture]\npcap_file = "x.pcap"\n'
+            '[network]\nlan_subnets = ["88.255.0.0/16"]\n'
+            '[store]\npath = "s.sqlite"\n'
+            '[relay]\nmode = "agent"\nsensor_id = "frigate"\n'
+            f'key = "{secret}"\n'
+            'url = "https://88.255.5.1:18443/ingest/v1"\n'
+            'tls_fingerprint = ["sha256:abc"]\n'
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["config-check", str(cfg_path)])
+        out = buf.getvalue()
+    assert rc == 0, rc
+    assert secret not in out, "config-check leaked the relay shared key"
+    assert "relay: agent" in out and "frigate" in out
+    print("  config-check: reports the relay, never the key")
+
+
 def main() -> int:
     print("=== relay validation ===")
     _check_json_constants()
@@ -210,6 +296,8 @@ def main() -> int:
     _check_records()
     _check_notification_hardening()
     _check_dashboard_numeric_escaping()
+    _check_relay_config()
+    _check_key_never_printed()
     print("\nRELAY VERIFICATION PASSED")
     return 0
 

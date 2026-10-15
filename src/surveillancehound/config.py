@@ -166,6 +166,64 @@ class UptimeCfg:
 
 
 @dataclass
+class RelaySensorCfg:
+    """One agent the collector will accept batches from."""
+    id: str = ""
+    key: str = ""
+
+
+@dataclass
+class RelayCfg:
+    """Multi-sensor relay. Off by default; this is the only thing in the
+    daemon that talks to another host on its own initiative.
+
+    `agent` runs the full pipeline locally, dispatches nothing, and pushes
+    records to a collector. `collector` additionally accepts those pushes.
+    Relayed data is quarantined in remote_* tables and can never overwrite
+    this instance's own state.
+    """
+    mode: str = "off"                      # off | agent | collector
+
+    # --- agent ---
+    sensor_id: str = ""
+    url: str = ""
+    key: str = ""
+    tls_fingerprint: list[str] = field(default_factory=list)
+    batch_seconds: float = 30.0
+    spool_max_bytes: int = 64 * 1024 * 1024
+    spool_max_age_seconds: float = 86400.0
+    allow_any_destination: bool = False
+
+    # --- collector ---
+    listen_host: str = ""
+    listen_port: int = 18443
+    listen_allow_any: bool = False
+    cert_file: str = ""
+    key_file: str = ""
+    sensor_timeout_seconds: float = 180.0
+    max_body_bytes: int = 8 * 1024 * 1024
+    max_records_per_batch: int = 20000
+    max_batches_per_minute: int = 60
+    clock_skew_seconds: float = 300.0
+    remote_retention_days: float = 30.0
+    sensors: list[RelaySensorCfg] = field(default_factory=list)
+
+    @property
+    def is_agent(self) -> bool:
+        return self.mode == "agent"
+
+    @property
+    def is_collector(self) -> bool:
+        return self.mode == "collector"
+
+    def key_for(self, sensor_id: str) -> str | None:
+        for s in self.sensors:
+            if s.id == sensor_id:
+                return s.key
+        return None
+
+
+@dataclass
 class BaselineCfg:
     """Per-camera behavioral baselining (opt-in).
 
@@ -253,6 +311,7 @@ class HoundCfg:
     snapshot: SnapshotCfg = field(default_factory=SnapshotCfg)
     web: "WebCfg" = field(default_factory=lambda: WebCfg())
     uptime: UptimeCfg = field(default_factory=UptimeCfg)
+    relay: RelayCfg = field(default_factory=RelayCfg)
 
 
 @dataclass
@@ -346,6 +405,142 @@ def _networks(section: dict, key: str) -> list[str]:
             ) from None
         out.append(value)
     return out
+
+
+def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
+    """Parse and validate [relay].
+
+    The validation here is the difference between a relay and an
+    exfiltration channel, so it refuses rather than warns.
+    """
+    rl = data.get("relay", {})
+    sensors_raw = rl.get("sensor", [])
+    if isinstance(sensors_raw, dict):
+        sensors_raw = [sensors_raw]
+
+    fp = rl.get("tls_fingerprint", [])
+    if isinstance(fp, str):
+        fp = [fp] if fp else []
+
+    cfg = RelayCfg(
+        mode=str(rl.get("mode", "off")).strip().lower(),
+        sensor_id=str(rl.get("sensor_id", "")).strip(),
+        url=str(rl.get("url", "")).strip(),
+        key=str(rl.get("key", "")),
+        tls_fingerprint=[str(f).strip() for f in fp if str(f).strip()],
+        batch_seconds=float(rl.get("batch_seconds", 30.0)),
+        spool_max_bytes=int(rl.get("spool_max_bytes", 64 * 1024 * 1024)),
+        spool_max_age_seconds=float(rl.get("spool_max_age_seconds", 86400.0)),
+        allow_any_destination=bool(rl.get("allow_any_destination", False)),
+        listen_host=str(rl.get("listen_host", "")).strip(),
+        listen_port=int(rl.get("listen_port", 18443)),
+        listen_allow_any=bool(rl.get("listen_allow_any", False)),
+        cert_file=str(rl.get("cert_file", "")).strip(),
+        key_file=str(rl.get("key_file", "")).strip(),
+        sensor_timeout_seconds=float(rl.get("sensor_timeout_seconds", 180.0)),
+        max_body_bytes=int(rl.get("max_body_bytes", 8 * 1024 * 1024)),
+        max_records_per_batch=int(rl.get("max_records_per_batch", 20000)),
+        max_batches_per_minute=int(rl.get("max_batches_per_minute", 60)),
+        clock_skew_seconds=float(rl.get("clock_skew_seconds", 300.0)),
+        remote_retention_days=float(rl.get("remote_retention_days", 30.0)),
+        sensors=[
+            RelaySensorCfg(id=str(x.get("id", "")).strip(),
+                           key=str(x.get("key", "")))
+            for x in sensors_raw
+        ],
+    )
+
+    if cfg.mode not in ("off", "agent", "collector"):
+        raise ValueError(
+            f"config: [relay].mode must be off, agent or collector, "
+            f"got {cfg.mode!r}"
+        )
+    if cfg.mode == "off":
+        return cfg
+
+    if cfg.mode == "agent":
+        if not cfg.sensor_id:
+            raise ValueError("config: [relay].sensor_id is required in agent mode")
+        if not cfg.key:
+            raise ValueError("config: [relay].key is required in agent mode")
+        if not cfg.url:
+            raise ValueError("config: [relay].url is required in agent mode")
+        host = _relay_url_host(cfg.url)
+        try:
+            dest = ipaddress.ip_address(host)
+        except ValueError:
+            # The daemon does no DNS anywhere else; a name here would also
+            # make the destination depend on whatever resolves it.
+            raise ValueError(
+                f"config: [relay].url host {host!r} must be an IP address. "
+                f"Hostnames are not supported — the daemon does no DNS "
+                f"resolution."
+            ) from None
+        if not cfg.allow_any_destination and not _is_local_dest(dest, network):
+            raise ValueError(
+                f"config: [relay].url points at {host}, which is outside "
+                f"private address space and [network].lan_subnets. A relay "
+                f"ships this segment's whole flow table, so an off-network "
+                f"destination is refused. Set "
+                f"[relay].allow_any_destination = true if that is genuinely "
+                f"what you want."
+            )
+        if not cfg.tls_fingerprint:
+            raise ValueError(
+                "config: [relay].tls_fingerprint is required in agent mode. "
+                "Without it the agent cannot tell the collector from anything "
+                "else answering on that address. Run `hound relay` on the "
+                "collector to print it."
+            )
+
+    if cfg.mode == "collector":
+        if not cfg.listen_host:
+            raise ValueError(
+                "config: [relay].listen_host is required in collector mode — "
+                "name the address to listen on rather than defaulting to all "
+                "of them."
+            )
+        if cfg.listen_host in ("0.0.0.0", "::") and not cfg.listen_allow_any:
+            raise ValueError(
+                f"config: [relay].listen_host = {cfg.listen_host!r} would "
+                f"accept ingest on every interface, including WAN. Name a "
+                f"single address, or set [relay].listen_allow_any = true if "
+                f"you really mean it."
+            )
+        if not cfg.sensors:
+            raise ValueError(
+                "config: collector mode needs at least one [[relay.sensor]] "
+                "with an id and a key"
+            )
+        seen = set()
+        for sensor in cfg.sensors:
+            if not sensor.id or not sensor.key:
+                raise ValueError(
+                    "config: every [[relay.sensor]] needs both id and key"
+                )
+            if sensor.id in seen:
+                raise ValueError(
+                    f"config: duplicate [[relay.sensor]] id {sensor.id!r}"
+                )
+            seen.add(sensor.id)
+    return cfg
+
+
+def _relay_url_host(url: str) -> str:
+    """Host portion of a relay URL, without importing urllib for one parse."""
+    rest = url.split("://", 1)[-1]
+    rest = rest.split("/", 1)[0]
+    if rest.startswith("["):                      # bracketed IPv6
+        return rest[1:].split("]", 1)[0]
+    return rest.rsplit(":", 1)[0] if ":" in rest else rest
+
+
+def _is_local_dest(dest, network: "NetworkCfg") -> bool:
+    from surveillancehound.discover import _LAN_NETWORKS
+    nets = list(_LAN_NETWORKS) + [
+        ipaddress.ip_network(c, strict=False) for c in network.lan_subnets
+    ]
+    return any(dest in n for n in nets)
 
 
 def _from_dict(data: dict) -> HoundCfg:
@@ -484,4 +679,5 @@ def _from_dict(data: dict) -> HoundCfg:
         capture=capture, network=network, thresholds=thresholds,
         alerts=alerts, store=store, notify=notify, baseline=baseline,
         snapshot=snapshot, web=web, uptime=uptime,
+        relay=_relay_from(data, network),
     )

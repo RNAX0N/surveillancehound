@@ -510,6 +510,20 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     if cfg.uptime.capture_stall_seconds <= 0:
         print("    NOTE: capture stall detection is OFF — a dead capture "
               "will not be reported.")
+    r = cfg.relay
+    if r.mode != "off":
+        masked = f"set ({len(r.key)} chars)" if r.key else "MISSING"
+        if r.mode == "agent":
+            print(f"  relay: agent sensor_id={r.sensor_id!r} -> {r.url} "
+                  f"key={masked} pinned={len(r.tls_fingerprint)} "
+                  f"batch={r.batch_seconds:.0f}s")
+        else:
+            print(f"  relay: collector on {r.listen_host}:{r.listen_port} "
+                  f"sensors={[x.id for x in r.sensors]} "
+                  f"timeout={r.sensor_timeout_seconds:.0f}s "
+                  f"retention={r.remote_retention_days:.0f}d")
+    else:
+        print("  relay: off (single sensor)")
     print(f"  notify ({len(cfg.notify)} channel(s)):")
     for n in cfg.notify:
         extra = ""
