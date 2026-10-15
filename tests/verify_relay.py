@@ -934,6 +934,69 @@ def _check_resource_bounds(tmp: Path) -> None:
     print("  disk guard: trips when low, fails open when unreadable")
 
 
+def _check_capture_exclusion() -> None:
+    """The agent must not capture its own uploads.
+
+    Left in, they aggregate into a flow to an off-network host, classify
+    as telemetry, alert, and get relayed — which generates more of the
+    same traffic. Filtering in tcpdump keeps it off the parser entirely.
+    """
+    import shutil
+    import subprocess
+    from surveillancehound.capture import compose_bpf
+    from surveillancehound.relay import exclusion_filter, split_endpoint
+
+    assert split_endpoint("https://88.255.5.1:18443/ingest/v1") == (
+        "88.255.5.1", 18443, "/ingest/v1")
+    assert split_endpoint("https://[fd00::1]:18443/ingest/v1") == (
+        "fd00::1", 18443, "/ingest/v1"), "IPv6 literals must keep their port"
+
+    ex = exclusion_filter("https://88.255.5.1:18443/ingest/v1")
+    assert "88.255.5.1" in ex and "18443" in ex, ex
+    assert exclusion_filter("") == "", "no url means nothing to exclude"
+
+    # Precedence: a user filter of `a or b` must be parenthesised, or the
+    # `or` binds loosely and swallows the exclusion completely.
+    combined = compose_bpf("host 10.0.0.1 or host 10.0.0.2", ex)
+    assert combined.startswith("(host 10.0.0.1 or host 10.0.0.2)"), (
+        f"user filter must be parenthesised against `or` precedence: {combined}"
+    )
+    assert compose_bpf("port 554", "") == "port 554", "no exclusion, no change"
+    assert compose_bpf("", ex) == ex
+
+    # Compile them for real where tcpdump exists. A filter that does not
+    # compile takes the capture down on startup, which is the one failure
+    # the whole daemon cannot absorb.
+    # socketserver dispatches connection errors to the SERVER's
+    # handle_error. An override on the handler class silently never fires,
+    # which let aborted TLS handshakes print tracebacks to stderr — a peer
+    # that can reach the port could fill the log by dropping connections.
+    import socketserver
+    from surveillancehound.ingest import _Server
+    assert _Server.handle_error is not socketserver.BaseServer.handle_error, (
+        "_Server must override handle_error; putting it on the request "
+        "handler does not work and is how the traceback spam came back"
+    )
+
+    if shutil.which("tcpdump"):
+        checked = 0
+        for expr in (ex, combined, compose_bpf("port 554", ex)):
+            r = subprocess.run(
+                ["tcpdump", "-d", "-y", "EN10MB", expr],
+                capture_output=True, text=True,
+            )
+            assert r.returncode == 0, (
+                f"tcpdump refused the generated filter {expr!r}: "
+                f"{r.stderr.strip()}"
+            )
+            checked += 1
+        print(f"  capture exclusion: {checked} generated filter(s) compile "
+              f"under real tcpdump; `or` precedence held")
+    else:
+        print("  capture exclusion: shape correct (tcpdump absent, not "
+              "compile-checked)")
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -943,6 +1006,7 @@ def main() -> int:
     _check_notification_hardening()
     _check_dashboard_numeric_escaping()
     _check_relay_config()
+    _check_capture_exclusion()
     _check_key_never_printed()
     print("=== quarantine ===")
     _check_authorizer_actually_catches()

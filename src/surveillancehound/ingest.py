@@ -268,6 +268,19 @@ class IngestServer:
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        """Swallow per-connection errors.
+
+        socketserver calls this on the SERVER, not on the handler — an
+        override on the handler class never fires, which is how aborted
+        handshakes were printing tracebacks to stderr. A peer that can
+        reach the port must not be able to fill the log by dropping
+        connections mid-handshake.
+        """
+        log.debug("ingest: connection from %s failed", client_address,
+                  exc_info=True)
+
     # Bounded backlog; the handler timeout below bounds how long any one
     # connection can occupy a thread.
     request_queue_size = 16
@@ -293,9 +306,6 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
 
         def log_message(self, fmt, *args):
             log.debug("ingest: " + fmt, *args)
-
-        def handle_error(self, *a):
-            pass          # a hostile peer must not be able to spam stderr
 
         def _reply(self, status, payload):
             raw = json.dumps(payload).encode()

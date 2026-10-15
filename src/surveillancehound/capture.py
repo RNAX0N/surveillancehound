@@ -43,8 +43,23 @@ class CaptureError(RuntimeError):
     """A live capture subprocess could not start, or died."""
 
 
+def compose_bpf(user_bpf: str, exclude: str) -> str:
+    """Combine the operator's filter with a mandatory exclusion.
+
+    Both are ANDed and each is parenthesised: `a or b` as the user filter
+    would otherwise bind loosely and swallow the exclusion entirely.
+    """
+    user_bpf, exclude = (user_bpf or "").strip(), (exclude or "").strip()
+    if not exclude:
+        return user_bpf
+    if not user_bpf:
+        return exclude
+    return f"({user_bpf}) and ({exclude})"
+
+
 def stream_packets(
     cfg: CaptureCfg, *, keep_raw: bool = False, snaplen_override: int | None = None,
+    exclude_bpf: str = "",
 ) -> tuple[Iterator[Packet], CaptureStats, "CaptureHandle"]:
     """Open a packet source (live or file) and yield Packets.
 
@@ -80,8 +95,9 @@ def stream_packets(
         "-n",                                  # no DNS
         "-w", "-",                             # pcap to stdout
     ]
-    if cfg.bpf:
-        argv.append(cfg.bpf)
+    bpf = compose_bpf(cfg.bpf, exclude_bpf)
+    if bpf:
+        argv.append(bpf)
     log.info("starting live capture: %s", " ".join(argv))
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,

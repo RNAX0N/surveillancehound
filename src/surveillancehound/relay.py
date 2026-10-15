@@ -280,6 +280,51 @@ def fingerprint_of(der: bytes) -> str:
     return "sha256:" + hashlib.sha256(der).hexdigest()
 
 
+def split_endpoint(url: str) -> tuple[str, int, str]:
+    """Split a collector URL into (host, port, path).
+
+    Shared by the poster and by the capture filter that excludes this
+    agent's own relay traffic, so the two can never disagree about which
+    endpoint is the collector.
+    """
+    _scheme, _, rest = url.partition("://")
+    hostport, _, path = rest.partition("/")
+    path = "/" + path
+    if hostport.startswith("["):                    # [v6]:port
+        host, _, port_s = hostport[1:].partition("]")
+        port = int(port_s.lstrip(":") or 443)
+    elif ":" in hostport:
+        host, _, port_s = hostport.rpartition(":")
+        port = int(port_s)
+    else:
+        host, port = hostport, 443
+    return host, port, path
+
+
+def exclusion_filter(url: str) -> str:
+    """A BPF expression excluding this agent's own traffic to the collector.
+
+    Without it the agent captures its own uploads, aggregates them into
+    flows, and classifies them — an outbound session to an off-network
+    host, which is the shape `telemetry_offnet` exists to flag. It would
+    then report that as an alert, relay the alert, and generate more
+    traffic doing so. Filtering in tcpdump rather than after parsing also
+    keeps the volume off the parser entirely.
+
+    Returns "" when there is nothing to exclude, so callers can treat the
+    empty string as "no change".
+    """
+    if not url:
+        return ""
+    try:
+        host, port, _ = split_endpoint(url)
+    except ValueError:
+        return ""
+    if not host:
+        return ""
+    return f"not (host {host} and tcp port {port})"
+
+
 def post_batch(
     url: str, body: bytes, key: str, sensor_id: str, seq: int,
     fingerprints: list[str], timeout: float = 10.0,
@@ -291,17 +336,7 @@ def post_batch(
     the connection — and `ssl` has no verify callback, so the check has to
     happen between connect and request.
     """
-    scheme, _, rest = url.partition("://")
-    hostport, _, path = rest.partition("/")
-    path = "/" + path
-    if hostport.startswith("["):
-        host, _, port_s = hostport[1:].partition("]")
-        port = int(port_s.lstrip(":") or 443)
-    elif ":" in hostport:
-        host, _, port_s = hostport.rpartition(":")
-        port = int(port_s)
-    else:
-        host, port = hostport, 443
+    host, port, path = split_endpoint(url)
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     # The pin IS the trust decision; a self-signed collector cert has no

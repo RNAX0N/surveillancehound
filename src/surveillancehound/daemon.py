@@ -193,9 +193,18 @@ class Hound:
             self.cfg.snapshot.snaplen if self.snapshotter is not None else None
         )
         try:
+            # An agent must not capture its own uploads: they would be
+            # aggregated, classified as off-network telemetry, alerted on,
+            # and relayed — producing more of exactly the traffic that
+            # triggered them.
+            exclude_bpf = ""
+            if self.cfg.relay.is_agent:
+                from surveillancehound.relay import exclusion_filter
+                exclude_bpf = exclusion_filter(self.cfg.relay.url)
             gen, _stats, handle = stream_packets(
                 self.cfg.capture,
                 keep_raw=keep_raw, snaplen_override=snaplen_override,
+                exclude_bpf=exclude_bpf,
             )
         except CaptureError as e:
             log.error("capture failed to start: %s", e)
