@@ -131,9 +131,16 @@ jobs:
         run: |
           mkdir -p site/opnsense
           cp -a dist/repo/* site/opnsense/
-          # the pubkey is identical for every ABI; publish one at the top
-          # level too so the fetch URL in the docs stays ABI-independent
-          cp dist/repo/*/hound-repo.pub site/opnsense/hound-repo.pub
+          # The pubkey is identical for every ABI; publish one copy at the
+          # top level so the documented fetch URL stays ABI-independent.
+          # `cp a/*/f dest` with more than one match treats dest as a
+          # directory and fails, so pick exactly one.
+          set -eu
+          for pub in dist/repo/*/hound-repo.pub; do
+            cp "$pub" site/opnsense/hound-repo.pub
+            break
+          done
+          test -f site/opnsense/hound-repo.pub
           # Ship the client-side repo config too, so installing is two
           # fetches and a pkg install rather than "copy this from the repo
           # and edit the URL by hand".
