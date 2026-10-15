@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime
 
 from surveillancehound.baseline import Anomaly
 from surveillancehound.classify import FlowClassification
@@ -29,7 +30,20 @@ KIND_CAMERA_TO_CAMERA = "camera_to_camera"
 KIND_NEW_DEVICE = "new_device"
 KIND_NEW_PEER = "new_peer"
 KIND_CAMERA_OFFLINE = "camera_offline"
+KIND_CAMERA_RECOVERED = "camera_recovered"
+KIND_CAMERA_NEVER_SEEN = "camera_never_seen"
+KIND_CAPTURE_STALLED = "capture_stalled"
 KIND_BEHAVIORAL_ANOMALY = "behavioral_anomaly"
+
+# Appended to every liveness alert. Detection is passive — a camera that is
+# powered but no longer visible to this sensor is indistinguishable from one
+# that is powered down, and the operator must never be told otherwise.
+_PASSIVE_CAVEAT = (
+    "Liveness is inferred from traffic observed on the monitored interface, "
+    "not from active probing — a camera that is powered but no longer "
+    "visible to this sensor (moved VLAN, mirror/SPAN port reconfigured) "
+    "looks identical to one that is powered down."
+)
 
 
 _REPORTABLE_FLOW = {
@@ -38,6 +52,25 @@ _REPORTABLE_FLOW = {
     "telemetry_offnet": (KIND_TELEMETRY_OFFNET, "medium"),
     "camera_to_camera": (KIND_CAMERA_TO_CAMERA, "low"),
 }
+
+
+def _stamp(ts: float) -> str:
+    """Human-readable timestamp; 0.0 means the device was never observed."""
+    if ts <= 0.0:
+        return "never"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _dur(seconds: float) -> str:
+    """Compact duration — '3d 4h', '12m 30s'. Alert text, not log text."""
+    s = int(max(0.0, seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    if s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    return f"{s // 86400}d {(s % 86400) // 3600}h"
 
 
 @dataclass
@@ -61,9 +94,112 @@ class Alert:
 class AlertEngine:
     """Decides which classifications / events become Alerts. Handles dedup."""
 
-    def __init__(self, *, cfg: AlertsCfg, store: HoundStore) -> None:
+    def __init__(
+        self, *, cfg: AlertsCfg, store: HoundStore,
+        recovery_alerts: bool = True,
+    ) -> None:
         self.cfg = cfg
         self.store = store
+        self.recovery_alerts = recovery_alerts
+
+    # ----- liveness transitions -> alert -----
+
+    def from_transition(self, tr, now: float) -> Alert | None:
+        """Turn an `uptime.Transition` into an Alert, or None.
+
+        Dedup keys for down/up include the outage id, so each distinct
+        outage notifies exactly once while repeated ticks inside one outage
+        stay quiet. With a plain per-camera key, a camera that flapped
+        down -> up -> down inside `dedup_window_seconds` had its second
+        outage silently swallowed.
+        """
+        if tr.kind == "stall_cleared":
+            return None  # logged by the daemon; not worth waking anyone
+        if tr.kind == "up" and not self.recovery_alerts:
+            return None
+
+        what = "NVR" if tr.role == "nvr" else "camera"
+        if tr.kind == "down":
+            return self._mk(
+                f"camera_offline:{tr.camera_ip}:{tr.outage_id}", now,
+                device_ip=tr.camera_ip, kind=KIND_CAMERA_OFFLINE,
+                severity="medium",
+                summary=(
+                    f"{what} {tr.camera_ip} has been silent for "
+                    f"{tr.duration:.0f}s — possibly offline."
+                ),
+                detail=(
+                    f"No traffic involving {tr.camera_ip} has been observed "
+                    f"for {tr.duration:.0f} seconds (last seen "
+                    f"{_stamp(tr.last_seen_before)}). Check that the {what} "
+                    f"is powered, cabled, and still recording. "
+                    f"{_PASSIVE_CAVEAT}"
+                ),
+            )
+        if tr.kind == "up":
+            return self._mk(
+                f"camera_recovered:{tr.camera_ip}:{tr.outage_id}", now,
+                device_ip=tr.camera_ip, kind=KIND_CAMERA_RECOVERED,
+                severity="info",
+                summary=(
+                    f"{what} {tr.camera_ip} is back after "
+                    f"{_dur(tr.duration)} of silence."
+                ),
+                detail=(
+                    f"Traffic from {tr.camera_ip} resumed after "
+                    f"{_dur(tr.duration)} ({tr.duration:.0f}s) with no "
+                    f"observed activity. The outage is recorded in the "
+                    f"uptime history. {_PASSIVE_CAVEAT}"
+                ),
+            )
+        if tr.kind == "never_seen":
+            return self._mk(
+                f"camera_never_seen:{tr.camera_ip}", now,
+                device_ip=tr.camera_ip, kind=KIND_CAMERA_NEVER_SEEN,
+                severity="medium",
+                summary=(
+                    f"configured {what} {tr.camera_ip} has never been "
+                    f"observed on the segment."
+                ),
+                detail=(
+                    f"{tr.camera_ip} is listed in [network] but no traffic "
+                    f"from it has been seen in the {tr.duration:.0f}s since "
+                    f"the monitor started. Either it is powered down / "
+                    f"disconnected, it sits on a segment this sensor cannot "
+                    f"see, or the configured address is wrong. "
+                    f"{_PASSIVE_CAVEAT}"
+                ),
+            )
+        if tr.kind == "stalled":
+            return self._mk(
+                "capture_stalled", now,
+                device_ip="", kind=KIND_CAPTURE_STALLED, severity="high",
+                summary=(
+                    f"no packets captured for {tr.duration:.0f}s — the "
+                    f"monitor is blind."
+                ),
+                detail=(
+                    f"Zero packets of any kind have been captured for "
+                    f"{tr.duration:.0f} seconds. Likely causes: the capture "
+                    f"process died, the monitored interface went down, or "
+                    f"the mirror/SPAN port was reconfigured. Per-camera "
+                    f"offline alerts are suppressed while stalled, because "
+                    f"a blind sensor cannot tell which cameras are up — "
+                    f"fix the capture first, then re-check the cameras."
+                ),
+            )
+        return None
+
+    def _mk(
+        self, dedup_key: str, now: float, *, device_ip: str, kind: str,
+        severity: str, summary: str, detail: str,
+    ) -> Alert | None:
+        if self._suppressed(dedup_key, now):
+            return None
+        return Alert(
+            ts=now, device_ip=device_ip, kind=kind, severity=severity,
+            summary=summary, detail=detail, dedup_key=dedup_key,
+        )
 
     # ----- flow -> alert -----
 

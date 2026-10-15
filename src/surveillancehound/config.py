@@ -29,6 +29,13 @@ Schema (see hound.toml.example):
   [alerts]
   dedup_window_seconds = 1800   # don't re-notify on the same alert within this window
 
+  [uptime]
+  enabled               = true     # per-camera liveness tracking + outage history
+  startup_grace_seconds = 600.0    # 0 -> inherit thresholds.silence_seconds
+  capture_stall_seconds = 120.0    # no packets at all for this long -> CAPTURE_STALLED; 0 disables
+  recovery_alerts       = true     # emit camera_recovered when a camera comes back
+  report_window_seconds = 86400.0  # default availability window for `hound uptime` + /api/uptime
+
   [store]
   path = "/var/lib/surveillancehound/hound.sqlite"   # or relative
 
@@ -110,6 +117,39 @@ class ThresholdCfg:
 @dataclass
 class AlertsCfg:
     dedup_window_seconds: float = 1800.0
+
+
+@dataclass
+class UptimeCfg:
+    """Per-camera liveness tracking, outage history, and availability.
+
+    Detection is PASSIVE: a camera is considered up because packets from it
+    were observed on the monitored interface. It is not probed. A camera that
+    is powered and recording but no longer visible to this sensor (moved
+    VLAN, mirror port reconfigured) is indistinguishable from one that is
+    powered down. Active probing is deliberately out of scope — see
+    DevNotes.md.
+
+    `capture_stall_seconds` is the dead-man's-switch: when NO packets at all
+    arrive for that long, the sensor is blind, so a single `capture_stalled`
+    alert fires and per-camera offline alerts are suppressed. Without it, a
+    dead tcpdump looks exactly like every camera failing at once.
+    """
+    enabled: bool = True
+    startup_grace_seconds: float = 600.0   # 0 -> inherit silence_seconds
+    capture_stall_seconds: float = 120.0   # 0 -> disable the dead-man's-switch
+    recovery_alerts: bool = True
+    report_window_seconds: float = 86400.0
+
+    def grace_for(self, thresholds: "ThresholdCfg") -> float:
+        """How long after startup before an unobserved camera alerts.
+
+        0 means 'inherit the silence threshold' so an operator only has to
+        tune one number in the common case.
+        """
+        if self.startup_grace_seconds > 0:
+            return self.startup_grace_seconds
+        return thresholds.silence_seconds
 
 
 @dataclass
@@ -199,6 +239,7 @@ class HoundCfg:
     baseline: BaselineCfg = field(default_factory=BaselineCfg)
     snapshot: SnapshotCfg = field(default_factory=SnapshotCfg)
     web: "WebCfg" = field(default_factory=lambda: WebCfg())
+    uptime: UptimeCfg = field(default_factory=UptimeCfg)
 
 
 @dataclass
@@ -246,6 +287,7 @@ def _from_dict(data: dict) -> HoundCfg:
     bl = data.get("baseline", {})
     sn = data.get("snapshot", {})
     wb = data.get("web", {})
+    up = data.get("uptime", {})
     notify_raw = data.get("notify", [])
     if isinstance(notify_raw, dict):
         notify_raw = [notify_raw]
@@ -359,8 +401,16 @@ def _from_dict(data: dict) -> HoundCfg:
         # a misconfigured deployment still surfaces alerts to the operator
         notify.append(NotifyChannelCfg(type="stdout", level="low"))
 
+    uptime = UptimeCfg(
+        enabled=bool(up.get("enabled", True)),
+        startup_grace_seconds=float(up.get("startup_grace_seconds", 600.0)),
+        capture_stall_seconds=float(up.get("capture_stall_seconds", 120.0)),
+        recovery_alerts=bool(up.get("recovery_alerts", True)),
+        report_window_seconds=float(up.get("report_window_seconds", 86400.0)),
+    )
+
     return HoundCfg(
         capture=capture, network=network, thresholds=thresholds,
         alerts=alerts, store=store, notify=notify, baseline=baseline,
-        snapshot=snapshot, web=web,
+        snapshot=snapshot, web=web, uptime=uptime,
     )

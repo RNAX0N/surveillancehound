@@ -17,6 +17,12 @@ Schema:
                   notified_channels (csv), notified_at, dedup_key.
   notifications — one row per dispatch attempt (audit log).
                   alert_id, channel_type, attempted_at, ok, error.
+  outages       — one row per camera downtime window. An OPEN row (up_at
+                  IS NULL) *is* the camera's current down-state, so a daemon
+                  restart resumes mid-outage instead of forgetting it.
+  monitor_sessions — one row per daemon run. Availability is only honest when
+                  computed over time the monitor was actually watching; this
+                  table is what makes that subtraction possible.
 
 Writes happen at flow-flush time (TTL eviction) and alert time. Reads are
 served by the CLI. WAL mode + a 30s busy timeout make this safe under the
@@ -82,6 +88,69 @@ class SnapshotRow:
     byte_count: int
     packet_count: int
     created_at: float
+
+
+@dataclass
+class OutageRow:
+    """One camera downtime window.
+
+    `up_at is None` means the outage is still open — that open row IS the
+    camera's down-state, which is why there is no separate state table and
+    why a restart resumes an outage rather than re-firing it.
+
+    `last_seen_before` is the camera's last activity before it went quiet
+    (0.0 when the camera has never been observed at all). `cause` is
+    'silence' or 'never_seen'.
+    """
+    id: int | None
+    camera_ip: str
+    down_since: float
+    up_at: float | None
+    last_seen_before: float
+    cause: str
+    alert_id: int | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.up_at is None
+
+    def duration(self, now: float) -> float:
+        return max(0.0, (self.up_at if self.up_at is not None else now) - self.down_since)
+
+
+@dataclass
+class MonitorSessionRow:
+    """One daemon run. `ended_at is None` while it is still running.
+
+    `clean_exit` is False when the capture died (daemon.run() returned
+    False), which is how an operator tells a deliberate stop from a crash.
+    """
+    id: int | None
+    started_at: float
+    ended_at: float | None
+    source: str          # interface name or pcap path
+    clean_exit: bool = False
+
+
+@dataclass
+class CameraUptimeRow:
+    """Derived per-camera availability over a reporting window.
+
+    `availability` is None when the monitor was not watching at all during
+    the window. That renders as 'n/a' — reporting 0% or 100% from zero
+    observation would be a fabrication.
+    """
+    ip: str
+    role: str
+    state: str                   # up | down | never_seen
+    last_seen: float             # 0.0 == never observed
+    first_seen: float
+    down_since: float | None     # start of the current open outage, if any
+    current_downtime: float
+    outage_count: int
+    downtime_seconds: float
+    monitored_seconds: float
+    availability: float | None   # 0.0..1.0, or None
 
 
 @dataclass
@@ -205,7 +274,70 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_alert ON snapshots(alert_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_camera ON snapshots(camera_ip);
+
+CREATE TABLE IF NOT EXISTS outages (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_ip         TEXT NOT NULL,
+    down_since        REAL NOT NULL,
+    up_at             REAL,              -- NULL while the outage is open
+    last_seen_before  REAL NOT NULL,     -- 0.0 when never observed
+    cause             TEXT NOT NULL,     -- 'silence' | 'never_seen'
+    alert_id          INTEGER            -- the camera_offline alert, if any
+);
+CREATE INDEX IF NOT EXISTS idx_outages_camera ON outages(camera_ip, down_since);
+CREATE INDEX IF NOT EXISTS idx_outages_open ON outages(up_at);
+
+CREATE TABLE IF NOT EXISTS monitor_sessions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at  REAL NOT NULL,
+    ended_at    REAL,                    -- NULL while running
+    source      TEXT NOT NULL,           -- interface name or pcap path
+    clean_exit  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_monitor_sessions_started ON monitor_sessions(started_at);
 """
+
+
+def _outage_row(r) -> OutageRow:
+    return OutageRow(
+        id=r["id"], camera_ip=r["camera_ip"], down_since=r["down_since"],
+        up_at=r["up_at"], last_seen_before=r["last_seen_before"],
+        cause=r["cause"], alert_id=r["alert_id"],
+    )
+
+
+def _merge_spans(spans) -> list[tuple[float, float]]:
+    """Sort and union a sequence of (start, end) intervals.
+
+    Zero-length and inverted intervals are dropped — they contribute no
+    time and would otherwise corrupt the merge.
+    """
+    ordered = sorted((a, b) for a, b in spans if b > a)
+    merged: list[tuple[float, float]] = []
+    for start, end in ordered:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _overlap_seconds(
+    a: list[tuple[float, float]], b: list[tuple[float, float]],
+) -> float:
+    """Total length of the intersection of two merged, sorted span lists."""
+    total = 0.0
+    i = j = 0
+    while i < len(a) and j < len(b):
+        lo = max(a[i][0], b[j][0])
+        hi = min(a[i][1], b[j][1])
+        if hi > lo:
+            total += hi - lo
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
 
 
 class HoundStore:
@@ -283,6 +415,218 @@ class HoundStore:
     def device_ips(self) -> set[str]:
         with self._lock:
             return {r["ip"] for r in self._conn.execute("SELECT ip FROM devices")}
+
+    def touch_devices_last_seen(self, mapping: dict[str, float]) -> None:
+        """Bulk-refresh `last_seen` ONLY — no counters, no role change.
+
+        The flow path (`upsert_device`) owns packet/byte counters and role
+        promotion. This exists because `last_seen` used to advance only when
+        a flow was evicted, which meant a camera holding one continuous RTSP
+        stream never refreshed it and tripped `camera_offline` while healthy.
+
+        The `last_seen < ?` guard keeps a late or out-of-order tick from
+        moving a device's clock backwards.
+        """
+        if not mapping:
+            return
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "UPDATE devices SET last_seen = ? WHERE ip = ? AND last_seen < ?",
+                [(ts, ip, ts) for ip, ts in mapping.items()],
+            )
+
+    def seed_device(self, ip: str, role: str, now: float) -> bool:
+        """Register a configured camera that has never been observed.
+
+        `last_seen = 0.0` is the 'never seen' marker — it is what makes a
+        camera that was powered down before the daemon ever started visible
+        to the uptime tracker. Returns True if a row was inserted; an
+        existing row is never overwritten.
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO devices
+                       (ip, role, first_seen, last_seen, packet_count, byte_count)
+                   VALUES (?, ?, ?, 0.0, 0, 0)""",
+                (ip, role, now),
+            )
+            return cur.rowcount == 1
+
+    # ----- outages -----
+
+    def open_outage(self, o: OutageRow) -> int:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """INSERT INTO outages (camera_ip, down_since, up_at,
+                                        last_seen_before, cause, alert_id)
+                   VALUES (?, ?, NULL, ?, ?, ?)""",
+                (o.camera_ip, o.down_since, o.last_seen_before, o.cause, o.alert_id),
+            )
+            return cur.lastrowid
+
+    def close_outage(self, outage_id: int, up_at: float) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE outages SET up_at = ? WHERE id = ? AND up_at IS NULL",
+                (up_at, outage_id),
+            )
+
+    def set_outage_alert(self, outage_id: int, alert_id: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE outages SET alert_id = ? WHERE id = ?",
+                (alert_id, outage_id),
+            )
+
+    def open_outage_for(self, camera_ip: str) -> OutageRow | None:
+        with self._lock:
+            r = self._conn.execute(
+                """SELECT * FROM outages
+                   WHERE camera_ip = ? AND up_at IS NULL
+                   ORDER BY down_since DESC LIMIT 1""",
+                (camera_ip,),
+            ).fetchone()
+        return _outage_row(r) if r is not None else None
+
+    def open_outages(self) -> list[OutageRow]:
+        """Every outage still open — used to resume state after a restart."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM outages WHERE up_at IS NULL ORDER BY down_since"
+            ).fetchall()
+        return [_outage_row(r) for r in rows]
+
+    def list_outages(
+        self, camera_ip: str | None = None, *,
+        since: float | None = None, limit: int = 100,
+    ) -> list[OutageRow]:
+        q = "SELECT * FROM outages WHERE 1=1"
+        params: list = []
+        if camera_ip:
+            q += " AND camera_ip = ?"
+            params.append(camera_ip)
+        if since is not None:
+            q += " AND (up_at IS NULL OR up_at >= ?)"
+            params.append(since)
+        q += " ORDER BY down_since DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(q, params).fetchall()
+        return [_outage_row(r) for r in rows]
+
+    # ----- monitor sessions -----
+
+    def start_monitor_session(self, now: float, source: str) -> int:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """INSERT INTO monitor_sessions (started_at, ended_at, source, clean_exit)
+                   VALUES (?, NULL, ?, 0)""",
+                (now, source),
+            )
+            return cur.lastrowid
+
+    def end_monitor_session(self, session_id: int, now: float, clean: bool) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE monitor_sessions SET ended_at = ?, clean_exit = ? WHERE id = ?",
+                (now, 1 if clean else 0, session_id),
+            )
+
+    def current_monitor_session(self) -> MonitorSessionRow | None:
+        with self._lock:
+            r = self._conn.execute(
+                """SELECT * FROM monitor_sessions
+                   ORDER BY started_at DESC LIMIT 1"""
+            ).fetchone()
+        if r is None:
+            return None
+        return MonitorSessionRow(
+            id=r["id"], started_at=r["started_at"], ended_at=r["ended_at"],
+            source=r["source"], clean_exit=bool(r["clean_exit"]),
+        )
+
+    def monitored_spans(self, since: float, until: float) -> list[tuple[float, float]]:
+        """Disjoint, merged intervals during which the monitor was running.
+
+        Each session is clipped to [since, until]; an open session (ended_at
+        IS NULL) is treated as running right up to `until`. Availability is
+        computed against these spans so time the daemon was stopped is never
+        charged to a camera as downtime.
+        """
+        if until <= since:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT started_at, ended_at FROM monitor_sessions
+                   WHERE started_at < ? AND (ended_at IS NULL OR ended_at > ?)
+                   ORDER BY started_at""",
+                (until, since),
+            ).fetchall()
+        return _merge_spans(
+            (max(since, r["started_at"]),
+             min(until, r["ended_at"] if r["ended_at"] is not None else until))
+            for r in rows
+        )
+
+    def uptime_report(
+        self, window_seconds: float, now: float,
+    ) -> list[CameraUptimeRow]:
+        """Per-camera availability over [now - window_seconds, now].
+
+        Downtime is the overlap of the camera's outage spans with the spans
+        during which the monitor was actually watching. A camera whose outage
+        straddled a daemon restart is charged only for the monitored part.
+        """
+        since = now - max(0.0, window_seconds)
+        monitored = self.monitored_spans(since, now)
+        monitored_seconds = sum(b - a for a, b in monitored)
+        with self._lock:
+            devs = self._conn.execute(
+                """SELECT * FROM devices WHERE role IN ('camera', 'nvr')
+                   ORDER BY ip"""
+            ).fetchall()
+            outs = self._conn.execute(
+                """SELECT * FROM outages
+                   WHERE up_at IS NULL OR up_at >= ?""",
+                (since,),
+            ).fetchall()
+        by_cam: dict[str, list[OutageRow]] = {}
+        for r in outs:
+            by_cam.setdefault(r["camera_ip"], []).append(_outage_row(r))
+
+        report: list[CameraUptimeRow] = []
+        for d in devs:
+            cam_outs = by_cam.get(d["ip"], [])
+            open_out = next((o for o in cam_outs if o.is_open), None)
+            down_spans = _merge_spans(
+                (max(since, o.down_since),
+                 min(now, o.up_at if o.up_at is not None else now))
+                for o in cam_outs
+            )
+            downtime = _overlap_seconds(down_spans, monitored)
+            if monitored_seconds > 0:
+                availability = max(
+                    0.0, min(1.0, (monitored_seconds - downtime) / monitored_seconds),
+                )
+            else:
+                availability = None
+            if d["last_seen"] <= 0.0:
+                state = "never_seen"
+            elif open_out is not None:
+                state = "down"
+            else:
+                state = "up"
+            report.append(CameraUptimeRow(
+                ip=d["ip"], role=d["role"], state=state,
+                last_seen=d["last_seen"], first_seen=d["first_seen"],
+                down_since=open_out.down_since if open_out else None,
+                current_downtime=open_out.duration(now) if open_out else 0.0,
+                outage_count=len(cam_outs),
+                downtime_seconds=downtime,
+                monitored_seconds=monitored_seconds,
+                availability=availability,
+            ))
+        return report
 
     # ----- flows -----
 
@@ -498,11 +842,30 @@ class HoundStore:
         self, *, flows_older_than: float | None = None,
         alerts_older_than: float | None = None,
         notifications_older_than: float | None = None,
+        outages_older_than: float | None = None,
+        sessions_older_than: float | None = None,
     ) -> dict[str, int]:
         """Delete old rows. Each cutoff is an epoch ts; rows with
-        last_seen/ts < cutoff are removed. Returns per-table rowcounts."""
+        last_seen/ts < cutoff are removed. Returns per-table rowcounts.
+
+        Outages and monitor sessions are only pruned once CLOSED / ENDED —
+        deleting an open row would strand live state the tracker is using.
+        """
         deleted: dict[str, int] = {}
         with self._lock, self._conn:
+            if outages_older_than is not None:
+                cur = self._conn.execute(
+                    "DELETE FROM outages WHERE up_at IS NOT NULL AND up_at < ?",
+                    (outages_older_than,),
+                )
+                deleted["outages"] = cur.rowcount
+            if sessions_older_than is not None:
+                cur = self._conn.execute(
+                    """DELETE FROM monitor_sessions
+                       WHERE ended_at IS NOT NULL AND ended_at < ?""",
+                    (sessions_older_than,),
+                )
+                deleted["monitor_sessions"] = cur.rowcount
             if flows_older_than is not None:
                 cur = self._conn.execute(
                     "DELETE FROM flows WHERE last_seen < ?", (flows_older_than,)
