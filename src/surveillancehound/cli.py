@@ -381,6 +381,16 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     print(f"  web: enabled={cfg.web.enabled} "
           f"bind={cfg.web.host}:{cfg.web.port} "
           f"poll={cfg.web.poll_interval_seconds:.1f}s")
+    print(f"  uptime: enabled={cfg.uptime.enabled} "
+          f"grace={cfg.uptime.grace_for(cfg.thresholds):.0f}s "
+          f"stall={cfg.uptime.capture_stall_seconds:.0f}s "
+          f"recovery_alerts={cfg.uptime.recovery_alerts} "
+          f"(passive — inferred from observed traffic, not probed)")
+    if not cfg.uptime.enabled:
+        print("    NOTE: uptime disabled also disables camera_offline.")
+    if cfg.uptime.capture_stall_seconds <= 0:
+        print("    NOTE: capture stall detection is OFF — a dead capture "
+              "will not be reported.")
     print(f"  notify ({len(cfg.notify)} channel(s)):")
     for n in cfg.notify:
         extra = ""
