@@ -126,7 +126,7 @@ FIELDS: dict[str, dict] = {
     "relay.url": {"raw": "https://10.77.0.250:19443/ingest/v1"},
     "relay.key": {"raw": "agent-secret"},
     "relay.tls_fingerprint": {
-        "raw": "sha256:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+        "raw": "sha256:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11",
     },
     "thresholds.silence_seconds": {
         "raw": "777", "check": lambda c: c.thresholds.silence_seconds,
@@ -465,8 +465,7 @@ def _check_relay_agent_round_trip() -> None:
         "<relay><mode>agent</mode><sensor_id>edge-box</sensor_id>"
         "<url>https://10.77.0.250:19443/ingest/v1</url>"
         "<key>agent-secret</key>"
-        "<tls_fingerprint>sha256:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77"
-        ":88:99</tls_fingerprint></relay>"
+        "<tls_fingerprint>sha256:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11</tls_fingerprint></relay>"
     )
     cfg = load_from_dict(tomllib.loads(toml_text))
     assert cfg.relay.mode == "agent", cfg.relay.mode

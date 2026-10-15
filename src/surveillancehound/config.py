@@ -369,6 +369,31 @@ KNOWN_SECTIONS = frozenset({
 })
 
 
+def normalize_fingerprint(raw: str) -> str:
+    """Canonicalise a certificate fingerprint to `sha256:<64 lowercase hex>`.
+
+    Operators get this value from one of two places, and they disagree on
+    formatting: `hound relay` prints `sha256:ab12...`, while
+    `openssl x509 -fingerprint -sha256` prints `AB:12:...` uppercase with
+    colons. Comparing the raw strings means the openssl form never matches
+    and the agent refuses to connect with "not in the pinned set", naming
+    two values that look the same to a human reading them. Normalising both
+    ends is the only way that error message is ever truthful.
+
+    Returns "" for anything that is not a 64-hex-digit SHA-256 digest, so
+    the caller can reject it rather than pin something unmatchable.
+    """
+    v = raw.strip().lower()
+    for prefix in ("sha256:", "sha-256:", "sha256 fingerprint="):
+        if v.startswith(prefix):
+            v = v[len(prefix):]
+            break
+    v = v.replace(":", "").replace(" ", "")
+    if len(v) != 64 or any(c not in "0123456789abcdef" for c in v):
+        return ""
+    return "sha256:" + v
+
+
 def overbroad_lan_subnets(nets: list[str]) -> list[str]:
     """Public prefixes declared local that cover more than a /24.
 
@@ -456,6 +481,31 @@ def _networks(section: dict, key: str) -> list[str]:
     return out
 
 
+def _pins(raw) -> list[str]:
+    """Normalise and validate pinned fingerprints.
+
+    A malformed pin is refused rather than carried through: it can never
+    match a real certificate, so keeping it would turn a typo into a
+    permanently failing connection diagnosed as a network problem.
+    """
+    out = []
+    for f in raw:
+        text = str(f).strip()
+        if not text:
+            continue
+        norm = normalize_fingerprint(text)
+        if not norm:
+            raise ValueError(
+                f"config: [relay].tls_fingerprint entry {text!r} is not a "
+                f"SHA-256 certificate fingerprint. Expected 64 hex digits, "
+                f"optionally prefixed 'sha256:' and optionally "
+                f"colon-separated. Run `hound relay <config>` on the "
+                f"collector to print the right value."
+            )
+        out.append(norm)
+    return out
+
+
 def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
     """Parse and validate [relay].
 
@@ -476,7 +526,7 @@ def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
         sensor_id=str(rl.get("sensor_id", "")).strip(),
         url=str(rl.get("url", "")).strip(),
         key=str(rl.get("key", "")),
-        tls_fingerprint=[str(f).strip() for f in fp if str(f).strip()],
+        tls_fingerprint=_pins(fp),
         batch_seconds=float(rl.get("batch_seconds", 30.0)),
         spool_max_bytes=int(rl.get("spool_max_bytes", 64 * 1024 * 1024)),
         spool_max_age_seconds=float(rl.get("spool_max_age_seconds", 86400.0)),

@@ -20,6 +20,8 @@ PY=/usr/local/bin/python3
 CERT_DIR=/var/lib/hound
 CERT_FILE="${CERT_DIR}/hound-web.crt"
 KEY_FILE="${CERT_DIR}/hound-web.key"
+INGEST_CERT="${CERT_DIR}/hound-ingest.crt"
+INGEST_KEY="${CERT_DIR}/hound-ingest.key"
 
 if [ ! -x "${PY}" ]; then
     echo "python3 not found at ${PY}; install python from pkg first" >&2
@@ -31,24 +33,33 @@ fi
 # If the rendered TOML asks for the auto-cert paths, materialize them.
 # Idempotent — only generates when the files don't already exist (or are
 # unreadable). openssl ships with OPNsense base, so no extra pkg dep.
-if grep -q "^cert_file *= *\"${CERT_FILE}\"" /usr/local/etc/hound.toml 2>/dev/null; then
-    if [ ! -s "${CERT_FILE}" ] || [ ! -s "${KEY_FILE}" ]; then
-        echo "minting self-signed TLS cert for hound web → ${CERT_FILE}"
-        install -d -m 0750 "${CERT_DIR}"
-        # CN matches the bind host the dashboard will be served on; SAN
-        # covers loopback + the firewall's primary hostname so the same
-        # cert works whether the operator browses via IP or DNS.
-        HOSTNAME=$(hostname -s 2>/dev/null || echo opnsense)
-        openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
-            -keyout "${KEY_FILE}" -out "${CERT_FILE}" \
-            -subj "/CN=hound-web/O=SurveillanceHound (auto-generated)" \
-            -addext "subjectAltName=DNS:localhost,DNS:${HOSTNAME},IP:127.0.0.1" \
-            2>/dev/null
-        chmod 0640 "${CERT_FILE}" "${KEY_FILE}"
-        # Best-effort: hand to the hound user if it exists
-        chown hound:hound "${CERT_FILE}" "${KEY_FILE}" 2>/dev/null || true
-    fi
-fi
+#
+# `cn` is cosmetic for both of these: the dashboard cert is trusted by the
+# browser only after the operator accepts it, and the ingest cert is pinned
+# by fingerprint rather than validated by name.
+mint_cert() {
+    _cert="$1"; _key="$2"; _cn="$3"; _what="$4"
+    grep -q "^[a-z_]* *= *\"${_cert}\"" /usr/local/etc/hound.toml 2>/dev/null || return 0
+    [ -s "${_cert}" ] && [ -s "${_key}" ] && return 0
+    echo "minting self-signed TLS cert for ${_what} → ${_cert}"
+    install -d -m 0750 "${CERT_DIR}"
+    _host=$(hostname -s 2>/dev/null || echo opnsense)
+    openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+        -keyout "${_key}" -out "${_cert}" \
+        -subj "/CN=${_cn}/O=SurveillanceHound (auto-generated)" \
+        -addext "subjectAltName=DNS:localhost,DNS:${_host},IP:127.0.0.1" \
+        2>/dev/null
+    chmod 0640 "${_cert}" "${_key}"
+    # Best-effort: hand to the hound user if it exists
+    chown hound:hound "${_cert}" "${_key}" 2>/dev/null || true
+}
+
+mint_cert "${CERT_FILE}" "${KEY_FILE}" "hound-web" "hound web"
+
+# The relay listener needs its own certificate. Without this, selecting
+# Collector in the UI produced a daemon that logged "cannot load ingest
+# certificate" and simply never listened — nothing in the UI said so.
+mint_cert "${INGEST_CERT}" "${INGEST_KEY}" "hound-ingest" "hound relay ingest"
 
 # Put rc.conf in step with the Enable tick-box, then act on it.
 #

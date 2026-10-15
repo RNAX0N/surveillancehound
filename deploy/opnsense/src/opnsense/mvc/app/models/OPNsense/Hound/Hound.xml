@@ -209,7 +209,7 @@
             </key>
             <tls_fingerprint type="CSVListField">
                 <Required>N</Required>
-                <Mask>/^(sha256:)?[0-9A-Fa-f:]{32,}$/u</Mask>
+                <Mask>/^(sha256:)?([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$|^(sha256:)?[0-9A-Fa-f]{64}$/u</Mask>
                 <ValidationMessage>The collector certificate fingerprint, e.g. sha256:AB:CD:... Run "hound relay" on the collector to print it.</ValidationMessage>
             </tls_fingerprint>
         </relay>

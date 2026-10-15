@@ -229,9 +229,9 @@ def _check_relay_config() -> None:
 
     agent = {"mode": "agent", "sensor_id": "frigate", "key": "k",
              "url": "https://88.255.5.1:18443/ingest/v1",
-             "tls_fingerprint": "sha256:abc"}
+             "tls_fingerprint": "sha256:" + "ab" * 32}
     cfg = load(agent)
-    assert cfg.relay.is_agent and cfg.relay.tls_fingerprint == ["sha256:abc"]
+    assert cfg.relay.is_agent and cfg.relay.tls_fingerprint == ["sha256:" + "ab" * 32]
 
     rejects({**agent, "url": "https://collector.lan:18443/x"},
             "a hostname in relay.url (the daemon does no DNS)")
@@ -277,7 +277,7 @@ def _check_key_never_printed() -> None:
             '[relay]\nmode = "agent"\nsensor_id = "frigate"\n'
             f'key = "{secret}"\n'
             'url = "https://88.255.5.1:18443/ingest/v1"\n'
-            'tls_fingerprint = ["sha256:abc"]\n'
+            'tls_fingerprint = ["sha256:' + "ab" * 32 + '"]\n'
         )
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -815,7 +815,7 @@ def _check_agent_is_silent(tmp: Path) -> None:
         "notify": [{"type": "stdout", "level": "info"}],
         "relay": {"mode": "agent", "sensor_id": "frigate", "key": "k",
                   "url": "https://88.255.5.1:18443/ingest/v1",
-                  "tls_fingerprint": ["sha256:abc"]},
+                  "tls_fingerprint": ["sha256:" + "ab" * 32]},
     })
     hound = Hound(cfg)
     try:
@@ -944,6 +944,7 @@ def _check_capture_exclusion() -> None:
     import shutil
     import subprocess
     from surveillancehound.capture import compose_bpf
+    from surveillancehound.config import load_from_dict
     from surveillancehound.relay import exclusion_filter, split_endpoint
 
     assert split_endpoint("https://88.255.5.1:18443/ingest/v1") == (
@@ -967,12 +968,41 @@ def _check_capture_exclusion() -> None:
     # Compile them for real where tcpdump exists. A filter that does not
     # compile takes the capture down on startup, which is the one failure
     # the whole daemon cannot absorb.
+    # Fingerprint formats must converge. `hound relay` prints
+    # sha256:<lowercase hex>; openssl prints UPPER:CASE:WITH:COLONS. If
+    # these do not normalise to the same value, pasting the openssl output
+    # produces "not in the pinned set" naming two strings a human reads as
+    # identical.
+    from surveillancehound.config import normalize_fingerprint as _nf
+    canon = "sha256:" + "d42847ed2b32b8533bb1f4b8dda27de41ae291e4d98434a0c6eebd85f008fbb2"
+    openssl_form = "D4:28:47:ED:2B:32:B8:53:3B:B1:F4:B8:DD:A2:7D:E4:1A:E2:91:E4:D9:84:34:A0:C6:EE:BD:85:F0:08:FB:B2"
+    assert _nf(openssl_form) == _nf(canon) == canon, (
+        f"openssl and hound fingerprint formats must converge: "
+        f"{_nf(openssl_form)} vs {_nf(canon)}"
+    )
+    for bad in ("nope", "abcd", "", "sha256:" + "z" * 64):
+        assert _nf(bad) == "", f"{bad!r} must not normalise to a pin"
+
+    # And a malformed pin must be REFUSED at load, not carried through:
+    # it can never match, so it turns a typo into a permanently failing
+    # connection that gets diagnosed as a network fault.
+    try:
+        load_from_dict({
+            "capture": {"interface": "x0"},
+            "network": {"camera_ips": ["10.0.0.1"]},
+            "relay": {"mode": "agent", "sensor_id": "s",
+                      "url": "https://10.0.0.2:18443/ingest/v1",
+                      "key": "k" * 20, "tls_fingerprint": ["not-a-digest"]},
+        })
+        raise AssertionError("a malformed tls_fingerprint must be refused")
+    except ValueError as e:
+        assert "fingerprint" in str(e).lower(), e
+
     # Wiring, not just the helper: prove the daemon actually hands the
     # exclusion to the capture layer in agent mode, and hands nothing in
     # the default case. A correct helper nobody calls is still a bug.
     import tempfile
     from surveillancehound import daemon as daemon_mod
-    from surveillancehound.config import load_from_dict
 
     def _seen_exclusion(relay_block: dict) -> str:
         seen: dict = {}
