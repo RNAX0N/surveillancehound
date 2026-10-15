@@ -31,7 +31,7 @@ from surveillancehound.config import (  # noqa: E402
 from surveillancehound.daemon import Hound  # noqa: E402
 from surveillancehound.notify import _maybe_rotate  # noqa: E402
 from surveillancehound.pcap import read_packets  # noqa: E402
-from surveillancehound.store import HoundStore  # noqa: E402
+from surveillancehound.store import HoundStore, OutageRow  # noqa: E402
 from surveillancehound.web import _Handler  # noqa: E402
 
 import make_synthetic_camera_pcap as mk  # noqa: E402
@@ -105,20 +105,61 @@ def _check_prune(cfg: HoundCfg) -> None:
     store = HoundStore(path=cfg.store.path)
     try:
         before = len(store.recent_flows(limit=1000))
+        # one closed + one OPEN outage, one ended + one RUNNING session.
+        # Pruning must take the finished rows and leave the live ones — a
+        # deleted open outage would strand the tracker's state.
+        now = time.time()
+        closed = store.open_outage(
+            OutageRow(None, "10.9.9.1", now - 500, None, now - 600, "silence", None),
+        )
+        store.close_outage(closed, now - 400)
+        live_outage = store.open_outage(
+            OutageRow(None, "10.9.9.2", now - 100, None, now - 200, "silence", None),
+        )
+        ended = store.start_monitor_session(now - 500, "test0")
+        store.end_monitor_session(ended, now - 400, True)
+        store.start_monitor_session(now - 100, "test0")
+
         # prune everything (cutoff in the far future)
         deleted = store.prune(
             flows_older_than=time.time() + 1.0,
             alerts_older_than=time.time() + 1.0,
+            outages_older_than=time.time() + 1.0,
+            sessions_older_than=time.time() + 1.0,
         )
         assert deleted["flows"] == before, (deleted, before)
         assert deleted["alerts"] > 0, deleted
+        assert deleted["outages"] == 1, deleted
+        # >= 1 because the replay run earlier in this suite also recorded and
+        # ended a session of its own; what matters is that only ENDED ones go
+        assert deleted["monitor_sessions"] >= 1, deleted
+        assert store.open_outage_for("10.9.9.2").id == live_outage
+        assert store.current_monitor_session().ended_at is None
         # second prune is a no-op
         deleted2 = store.prune(flows_older_than=time.time() + 1.0)
         assert deleted2["flows"] == 0, deleted2
     finally:
         store.close()
     print(f"  prune: removed {deleted['flows']} flow rows + "
-          f"{deleted['alerts']} alerts; idempotent")
+          f"{deleted['alerts']} alerts + {deleted['outages']} closed outage(s); "
+          f"open outage and running session preserved")
+
+
+def _check_uptime_cli(cfg_path: Path) -> None:
+    env = {"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"}
+    out = subprocess.run(
+        [sys.executable, "-m", "surveillancehound.cli", "uptime", str(cfg_path)],
+        capture_output=True, text=True, check=True, env=env,
+    )
+    assert "not from active probing" in out.stdout, out.stdout
+    assert "avail" in out.stdout or "no cameras" in out.stdout, out.stdout
+    out = subprocess.run(
+        [sys.executable, "-m", "surveillancehound.cli",
+         "uptime", str(cfg_path), "--outages", "--window", "3600"],
+        capture_output=True, text=True, check=True, env=env,
+    )
+    assert "cause" in out.stdout or "no outages" in out.stdout, out.stdout
+    print("  CLI: hound uptime (summary + --outages) renders and exits 0")
 
 
 def _check_baselines_cli(cfg_path: Path) -> None:
@@ -175,11 +216,48 @@ def _check_web(cfg: HoundCfg) -> None:
             ("/api/flows", "flows"),
             ("/api/baselines", "baselines"),
             ("/api/snapshots", "snapshots"),
+            ("/api/uptime", "cameras"),
             ("/api/help", "intro"),
         ]:
             with urllib.request.urlopen(base + path) as resp:
                 body = json.loads(resp.read())
             assert key in body, (path, body)
+
+        # /api/uptime: the documented shape, and the honesty contract — the
+        # evidence must always declare itself passive, because nothing here
+        # probes anything
+        with urllib.request.urlopen(base + "/api/uptime?window=3600") as resp:
+            up = json.loads(resp.read())
+        assert up["evidence"] == "passive", up.get("evidence")
+        assert up["window_seconds"] == 3600.0, up["window_seconds"]
+        assert isinstance(up["cameras"], list) and isinstance(up["outages"], list)
+        mon = up["monitor"]
+        for field in ("source", "running", "stalled", "last_flow_ts"):
+            assert field in mon, (field, mon)
+        if up["cameras"]:
+            cam = up["cameras"][0]
+            for field in (
+                "ip", "role", "state", "last_seen", "current_downtime",
+                "outage_count", "downtime_seconds", "monitored_seconds",
+                "availability",
+            ):
+                assert field in cam, (field, cam)
+            assert cam["state"] in ("up", "down", "never_seen"), cam["state"]
+        # a non-numeric window is rejected rather than silently defaulted
+        try:
+            urllib.request.urlopen(base + "/api/uptime?window=soon")
+            raise AssertionError("expected 400 on a non-numeric window")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, e.code
+        print(f"  web: /api/uptime shape + passive evidence flag "
+              f"({len(up['cameras'])} camera rows)")
+
+        # the dashboard has to actually render the panel, not just serve the API
+        assert "Camera uptime" in html, "uptime panel missing from the dashboard"
+        assert "renderUptime" in html, "uptime renderer missing from the dashboard"
+        assert "not from" in html and "active probing" in html, (
+            "dashboard must state that liveness is passive inference"
+        )
 
         # 404 for unknown
         try:
@@ -330,6 +408,7 @@ def main() -> int:
         _check_log_rotation(root / "alerts.log")
         _check_baselines_cli(cfg_path)
         _check_snapshots_cli(cfg_path)
+        _check_uptime_cli(cfg_path)
         _check_web(cfg)
         _check_web_https(cfg, root)
         _check_web_cfg_validation()

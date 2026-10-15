@@ -15,6 +15,7 @@ Endpoints:
   GET /                  — the dashboard HTML (cache-controlled to no-store)
   GET /api/status        — daemon liveness + counters
   GET /api/devices       — observed devices, sorted by recency
+  GET /api/uptime        — per-camera liveness + availability (passive)
   GET /api/alerts        — recent alerts (limit param)
   GET /api/flows         — recent flows (limit, classification params)
   GET /api/baselines     — Welford buckets (camera param)
@@ -80,6 +81,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._api_status()
             if url.path == "/api/devices":
                 return self._api_devices()
+            if url.path == "/api/uptime":
+                return self._api_uptime(params.get("window"))
             if url.path == "/api/alerts":
                 return self._api_alerts(int(params.get("limit", 100)))
             if url.path == "/api/flows":
@@ -150,6 +153,58 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             store.close()
         _json(self, HTTPStatus.OK, {"devices": [r.__dict__ for r in rows]})
+
+    def _api_uptime(self, window: str | None) -> None:
+        """Per-camera liveness + availability.
+
+        `evidence` is always "passive" and clients are expected to surface
+        that: a camera counts as up because packets from it were observed,
+        not because anything probed it.
+
+        `monitor.stalled` is a reader-side heuristic for the same reason
+        `status.alive` is — this process cannot contact the daemon, it can
+        only notice that no flow row has landed recently.
+        """
+        seconds = self.cfg.uptime.report_window_seconds
+        if window:
+            try:
+                seconds = max(60.0, float(window))
+            except ValueError:
+                _json(self, HTTPStatus.BAD_REQUEST,
+                      {"error": f"window must be a number, got {window!r}"})
+                return
+        now = time.time()
+        store = self._store()
+        try:
+            cameras = store.uptime_report(seconds, now)
+            session = store.current_monitor_session()
+            recent = store.recent_flows(limit=1)
+            outages = store.list_outages(since=now - seconds, limit=200)
+        finally:
+            store.close()
+        last_flow_ts = recent[0].last_seen if recent else 0.0
+        stall_window = self.cfg.uptime.capture_stall_seconds
+        running = session is not None and session.ended_at is None
+        stalled = bool(
+            running and stall_window > 0
+            and (now - last_flow_ts) > stall_window
+        )
+        _json(self, HTTPStatus.OK, {
+            "window_seconds": seconds,
+            "now": now,
+            "evidence": "passive",
+            "cameras": [c.__dict__ for c in cameras],
+            "outages": [o.__dict__ for o in outages],
+            "monitor": {
+                "source": session.source if session else "",
+                "started_at": session.started_at if session else 0.0,
+                "ended_at": session.ended_at if session else 0.0,
+                "running": running,
+                "stalled": stalled,
+                "last_flow_ts": last_flow_ts,
+                "stall_window_seconds": stall_window,
+            },
+        })
 
     def _api_alerts(self, limit: int) -> None:
         store = self._store()
@@ -249,7 +304,25 @@ _HELP_TEXT: dict = {
                  "severity — useful pattern signal, not a high-priority alert."},
         {"kind": "camera_offline",
          "what": "A known camera has been silent for `silence_seconds` (default 600). "
-                 "Check that the camera is online and recording."},
+                 "Check that the camera is online and recording. Detection is "
+                 "PASSIVE — a camera that is powered but no longer visible to this "
+                 "sensor reads the same as one that is powered down."},
+        {"kind": "camera_recovered",
+         "what": "A camera that was offline is sending traffic again. Info-grade; "
+                 "the outage duration is in the summary and the downtime is "
+                 "recorded in the uptime history."},
+        {"kind": "camera_never_seen",
+         "what": "A camera listed in [network] has NEVER been observed, and the "
+                 "startup grace period has elapsed. Either it was already powered "
+                 "down before the monitor started, the configured IP is wrong, or "
+                 "it sits on a segment this sensor cannot see."},
+        {"kind": "capture_stalled",
+         "what": "ZERO packets of any kind for `capture_stall_seconds` (default 120) "
+                 "— the sensor itself is blind, so no other detection is running "
+                 "either. Likely the capture process died, the interface went down, "
+                 "or the mirror/SPAN port was reconfigured. Per-camera offline "
+                 "alerts are suppressed while stalled, because a blind sensor "
+                 "cannot tell which cameras are actually up."},
         {"kind": "behavioral_anomaly",
          "what": "When [baseline] is enabled: this camera's flow is >= z_threshold "
                  "standard deviations from its learned per-(weekday, hour) envelope. "
@@ -264,6 +337,12 @@ _HELP_TEXT: dict = {
         "downloaded from this dashboard. Open them in Wireshark.",
         "Live capture requires tcpdump and CAP_NET_RAW — run as root or "
         "`setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)`.",
+        "A `capture_stalled` alert means THIS sensor stopped seeing traffic. Fix "
+        "the capture before chasing cameras — while stalled, per-camera offline "
+        "alerts are suppressed and the blind window is excluded from availability.",
+        "Availability shows n/a rather than 0% or 100% when the monitor was not "
+        "running during the window. Uptime is only computed over time the sensor "
+        "was actually watching, so a stopped daemon is never charged to a camera.",
     ],
 }
 
@@ -547,6 +626,61 @@ main {
 }
 .device .ip { color: var(--fg); flex: 1; }
 .device .seen { color: var(--fg-mute); font-size: 11px; }
+/* Uptime panel */
+.monitor-line {
+  display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center;
+  padding: 11px 18px;
+  border-bottom: 1px solid var(--line-soft);
+  font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
+}
+.monitor-line .mon-state {
+  font-weight: 600; letter-spacing: 0.16em; text-transform: uppercase;
+}
+.monitor-line .mon-state.ok { color: var(--ok); }
+.monitor-line .mon-state.bad { color: var(--bad); }
+.uptime-grid {
+  display: grid;
+  grid-template-columns: auto auto 1fr auto auto auto;
+  gap: 0 14px; align-items: center;
+  padding: 4px 18px 12px;
+  font-family: var(--mono); font-size: 12px;
+}
+.uptime-grid .head {
+  font: 600 10px var(--mono);
+  text-transform: uppercase; letter-spacing: 0.16em;
+  color: var(--fg-mute);
+  padding: 10px 0 8px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.uptime-grid .cell {
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line-soft);
+  white-space: nowrap;
+}
+.uptime-grid .cell.ip { color: var(--fg); }
+.uptime-grid .cell.dim { color: var(--fg-mute); font-size: 11px; }
+.uptime-grid .cell.num { text-align: right; }
+.pill {
+  display: inline-block; padding: 1px 8px;
+  font: 600 10px var(--mono);
+  text-transform: uppercase; letter-spacing: 0.16em;
+  border: 1px solid currentColor;
+}
+.pill.up { color: var(--ok); }
+.pill.down { color: var(--bad); }
+.pill.never_seen { color: var(--warn); }
+.panel-note {
+  padding: 10px 18px 14px;
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
+  color: var(--fg-mute);
+  border-top: 1px solid var(--line-soft);
+}
+/* Narrow: drop the role and last-seen columns. The count of hidden cells
+   must match the columns removed here, or every row shifts out of line. */
+@media (max-width: 900px) {
+  .uptime-grid { grid-template-columns: auto 1fr auto auto; }
+  .uptime-grid .opt { display: none; }
+}
 .snapshot-link {
   color: var(--accent); text-decoration: none;
   border-bottom: 1px dashed var(--accent);
@@ -678,6 +812,20 @@ footer a:hover { color: var(--accent); }
     </div>
   </div>
 
+  <!-- uptime: liveness + availability (passive inference) -->
+  <div class="card panel">
+    <h2>Camera uptime <span class="count" id="c-uptime"></span></h2>
+    <div class="monitor-line" id="monitor-line"></div>
+    <div id="uptime"></div>
+    <div class="panel-note">
+      Inferred from traffic observed on the monitored interface, not from
+      active probing — a camera that is powered but no longer visible to this
+      sensor reads the same as one that is off. Availability covers only time
+      the monitor was actually running; it shows n/a rather than a figure
+      invented from no observation.
+    </div>
+  </div>
+
   <!-- main 3-column grid -->
   <div class="grid">
     <div class="card panel">
@@ -767,7 +915,7 @@ async function fetchJSON(path) {
 
 async function refresh() {
   try {
-    const [status, alerts, devices, flows, snapshots, baselines] =
+    const [status, alerts, devices, flows, snapshots, baselines, uptime] =
       await Promise.all([
         fetchJSON("/api/status"),
         fetchJSON("/api/alerts?limit=100"),
@@ -775,8 +923,10 @@ async function refresh() {
         fetchJSON("/api/flows?limit=100"),
         fetchJSON("/api/snapshots?limit=50"),
         fetchJSON("/api/baselines"),
+        fetchJSON("/api/uptime"),
       ]);
     renderStatus(status, alerts.alerts, snapshots.snapshots);
+    renderUptime(uptime);
     renderAlerts(alerts.alerts);
     renderDevices(devices.devices);
     renderFlows(flows.flows);
@@ -810,6 +960,64 @@ function renderStatus(s, alerts, snapshots) {
   $("s-snapshots-sub").textContent = s.snapshot_enabled
     ? (snapshots[0] ? `last: ${fmtAgo(snapshots[0].created_at)}` : "engine: enabled")
     : "engine: disabled";
+}
+
+const fmtDur = (s) => {
+  s = Math.max(0, Math.floor(s || 0));
+  if (!s) return "—";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
+  if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+  return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
+};
+
+function renderUptime(u) {
+  const m = u.monitor;
+  // The monitor's own health comes first: if the sensor is blind, every
+  // per-camera figure below it is stale, and saying so beats a green row.
+  let mon = "";
+  if (!m.source) {
+    mon = '<span class="mon-state bad">no session</span>'
+        + '<span>the daemon has not run yet</span>';
+  } else if (m.stalled) {
+    mon = '<span class="mon-state bad">capture stalled</span>'
+        + `<span>source ${escapeHTML(m.source)}</span>`
+        + `<span>last packet ${m.last_flow_ts ? fmtAgo(m.last_flow_ts) : "never"}</span>`
+        + '<span>per-camera offline alerts suppressed</span>';
+  } else if (m.running) {
+    mon = '<span class="mon-state ok">watching</span>'
+        + `<span>source ${escapeHTML(m.source)}</span>`
+        + `<span>since ${fmtTs(m.started_at)}</span>`;
+  } else {
+    mon = '<span class="mon-state bad">stopped</span>'
+        + `<span>source ${escapeHTML(m.source)}</span>`
+        + `<span>ended ${fmtAgo(m.ended_at)}</span>`;
+  }
+  mon += `<span>window ${fmtDur(u.window_seconds)}</span>`;
+  $("monitor-line").innerHTML = mon;
+
+  const cams = u.cameras || [];
+  const down = cams.filter(c => c.state !== "up").length;
+  $("c-uptime").textContent = down
+    ? `${down} of ${cams.length} not up` : `${cams.length} up`;
+  if (!cams.length) {
+    $("uptime").innerHTML =
+      '<div class="empty">no cameras known — check [network] in the config</div>';
+    return;
+  }
+  // The two `opt` cells are dropped together with their columns at the
+  // narrow breakpoint; keep the counts in step or rows shift out of line.
+  const head = ['state', 'ip', '', 'last seen', 'down for', 'avail']
+    .map((h, i) => `<div class="head${i === 2 || i === 3 ? ' opt' : ''}">${h}</div>`)
+    .join("");
+  $("uptime").innerHTML = '<div class="uptime-grid">' + head + cams.map(c => `
+    <div class="cell"><span class="pill ${escapeHTML(c.state)}">${escapeHTML(c.state.replace("_", " "))}</span></div>
+    <div class="cell ip">${escapeHTML(c.ip)}</div>
+    <div class="cell dim opt">${escapeHTML(c.role)}${c.outage_count ? " · " + c.outage_count + " outage" + (c.outage_count === 1 ? "" : "s") : ""}</div>
+    <div class="cell dim opt">${c.last_seen ? fmtAgo(c.last_seen) : "never"}</div>
+    <div class="cell num">${fmtDur(c.current_downtime)}</div>
+    <div class="cell num">${c.availability === null ? "n/a" : (c.availability * 100).toFixed(2) + "%"}</div>
+  `).join("") + '</div>';
 }
 
 function renderAlerts(alerts) {
