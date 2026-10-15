@@ -82,12 +82,19 @@ class Alert:
     summary: str
     detail: str
     dedup_key: str
+    # Which sensor observed this. "local" for anything this daemon saw
+    # itself; a relay sensor id for anything that arrived over the wire.
+    # Without it a relayed alert is byte-identical to a local one in every
+    # notification channel, and an operator cannot tell which segment a
+    # camera_offline came from.
+    sensor: str = "local"
 
     def as_dict(self) -> dict:
         return {
             "ts": self.ts, "device_ip": self.device_ip, "kind": self.kind,
             "severity": self.severity, "summary": self.summary,
             "detail": self.detail, "dedup_key": self.dedup_key,
+            "sensor": self.sensor,
         }
 
 

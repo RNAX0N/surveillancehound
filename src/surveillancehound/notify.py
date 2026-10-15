@@ -41,6 +41,11 @@ from surveillancehound.store import HoundStore
 
 log = logging.getLogger(__name__)
 
+def _oneline(text: str) -> str:
+    """Collapse anything that could break a line-oriented log format."""
+    return "".join(" " if ch < " " or ch == "\x7f" else ch for ch in str(text))
+
+
 _SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
@@ -120,9 +125,14 @@ class LogfileChannel(NotifyChannel):
         p.parent.mkdir(parents=True, exist_ok=True)
         _maybe_rotate(p, self.max_bytes, self.keep)
         with p.open("a") as f:
+            # One alert must be exactly one line. A newline inside summary
+            # would otherwise forge additional records in a file that SIEMs
+            # tail — and with relayed alerts the summary is not necessarily
+            # produced by this host.
             f.write(
                 f"{int(alert.ts)} [{alert.severity}] {alert.kind} "
-                f"{alert.device_ip} — {alert.summary}\n"
+                f"{alert.sensor} {alert.device_ip} — "
+                f"{_oneline(alert.summary)}\n"
             )
 
 
@@ -207,7 +217,12 @@ class SyslogChannel(NotifyChannel):
         ts = datetime.fromtimestamp(alert.ts, tz=timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%S.%fZ",
         )
-        hostname = socket.gethostname() or "-"
+        # The originating sensor, not this host — a relayed event did not
+        # happen here, and stamping the firewall's hostname on it
+        # mis-attributes it in the SIEM.
+        hostname = (
+            socket.gethostname() if alert.sensor == "local" else alert.sensor
+        ) or "-"
         # escape STRUCTURED-DATA values per RFC 5424 §6.3.3
         def _esc(s: str) -> str:
             return s.replace("\\", "\\\\").replace('"', '\\"').replace("]", "\\]")

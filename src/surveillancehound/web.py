@@ -972,7 +972,7 @@ function setStatus(alive, text) {
 function renderStatus(s, alerts, snapshots) {
   setStatus(s.alive, s.alive ? "daemon live" : "no recent traffic");
   $("s-cameras").textContent = s.camera_count;
-  $("s-nvrs").textContent = `${s.nvr_count} NVR · ${s.device_count - s.camera_count - s.nvr_count} other`;
+  $("s-nvrs").textContent = `${num(s.nvr_count)} NVR · ${num(s.device_count) - num(s.camera_count) - num(s.nvr_count)} other`;
   const dayAgo = Date.now() / 1000 - 86400;
   const last24 = alerts.filter(a => a.ts >= dayAgo).length;
   $("s-alerts").textContent = last24;
@@ -986,6 +986,12 @@ function renderStatus(s, alerts, snapshots) {
     ? (snapshots[0] ? `last: ${fmtAgo(snapshots[0].created_at)}` : "engine: enabled")
     : "engine: disabled";
 }
+
+/* Coerce anything interpolated as a number to an actual number before it
+   reaches innerHTML. These columns come from INTEGER/REAL SQLite columns
+   today, but SQLite is dynamically typed and relayed rows originate on
+   another host — a string here would be markup in the operator's browser. */
+const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 
 const fmtDur = (s) => {
   s = Math.max(0, Math.floor(s || 0));
@@ -1041,7 +1047,7 @@ function renderUptime(u) {
   $("uptime").innerHTML = '<div class="uptime-grid">' + head + cams.map(c => `
     <div class="cell"><span class="pill ${escapeHTML(c.state)}">${escapeHTML(c.state.replace("_", " "))}</span></div>
     <div class="cell ip">${escapeHTML(c.ip)}</div>
-    <div class="cell dim opt">${escapeHTML(c.role)}${c.outage_count ? " · " + c.outage_count + " outage" + (c.outage_count === 1 ? "" : "s") : ""}</div>
+    <div class="cell dim opt">${escapeHTML(c.role)}${num(c.outage_count) ? " · " + num(c.outage_count) + " outage" + (num(c.outage_count) === 1 ? "" : "s") : ""}</div>
     <div class="cell dim opt">${c.last_seen ? fmtAgo(c.last_seen) : "never"}</div>
     <div class="cell num">${fmtDur(c.current_downtime)}</div>
     <div class="cell num">${c.availability === null ? "n/a" : (c.availability * 100).toFixed(2) + "%"}</div>
@@ -1105,9 +1111,9 @@ function renderFlows(flows) {
           <span style="color:var(--fg-mute)">[${escapeHTML(f.proto)}]</span>
         </div>
         <div class="row-detail">
-          ${f.packets} packets · ${fmtBytes(f.bytes)}
-          ${f.bytes_to_camera ? "· →cam " + fmtBytes(f.bytes_to_camera) : ""}
-          ${f.bytes_from_camera ? "· cam→ " + fmtBytes(f.bytes_from_camera) : ""}
+          ${num(f.packets)} packets · ${fmtBytes(num(f.bytes))}
+          ${num(f.bytes_to_camera) ? "· →cam " + fmtBytes(num(f.bytes_to_camera)) : ""}
+          ${num(f.bytes_from_camera) ? "· cam→ " + fmtBytes(num(f.bytes_from_camera)) : ""}
         </div>
       </div>
     </div>
@@ -1146,7 +1152,7 @@ function renderBaselines(baselines) {
             const std = b.n >= 2 ? Math.sqrt(b.m2 / (b.n - 1)) : 0;
             return `<span style="margin-right:18px">
               <span style="color:var(--accent)">${escapeHTML(b.feature)}</span>
-              n=${b.n} μ=${b.mean.toFixed(1)} σ=${std.toFixed(1)}
+              n=${num(b.n)} μ=${num(b.mean).toFixed(1)} σ=${num(std).toFixed(1)}
             </span>`;
           }).join("")}
         </div>
@@ -1170,12 +1176,12 @@ function renderSnapshots(snaps) {
       <div class="row-main">
         <div class="row-top">
           <span class="ts">${fmtTs(s.created_at)}</span>
-          <span class="kind">alert #${s.alert_id}</span>
+          <span class="kind">alert #${num(s.alert_id)}</span>
           <span style="color:var(--fg-mute)">${escapeHTML(s.camera_ip)}</span>
         </div>
         <div class="row-summary">
-          ${s.packet_count} packets · ${fmtBytes(s.byte_count)} ·
-          <a class="snapshot-link" href="/api/snapshots/${s.id}.pcap">
+          ${num(s.packet_count)} packets · ${fmtBytes(num(s.byte_count))} ·
+          <a class="snapshot-link" href="/api/snapshots/${num(s.id)}.pcap">
             download .pcap
           </a>
         </div>
