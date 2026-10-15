@@ -491,6 +491,193 @@ def _check_authorizer_actually_catches() -> None:
     print("  quarantine guard: verified to fire on a real central write")
 
 
+
+# ---------------------------------------------------------------------------
+# listener: real TLS on loopback, every rejection path
+# ---------------------------------------------------------------------------
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+
+def _collector_cfg(port: int, **over):
+    from surveillancehound.config import RelayCfg, RelaySensorCfg
+    cfg = RelayCfg(
+        mode="collector", listen_host="127.0.0.1", listen_port=port,
+        cert_file=str(FIXTURES / "ingest-test.crt"),
+        key_file=str(FIXTURES / "ingest-test.key"),
+        sensors=[RelaySensorCfg(id="frigate", key="shared-secret")],
+    )
+    for k, v in over.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def _pin() -> list[str]:
+    import ssl as _ssl
+    from surveillancehound.relay import fingerprint_of
+    der = _ssl.PEM_cert_to_DER_cert((FIXTURES / "ingest-test.crt").read_text())
+    return [fingerprint_of(der)]
+
+
+def _check_listener(tmp: Path) -> None:
+    import time as _time
+    from surveillancehound import relay as R
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.store import HoundStore
+
+    clock = {"t": T0}
+    port = _free_port()
+    store = HoundStore(path=tmp / "coll.sqlite")
+    got_alerts = []
+    srv = IngestServer(
+        _collector_cfg(port), store,
+        on_alerts=lambda sid, al: got_alerts.append((sid, len(al))),
+        now=lambda: clock["t"],
+    )
+    assert srv.start(), "listener failed to start"
+    url = f"https://127.0.0.1:{port}/ingest/v1"
+    pins = _pin()
+
+    def send(seq=1, key="shared-secret", sensor="frigate", instance="inst-1",
+             sent_at=None, records=None, mutate=None):
+        body = R.build_batch(sensor, instance, seq,
+                             records if records is not None else _good_records(),
+                             clock["t"] if sent_at is None else sent_at)
+        if mutate:
+            body = mutate(body)
+        return R.post_batch(url, body, key, sensor, seq, pins, timeout=10)
+
+    try:
+        st, pay = send(seq=1)
+        assert st == 200 and pay["ack_seq"] == 1, (st, pay)
+        assert got_alerts == [("frigate", 1)], got_alerts
+
+        st, pay = send(seq=1)
+        assert st == 409 and pay["last_seq"] == 1, (st, pay)
+
+        st, _ = send(seq=2)
+        assert st == 200
+
+        st, _ = send(seq=3, key="wrong-key")
+        assert st == 401, st
+
+        st, _ = send(seq=3, sensor="unknown-sensor")
+        assert st == 401, st
+
+        # the signed body wins: header says frigate, body claims someone else
+        def claim_other(body):
+            return body.replace(b'"sensor_id":"frigate"', b'"sensor_id":"other12"')
+        st, _ = send(seq=3, mutate=claim_other)
+        assert st in (400, 401), st
+
+        st, pay = send(seq=3, sent_at=clock["t"] + 9999)
+        assert st == 400 and "sent_at" in pay["error"], (st, pay)
+
+        # a day-old SPOOLED batch, re-stamped at transmission, is fine —
+        # this is the v1 contradiction that made the spool unreplayable
+        old = R.build_batch("frigate", "inst-1", 3, _good_records(), T0 - 86400)
+        fresh = R.restamp(old, clock["t"])
+        st, _ = R.post_batch(url, fresh, "shared-secret", "frigate", 3, pins)
+        assert st == 200, f"re-stamped spooled batch rejected: {st}"
+
+        st, _ = send(seq=4, records={"flows": "not a list"})
+        assert st == 400, st
+
+        bad = _good_records(); bad["flows"][0]["packets"] = "<img src=x>"
+        st, _ = send(seq=4, records=bad)
+        assert st == 400, "a script tag in a numeric field was accepted"
+
+        # a new instance id resets the sequence instead of wedging
+        st, _ = send(seq=1, instance="inst-2")
+        assert st == 200, f"instance change not accepted: {st}"
+
+        print("  listener: 200/409/401/400 paths correct over real TLS; "
+              "signed body authoritative; re-stamped spool accepted")
+    finally:
+        srv.stop()
+        store.close()
+
+
+def _check_listener_limits(tmp: Path) -> None:
+    import http.client
+    import ssl as _ssl
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.store import HoundStore
+
+    clock = {"t": T0}
+    port = _free_port()
+    store = HoundStore(path=tmp / "lim.sqlite")
+    srv = IngestServer(_collector_cfg(port, max_body_bytes=2048,
+                                      max_batches_per_minute=3),
+                       store, now=lambda: clock["t"])
+    assert srv.start()
+
+    def raw(method="POST", path="/ingest/v1", body=b"{}", headers=None):
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        c = http.client.HTTPSConnection("127.0.0.1", port, timeout=10, context=ctx)
+        try:
+            h = {"Content-Length": str(len(body))}
+            if headers:
+                h.update(headers)
+                if headers.get("Transfer-Encoding"):
+                    h.pop("Content-Length", None)
+            c.request(method, path, body=body, headers=h)
+            return c.getresponse().status
+        finally:
+            c.close()
+
+    try:
+        assert raw(method="GET") == 405, "GET should be rejected"
+        assert raw(path="/elsewhere") == 404, "unknown path should 404"
+        assert raw(body=b"x" * 4096) == 413, "oversized body should 413"
+        assert raw(headers={"Transfer-Encoding": "chunked"}) == 400, \
+            "chunked should be rejected"
+
+        # rate limit is by source address and fires before auth
+        codes = [raw(body=b"{}") for _ in range(6)]
+        assert 429 in codes, f"rate limit never fired: {codes}"
+        print("  listener: 405/404/413/400-chunked enforced; rate limit is "
+              "pre-auth and by source address")
+    finally:
+        srv.stop()
+        store.close()
+
+
+def _check_pinning(tmp: Path) -> None:
+    from surveillancehound import relay as R
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.store import HoundStore
+
+    port = _free_port()
+    store = HoundStore(path=tmp / "pin.sqlite")
+    srv = IngestServer(_collector_cfg(port), store, now=lambda: T0)
+    assert srv.start()
+    url = f"https://127.0.0.1:{port}/ingest/v1"
+    body = R.build_batch("frigate", "i", 1, _good_records(), T0)
+    try:
+        st, _ = R.post_batch(url, body, "shared-secret", "frigate", 1, _pin())
+        assert st == 200
+        try:
+            R.post_batch(url, body, "shared-secret", "frigate", 2,
+                         ["sha256:" + "0" * 64])
+            raise AssertionError("a wrong pinned fingerprint was accepted")
+        except R.RelayError as e:
+            assert "pinned set" in str(e)
+        print("  pinning: correct fingerprint accepted, wrong one refuses to send")
+    finally:
+        srv.stop()
+        store.close()
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -506,6 +693,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         _check_remote_store(Path(td))
         _check_quarantine(Path(td))
+    print("=== listener ===")
+    with tempfile.TemporaryDirectory() as td:
+        _check_listener(Path(td))
+        _check_listener_limits(Path(td))
+        _check_pinning(Path(td))
     print("\nRELAY VERIFICATION PASSED")
     return 0
 

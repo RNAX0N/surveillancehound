@@ -1,0 +1,330 @@
+"""Collector-side ingest listener.
+
+Runs inside the daemon because `HoundStore` is single-writer and the daemon
+owns it. It deliberately does **not** take the daemon's `_loop_lock`: that
+lock guards in-RAM state (the flow aggregator, device classifier, uptime
+tracker, snapshot ring) which ingest never touches, and `HoundStore`
+serialises itself. Taking it would let one large authenticated batch stall
+packet capture long enough for the watchdog to declare the capture stalled —
+a remote host making the firewall fabricate an alert about its own
+blindness.
+
+Everything here assumes the peer is hostile even when the signature checks
+out, because the agent runs on a camera-segment host that is more likely to
+be compromised than this one.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import socket
+import ssl
+import threading
+import time
+from collections import defaultdict, deque
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from surveillancehound import relay, validate
+from surveillancehound.config import RelayCfg
+from surveillancehound.store import HoundStore
+
+log = logging.getLogger(__name__)
+
+INGEST_PATH = "/ingest/v1"
+# A forged seq must not be able to poison the counter so the real agent can
+# never catch up.
+MAX_SEQ_ADVANCE = 1_000_000
+
+
+class _RateLimiter:
+    """Token bucket keyed by SOURCE ADDRESS, applied before authentication.
+
+    Keying on the sensor id would mean keying on an unsigned header, so
+    anyone who could reach the port could exhaust the real agent's budget
+    just by naming it.
+    """
+
+    def __init__(self, per_minute: int):
+        self.per_minute = max(1, int(per_minute))
+        self._hits: dict[str, deque] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, source: str, now: float) -> bool:
+        with self._lock:
+            q = self._hits[source]
+            while q and (now - q[0]) > 60.0:
+                q.popleft()
+            if len(q) >= self.per_minute:
+                return False
+            q.append(now)
+            if len(self._hits) > 1024:          # bound the keyspace itself
+                for k in [k for k, v in self._hits.items() if not v][:512]:
+                    del self._hits[k]
+            return True
+
+
+class IngestServer:
+    """HTTPS listener accepting exactly one route."""
+
+    def __init__(self, cfg: RelayCfg, store: HoundStore, on_alerts=None,
+                 now=time.time):
+        self.cfg = cfg
+        self.store = store
+        self.on_alerts = on_alerts
+        self.now = now
+        self._httpd: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self._limiter = _RateLimiter(cfg.max_batches_per_minute)
+        self.started = False
+
+    # ----- lifecycle -----
+
+    def start(self) -> bool:
+        """Bind and serve. Never fatal — a failure here must not kill capture."""
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(self.cfg.cert_file, self.cfg.key_file)
+        except (OSError, ssl.SSLError) as e:
+            log.error(
+                "relay: cannot load ingest certificate (%s / %s): %s — "
+                "listener not started; the rest of the daemon is unaffected",
+                self.cfg.cert_file, self.cfg.key_file, e,
+            )
+            return False
+
+        server = self
+        handler = _make_handler(server, ctx)
+        try:
+            httpd = _Server((self.cfg.listen_host, self.cfg.listen_port), handler)
+        except OSError as e:
+            log.error(
+                "relay: cannot bind %s:%s: %s — listener not started. The "
+                "address may not be up yet; capture continues regardless.",
+                self.cfg.listen_host, self.cfg.listen_port, e,
+            )
+            return False
+
+        self._httpd = httpd
+        self._thread = threading.Thread(
+            target=httpd.serve_forever, name="hound-ingest", daemon=True,
+        )
+        self._thread.start()
+        self.started = True
+        log.info(
+            "relay: ingest listening on https://%s:%d%s for sensor(s) %s",
+            self.cfg.listen_host, self.cfg.listen_port, INGEST_PATH,
+            ", ".join(s.id for s in self.cfg.sensors),
+        )
+        return True
+
+    def stop(self) -> None:
+        """Stop before the store closes, or in-flight writes hit a dead handle."""
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._httpd = None
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+            self._thread = None
+        self.started = False
+
+    # ----- request handling -----
+
+    def handle_batch(self, source: str, body: bytes, headers) -> tuple[int, dict]:
+        now = self.now()
+
+        sensor_hint = headers.get(relay.SENSOR_HEADER, "")
+        signature = headers.get(relay.SIG_HEADER, "")
+
+        try:
+            doc = validate.loads_strict(body)
+        except validate.ValidationError as e:
+            return HTTPStatus.BAD_REQUEST, {"error": str(e)}
+        if not isinstance(doc, dict):
+            return HTTPStatus.BAD_REQUEST, {"error": "body must be an object"}
+
+        if doc.get("schema") != relay.SCHEMA_VERSION:
+            return HTTPStatus.BAD_REQUEST, {
+                "error": f"unsupported schema {doc.get('schema')!r}, "
+                         f"expected {relay.SCHEMA_VERSION}",
+            }
+
+        sensor_id = str(doc.get("sensor_id", ""))
+        # The signed body is authoritative. Without this check a holder of
+        # one sensor's key could set the header to their own id (so the
+        # right key verifies) and claim another sensor's in the body.
+        if sensor_hint and sensor_hint != sensor_id:
+            return HTTPStatus.BAD_REQUEST, {
+                "error": "sensor id in the header does not match the signed body",
+            }
+
+        key = self.cfg.key_for(sensor_id)
+        if key is None or not relay.verify(key, body, signature):
+            # One status for both, deliberately: distinguishing "unknown
+            # sensor" from "bad signature" is a probing oracle.
+            log.warning("relay: rejected batch from %s (sensor=%r)",
+                        source, sensor_id[:64])
+            return HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"}
+
+        sent_at = doc.get("sent_at")
+        if not isinstance(sent_at, (int, float)):
+            return HTTPStatus.BAD_REQUEST, {"error": "sent_at must be a number"}
+        skew = float(sent_at) - now
+        if abs(skew) > self.cfg.clock_skew_seconds:
+            return HTTPStatus.BAD_REQUEST, {
+                "error": f"sent_at is {skew:+.0f}s from collector time, "
+                         f"outside the +/-{self.cfg.clock_skew_seconds:.0f}s window",
+                "server_time": now,
+            }
+
+        instance_id = str(doc.get("instance_id", ""))
+        seq = doc.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+            return HTTPStatus.BAD_REQUEST, {"error": "seq must be a positive integer"}
+
+        known = self.store.get_remote_sensor(sensor_id)
+        if known is not None and known.instance_id == instance_id:
+            if seq <= known.last_seq:
+                # Tell the agent where we are so it can fast-forward instead
+                # of discarding everything it has.
+                return HTTPStatus.CONFLICT, {
+                    "error": "stale sequence",
+                    "last_seq": known.last_seq,
+                    "instance_id": known.instance_id,
+                }
+            if seq - known.last_seq > MAX_SEQ_ADVANCE:
+                return HTTPStatus.BAD_REQUEST, {
+                    "error": "implausible sequence advance",
+                    "last_seq": known.last_seq,
+                }
+        elif known is not None:
+            log.warning(
+                "relay: sensor %r presented a new instance id (%s -> %s); "
+                "accepting and resetting its sequence. If two agents share "
+                "this sensor_id, give them separate ids.",
+                sensor_id, known.instance_id, instance_id,
+            )
+
+        try:
+            records = validate.validate_records(
+                doc.get("records", {}), self.cfg.max_records_per_batch,
+            )
+        except validate.ValidationError as e:
+            log.warning("relay: rejected batch from %s: %s", sensor_id, e)
+            return HTTPStatus.BAD_REQUEST, {"error": str(e)}
+
+        counts = self.store.ingest_remote_batch(
+            sensor_id, instance_id, seq, records, now,
+            skew=skew, body_bytes=len(body),
+        )
+
+        if self.on_alerts and records.get("alerts"):
+            try:
+                self.on_alerts(sensor_id, records["alerts"])
+            except Exception:       # noqa: BLE001 - never fail ingest on dispatch
+                log.exception("relay: queuing relayed alerts failed")
+
+        return HTTPStatus.OK, {
+            "status": "ok", "ack_seq": seq,
+            "accepted": counts.get("total", 0), "server_time": now,
+        }
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+    # Bounded backlog; the handler timeout below bounds how long any one
+    # connection can occupy a thread.
+    request_queue_size = 16
+    allow_reuse_address = True
+
+
+def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        # Do not advertise the Python version on an open port.
+        server_version = "hound"
+        sys_version = ""
+        timeout = 15
+
+        def setup(self):
+            # Wrap per connection, not on the listening socket: wrapping the
+            # listener runs the handshake on the accept thread, so one
+            # dribbled ClientHello blocks every other sensor.
+            self.connection = ctx.wrap_socket(self.request, server_side=True)
+            self.request = self.connection
+            self.connection.settimeout(self.timeout)
+            super().setup()
+
+        def log_message(self, fmt, *args):
+            log.debug("ingest: " + fmt, *args)
+
+        def handle_error(self, *a):
+            pass          # a hostile peer must not be able to spam stderr
+
+        def _reply(self, status, payload):
+            raw = json.dumps(payload).encode()
+            self.send_response(int(status))
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):          # noqa: N802
+            self._reply(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "POST only"})
+
+        def do_POST(self):         # noqa: N802
+            source = self.client_address[0] if self.client_address else "?"
+
+            if self.path != INGEST_PATH:
+                self._reply(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+
+            # Rate limit BEFORE reading the body or authenticating.
+            if not server._limiter.allow(source, server.now()):
+                self._reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": "slow down"})
+                return
+
+            if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                # BaseHTTPRequestHandler cannot read a chunked body, and
+                # silently treating it as empty would be worse.
+                self._reply(HTTPStatus.BAD_REQUEST,
+                            {"error": "chunked encoding not supported"})
+                return
+
+            raw_len = self.headers.get("Content-Length")
+            if raw_len is None:
+                self._reply(HTTPStatus.LENGTH_REQUIRED,
+                            {"error": "Content-Length required"})
+                return
+            try:
+                length = int(raw_len)
+            except ValueError:
+                self._reply(HTTPStatus.BAD_REQUEST, {"error": "bad Content-Length"})
+                return
+            # Check the declared size before reading a single byte.
+            if length < 0 or length > server.cfg.max_body_bytes:
+                self._reply(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            {"error": f"body over {server.cfg.max_body_bytes} bytes"})
+                return
+
+            try:
+                body = self.rfile.read(length)
+            except (TimeoutError, socket.timeout, OSError):
+                return
+            if len(body) != length:
+                self._reply(HTTPStatus.BAD_REQUEST, {"error": "short body"})
+                return
+
+            try:
+                status, payload = server.handle_batch(source, body, self.headers)
+            except Exception:       # noqa: BLE001
+                # Never return exception text to a client.
+                log.exception("relay: ingest failed")
+                self._reply(HTTPStatus.INTERNAL_SERVER_ERROR,
+                            {"error": "internal error"})
+                return
+            self._reply(status, payload)
+
+    return Handler
