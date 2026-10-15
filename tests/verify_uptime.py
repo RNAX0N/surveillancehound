@@ -18,6 +18,7 @@ Run: PYTHONPATH=src:tests python tests/verify_uptime.py
 
 from __future__ import annotations
 
+import struct
 import sys
 import tempfile
 import threading
@@ -702,6 +703,98 @@ def _check_watchdog_fires_when_capture_wedges(tmp: Path) -> None:
         daemon_mod._TICK_S = orig_tick
 
 
+def _check_full_pipeline_replay(tmp: Path) -> None:
+    """The headline fix, end to end through the real pipeline.
+
+    Everything else either drives the tracker directly or stubs the
+    capture. This one goes pcap -> parser -> flow aggregator -> classifier
+    -> uptime -> alert engine, which is the only way to prove the gap-2
+    regression is actually fixed in the shipping code path:
+
+      * STREAMER holds ONE continuous RTSP-shaped flow for the whole
+        capture. It never goes idle, so it is never evicted, so under the
+        old design devices.last_seen never advanced and it tripped
+        camera_offline while actively streaming.
+      * DROPPER streams briefly and then dies, and must produce exactly
+        one camera_offline.
+      * The NVR keeps talking throughout, so the sensor is demonstrably
+        not blind and the no-blame-without-evidence rule is satisfied.
+    """
+    import make_synthetic_camera_pcap as mk
+
+    streamer, dropper, nvr = "192.168.77.10", "192.168.77.11", "192.168.77.2"
+    out = bytearray()
+    out += struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+    base = mk.BASE_TS
+    # A short exchange at startup (NTP/ONVIF-shaped) that DOES go idle and
+    # therefore DOES get evicted. This is what makes the regression real:
+    # it creates the device row early with an old last_seen, and under the
+    # old design nothing ever moved that value forward again, because the
+    # camera's only other flow was the stream that never goes idle.
+    for i in range(5):
+        out += mk._tcp_packet(base + i, streamer, nvr, 49000, 123, 90)
+        out += mk._tcp_packet(base + i + 0.1, nvr, streamer, 123, 49000, 90)
+
+    for i in range(1200):            # 1200s of capture, one packet/sec each
+        t = base + i
+        # one long-lived flow per talker: same 5-tuple throughout, so the
+        # aggregator never evicts them
+        out += mk._tcp_packet(t, streamer, nvr, 50010, 554, 1400)
+        out += mk._tcp_packet(t + 0.2, nvr, streamer, 554, 50010, 120)
+        if i < 100:                  # the dropper dies at t+100
+            out += mk._tcp_packet(t, dropper, nvr, 50011, 554, 1400)
+
+    pcap = tmp / "pipeline.pcap"
+    pcap.write_bytes(bytes(out))
+    store_path = tmp / "pipeline.sqlite"
+    cfg = load_from_dict({
+        "capture": {"pcap_file": str(pcap)},
+        "network": {"camera_ips": [streamer, dropper], "nvr_ips": [nvr]},
+        "store": {"path": str(store_path)},
+        "thresholds": {"silence_seconds": 300.0, "flow_ttl_seconds": 300.0},
+        "uptime": {"capture_stall_seconds": 120.0,
+                   "startup_grace_seconds": 300.0},
+        "notify": [{"type": "stdout", "level": "critical"}],
+    })
+    from surveillancehound.daemon import Hound
+
+    assert Hound(cfg).run() is True
+
+    store = HoundStore(path=store_path)
+    try:
+        alerts = store.list_alerts(limit=500)
+        offline = [a for a in alerts if a.kind == "camera_offline"]
+        stalls = [a for a in alerts if a.kind == "capture_stalled"]
+        never = [a for a in alerts if a.kind == "camera_never_seen"]
+
+        # The streamer's device clock must be current. (Note: the shutdown
+        # drain also writes a final value, so this alone cannot distinguish
+        # a live-tracked clock from one fixed up at exit — the alert
+        # assertions below are what actually pin the behaviour.)
+        d = store.get_device(streamer)
+        assert d is not None, "streaming camera never reached the device table"
+        assert d.last_seen >= base + 1100, (
+            f"streaming camera's last_seen went stale ({d.last_seen - base:.0f}s "
+            f"into a 1200s capture) — devices.last_seen is not tracking a "
+            f"flow that never goes idle"
+        )
+        assert not any(a.device_ip == streamer for a in offline), (
+            "the continuously streaming camera was reported offline — "
+            "this is the regression the feature exists to fix"
+        )
+        assert [a.device_ip for a in offline] == [dropper], (
+            f"expected exactly one offline alert, for {dropper}: "
+            f"{[(a.device_ip, a.kind) for a in offline]}"
+        )
+        assert not stalls, f"false capture stall during live traffic: {stalls}"
+        assert not never, f"false never-seen for configured cameras: {never}"
+
+        print(f"  full pipeline: {len(alerts)} alerts, one camera_offline "
+              f"({dropper}), none for the 1200s continuous streamer")
+    finally:
+        store.close()
+
+
 def _check_capture_death_is_reported(tmp: Path) -> None:
     """tcpdump exiting must not look like a clean shutdown.
 
@@ -776,6 +869,8 @@ def main() -> int:
         print("=== watchdog (daemon-level) ===")
         _check_watchdog_fires_when_capture_wedges(tmp)
         _check_capture_death_is_reported(tmp)
+        print("=== full pipeline (replay) ===")
+        _check_full_pipeline_replay(tmp)
     print("\nUPTIME VERIFICATION PASSED")
     return 0
 
