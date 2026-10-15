@@ -141,6 +141,34 @@ configctl webgui restart
 Open **Services → SurveillanceHound** in the OPNsense UI, fill in the
 listen interface + camera IPs, tick **Enable**, hit **Save & restart**.
 
+## How it gets permission to capture
+
+The daemon runs as the unprivileged `hound` user, not as root — it parses
+untrusted bytes off the wire for a living, so it should not do that with
+full privilege. FreeBSD has no `capabilities(7)`, so there is no
+equivalent of the Linux `setcap cap_net_raw` on tcpdump. Instead the rc
+script grants the service user group access to `/dev/bpf` (normally
+`crw------- root:wheel`) at every start, re-applied on each boot by the
+service itself rather than by taking over the global devfs ruleset.
+
+Set `hound_grant_bpf=NO` in `/etc/rc.conf` to manage BPF access yourself
+(a devfs ruleset of your own, or running as root). The service logs a
+warning and keeps going if the grant fails, so you find out from the log
+rather than from silence.
+
+The rendered `/usr/local/etc/hound.toml` is written `0640 hound:hound`.
+It carries webhook URLs, SMTP passwords and FTP credentials, so it is
+deliberately not world-readable — and configd's own `umask 027` would
+otherwise leave it root-owned and unreadable by the daemon.
+
+## Interface names
+
+The form stores the OPNsense interface **alias** (`lan`, `opt3`); the
+renderer translates it to the real device (`igb1`, `vlan0.20`) by reading
+`<interfaces>` from `/conf/config.xml`, because tcpdump only knows device
+names. If you type a device name directly into the field it is passed
+through unchanged.
+
 ## Run the dashboard outside OPNsense
 
 The plugin's UI tab embeds the dashboard via an iframe. If your browser
