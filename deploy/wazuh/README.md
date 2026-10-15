@@ -124,6 +124,12 @@ sudo /var/ossec/bin/wazuh-logtest
  "severity": "high", "summary": "...", "detail": "...",
  "dedup_key": "bulk_inbound:192.168.10.22"}
 # expected: rule 100200 (anchor) + 100210 (bulk_inbound) match; level=11
+
+# and the empty-device_ip case:
+{"ts": 1.7e9, "device_ip": "", "kind": "capture_stalled",
+ "severity": "high", "summary": "...", "detail": "...",
+ "dedup_key": "capture_stalled"}
+# expected: rule 100206 (sensor anchor) + 100219 (capture_stalled) match; level=12
 ```
 
 For the syslog path:
@@ -140,6 +146,7 @@ sudo /var/ossec/bin/wazuh-logtest
 | ID | Level | What it matches |
 |----|-------|-----------------|
 | 100200 | 0  | anchor — any Hound JSON event with `kind`/`severity`/`device_ip` |
+| 100206 | 0  | sensor-level anchor — Hound JSON events with an empty `device_ip` (`capture_stalled`) |
 | 100201 | 3  | severity = info (fallback) |
 | 100202 | 5  | severity = low (fallback) |
 | 100203 | 8  | severity = medium (fallback) |
@@ -152,10 +159,21 @@ sudo /var/ossec/bin/wazuh-logtest
 | 100214 | 5  | kind = new_device — T1078 |
 | 100215 | 5  | kind = new_peer |
 | 100216 | 8  | kind = camera_offline — T1499 |
+| 100217 | 3  | kind = camera_recovered (camera visible again) — T1499 |
+| 100218 | 8  | kind = camera_never_seen (configured camera never observed) — T1499 |
+| 100219 | 12 | kind = capture_stalled (sensor blind, all detection stopped) — T1562.001 |
 | 100220 | 13 | 3+ bulk_inbound on same camera in 5 min — SUSTAINED |
 | 100221 | 13 | 3+ control_channel on same camera in 5 min — SUSTAINED |
+| 100222 | 13 | 3+ capture_stalled from one log source in 2h — FLAPPING capture |
 
 The 100200 range is operator-defined; renumber if you already use it.
+
+`capture_stalled` is the only kind whose `device_ip` is empty — the alert is
+about the sensor, not a camera — so it chains off anchor 100206 instead of
+100200 and its description never interpolates `$(device_ip)`. Rule 100222's
+2h window is sized for Hound's 1800s default `dedup_window_seconds`: three
+identical alerts cannot arrive closer than ~30 min apart, so the 5-min
+window used by the other correlation rules would never match.
 
 ## Active Response
 

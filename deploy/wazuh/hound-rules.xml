@@ -37,6 +37,18 @@
         <description>SurveillanceHound: event anchor</description>
     </rule>
 
+    <!-- Sensor-level anchor. `capture_stalled` is the one alert kind Hound
+         emits with device_ip="" — the event is about THIS SENSOR going
+         blind, not about a camera. An empty value does not satisfy the
+         100200 anchor's `device_ip` match, so sensor-level events get
+         their own anchor and must never interpolate $(device_ip). -->
+    <rule id="100206" level="0">
+        <decoded_as>json</decoded_as>
+        <field name="kind">^capture_stalled$</field>
+        <field name="severity">\.+</field>
+        <description>SurveillanceHound: sensor-level event anchor</description>
+    </rule>
+
     <!-- Severity-only fallbacks (used when no per-kind rule matches) -->
     <rule id="100201" level="3">
         <if_sid>100200</if_sid>
@@ -135,6 +147,39 @@
         <group>availability,</group>
     </rule>
 
+    <rule id="100217" level="3">
+        <if_sid>100200</if_sid>
+        <field name="kind">^camera_recovered$</field>
+        <description>SurveillanceHound: camera $(device_ip) visible again after an outage</description>
+        <mitre>
+            <id>T1499</id>
+        </mitre>
+        <group>availability,</group>
+    </rule>
+
+    <rule id="100218" level="8">
+        <if_sid>100200</if_sid>
+        <field name="kind">^camera_never_seen$</field>
+        <description>SurveillanceHound: configured camera $(device_ip) has never been observed — down, misaddressed, or out of this sensor's view</description>
+        <mitre>
+            <id>T1499</id>
+        </mitre>
+        <group>availability,</group>
+    </rule>
+
+    <!-- The sensor itself is blind: no packets at all. Ranked above the
+         per-camera availability rules because while this is active EVERY
+         other Hound detection is silent, including camera_offline. -->
+    <rule id="100219" level="12">
+        <if_sid>100206</if_sid>
+        <field name="kind">^capture_stalled$</field>
+        <description>SurveillanceHound: CAPTURE STALLED — no packets observed, the monitor is blind and all detection has stopped</description>
+        <mitre>
+            <id>T1562.001</id>
+        </mitre>
+        <group>availability,sensor_health,</group>
+    </rule>
+
     <!-- Correlation rule: repeated high-severity Hound alerts on one
          camera within 5 minutes suggests an active incident, not a
          false positive. Bump to level 13. -->
@@ -156,6 +201,29 @@
             <id>T1071</id>
         </mitre>
         <group>command_and_control,active_incident,</group>
+    </rule>
+
+    <!-- Flapping capture: the sensor has gone blind and come back more than
+         once. A single stall is a fault to fix; a repeating one usually
+         means a dying NIC, a mirror/SPAN port being reconfigured under
+         you, or a capture process that keeps crashing — i.e. detection
+         coverage is unreliable, not merely absent.
+
+         Timeframe is 2h deliberately: Hound's own dedup suppresses an
+         identical alert for `dedup_window_seconds` (default 1800), so
+         three capture_stalled notifications cannot arrive closer than
+         ~30 min apart and the 5-min window used by the rules above
+         would never fire. `same_location` keeps the count per log
+         source, so two sensors reporting to one manager don't add up
+         into a phantom flap. -->
+    <rule id="100222" level="13" frequency="3" timeframe="7200">
+        <if_matched_sid>100219</if_matched_sid>
+        <same_location />
+        <description>SurveillanceHound: capture FLAPPING — 3+ stalls in 2h, this sensor's coverage is unreliable</description>
+        <mitre>
+            <id>T1562.001</id>
+        </mitre>
+        <group>availability,sensor_health,active_incident,</group>
     </rule>
 
 </group>
