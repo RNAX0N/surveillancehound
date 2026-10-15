@@ -180,8 +180,21 @@ class Hound:
             self._begin_session(time.time())
             self._start_watchdog()
         clean = False
+        died = False
         try:
             self._loop(gen)
+            # A live capture whose generator simply ENDS has died — tcpdump
+            # exited and closed its stdout. Without this the daemon returns
+            # True ("clean"), the supervisor sees no reason to relaunch, and
+            # monitoring stops silently. The watchdog covers the wedged-but-
+            # alive case; this is the died-outright case.
+            if not self._replay and not self._stop_flag:
+                died = True
+                log.error(
+                    "capture ended unexpectedly (tcpdump alive=%s) — "
+                    "the monitor is blind", handle.is_alive(),
+                )
+                self._announce_capture_death()
             # drain everything on shutdown so nothing is lost. Sort by
             # last_ts so the baseliner sees flows in time order regardless of
             # dict-iteration order — anomaly detection is order-sensitive.
@@ -194,8 +207,8 @@ class Hound:
                     self.baseliner.flush(self.store)
                 if self.uptime is not None:
                     self.uptime.flush(self.store, self._now())
-            clean = True
-            return True
+            clean = not died
+            return not died
         finally:
             self._stop_flag = True
             if self._watchdog is not None:
@@ -381,6 +394,25 @@ class Hound:
         alert = self.alerts.new_device(ip, role, now)
         if alert is not None:
             self._emit(alert)
+
+    def _announce_capture_death(self) -> None:
+        """Tell the operator the capture died, through the normal channels.
+
+        Returning False to the supervisor is not enough on its own — if the
+        supervisor is a bare `hound run` in a terminal, or restarts into the
+        same failure, nobody is told. This routes through the same alert
+        path as a stall so it reaches every configured notify channel.
+        """
+        if self.uptime is None:
+            return
+        now = self._now()
+        last = self.uptime.last_packet_at or now
+        with self._loop_lock:
+            self._on_transition(Transition(
+                kind="stalled", camera_ip="", since=last,
+                duration=max(0.0, now - last), outage_id=None,
+                last_seen_before=0.0, role="",
+            ), now)
 
     def _on_transition(self, tr: Transition, now: float) -> None:
         """Handle one liveness transition from the uptime tracker."""

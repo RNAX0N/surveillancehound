@@ -609,6 +609,61 @@ def _check_watchdog_fires_when_capture_wedges(tmp: Path) -> None:
         daemon_mod._TICK_S = orig_tick
 
 
+def _check_capture_death_is_reported(tmp: Path) -> None:
+    """tcpdump exiting must not look like a clean shutdown.
+
+    When the capture process dies its stdout closes and the generator simply
+    ends. Reporting that as a clean run means the supervisor sees no reason
+    to relaunch and nobody is told the monitor went blind — the quietest
+    possible failure for a security sensor.
+    """
+    from surveillancehound import daemon as daemon_mod
+
+    class _DeadHandle:
+        def close(self) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return False
+
+    def _fake_stream(cfg, *, keep_raw=False, snaplen_override=None):
+        def _gen():
+            yield Packet(
+                ts=time.time(), src_ip=CAM, dst_ip="10.9.0.1",
+                src_port=554, dst_port=51000, proto="tcp",
+                length=800, tcp_flags="PA", raw_record=b"",
+            )
+            return  # tcpdump exited: stdout closed, generator ends
+        return _gen(), None, _DeadHandle()
+
+    orig = daemon_mod.stream_packets
+    daemon_mod.stream_packets = _fake_stream
+    try:
+        cfg = load_from_dict({
+            "capture": {"interface": "test0"},
+            "network": {"camera_ips": [CAM]},
+            "store": {"path": str(tmp / "death.sqlite")},
+            "notify": [{"type": "stdout", "level": "critical"}],
+        })
+        hound = daemon_mod.Hound(cfg)
+        ok = hound.run()
+        assert ok is False, "a dead capture reported a clean run"
+
+        store = _store(tmp, "death.sqlite")
+        try:
+            kinds = {a.kind for a in store.list_alerts(limit=50)}
+            assert "capture_stalled" in kinds, (
+                f"capture death was not announced to the operator: {kinds}"
+            )
+            session = store.current_monitor_session()
+            assert session.ended_at is not None, "session left open"
+        finally:
+            store.close()
+        print("  capture death: run() returns False and capture_stalled fires")
+    finally:
+        daemon_mod.stream_packets = orig
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -626,6 +681,7 @@ def main() -> int:
         _check_alerts(tmp)
         print("=== watchdog (daemon-level) ===")
         _check_watchdog_fires_when_capture_wedges(tmp)
+        _check_capture_death_is_reported(tmp)
     print("\nUPTIME VERIFICATION PASSED")
     return 0
 

@@ -119,6 +119,11 @@ class UptimeTracker:
     def stalled(self) -> bool:
         return self._stalled
 
+    @property
+    def last_packet_at(self) -> float:
+        """Timestamp of the most recent packet observed from any source."""
+        return self._last_packet_at
+
     # ----- lifecycle -----
 
     def bootstrap(
