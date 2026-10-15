@@ -22,3 +22,6 @@ dist/
 
 # local dev config (use hound.toml.example as the template)
 /hound.toml
+
+# Playwright MCP scratch output (screenshots, console logs)
+.playwright-mcp/
