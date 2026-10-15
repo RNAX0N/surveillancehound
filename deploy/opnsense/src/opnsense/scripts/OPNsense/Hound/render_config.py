@@ -141,6 +141,7 @@ def render(model_root: ET.Element, config_path: Path | None = None) -> str:
     w = model_root.find("web") or ET.Element("web")
     t = model_root.find("thresholds") or ET.Element("thresholds")
     u = model_root.find("uptime") or ET.Element("uptime")
+    r = model_root.find("relay") or ET.Element("relay")
 
     # the picker stores an alias; tcpdump needs the device behind it
     iface = resolve_interface(_xtext(g, "interface"), config_path)
@@ -151,6 +152,7 @@ def render(model_root: ET.Element, config_path: Path | None = None) -> str:
     cam_nets = _csv_to_array(_xtext(n, "camera_subnets"))
     nvr_ips = _csv_to_array(_xtext(n, "nvr_ips"))
     allow = _csv_to_array(_xtext(n, "manufacturer_allowlist"))
+    lan_nets = _csv_to_array(_xtext(n, "lan_subnets"))
 
     bp_enabled = _toml_bool(_xtext(b, "enabled", "0"))
     bp_z = _xtext(b, "z_threshold", "4.0")
@@ -205,6 +207,7 @@ def render(model_root: ET.Element, config_path: Path | None = None) -> str:
         f"camera_subnets         = {cam_nets}",
         f"nvr_ips                = {nvr_ips}",
         f"manufacturer_allowlist = {allow}",
+        f"lan_subnets            = {lan_nets}",
         "",
         "[thresholds]",
         f"silence_seconds = {float(silence_seconds)}",
@@ -252,7 +255,80 @@ def render(model_root: ET.Element, config_path: Path | None = None) -> str:
         "keep      = 5",
         "",
     ]
+    parts += _relay_lines(r)
     return "\n".join(parts)
+
+
+def _parse_sensors(raw: str) -> list[tuple[str, str]]:
+    """Parse the collector's sensor list: one `id = secret` per line.
+
+    A grid would mean an ArrayField plus five API endpoints; this stays
+    inside one textarea the renderer can validate. Malformed lines are
+    SKIPPED rather than guessed at — a half-parsed shared secret would
+    authenticate nothing and the 401 would be blamed on the agent.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in (raw or "").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        sep = "=" if "=" in line else (":" if ":" in line else "")
+        if not sep:
+            continue
+        sid, _, secret = line.partition(sep)
+        sid, secret = sid.strip(), secret.strip()
+        # A duplicate id would silently shadow the earlier secret, so the
+        # first one wins and the rest are dropped.
+        if not sid or not secret or sid in seen:
+            continue
+        seen.add(sid)
+        out.append((sid, secret))
+    return out
+
+
+def _relay_lines(r: ET.Element) -> list[str]:
+    """Render [relay]. Off emits nothing at all, so a box that never used
+    the feature produces exactly the file it produced before."""
+    mode = _xtext(r, "mode", "off").lower()
+    if mode not in ("agent", "collector"):
+        return []
+
+    lines = [
+        "# Multi-sensor relay. Configured in Services > SurveillanceHound.",
+        "[relay]",
+        f'mode = {_toml_quote(mode)}',
+    ]
+    if mode == "collector":
+        lines += [
+            f'listen_host = {_toml_quote(_xtext(r, "listen_host"))}',
+            f'listen_port = {int(_xtext(r, "listen_port", "18443"))}',
+            f'cert_file   = {_toml_quote(_xtext(r, "cert_file"))}',
+            f'key_file    = {_toml_quote(_xtext(r, "key_file"))}',
+            f'remote_retention_days = '
+            f'{float(_xtext(r, "remote_retention_days", "30.0"))}',
+            f'max_rows_per_sensor   = '
+            f'{int(_xtext(r, "max_rows_per_sensor", "250000"))}',
+            f'min_free_disk_mb      = '
+            f'{float(_xtext(r, "min_free_disk_mb", "256.0"))}',
+        ]
+        for sid, secret in _parse_sensors(_xtext(r, "sensors")):
+            lines += [
+                "",
+                "[[relay.sensor]]",
+                f"id  = {_toml_quote(sid)}",
+                f"key = {_toml_quote(secret)}",
+            ]
+    else:
+        lines += [
+            f'sensor_id = {_toml_quote(_xtext(r, "sensor_id"))}',
+            f'url       = {_toml_quote(_xtext(r, "url"))}',
+            f'key       = {_toml_quote(_xtext(r, "key"))}',
+            f'tls_fingerprint = '
+            f'{_csv_to_array(_xtext(r, "tls_fingerprint"))}',
+        ]
+    lines.append("")
+    return lines
 
 
 def main(argv: list[str]) -> int:

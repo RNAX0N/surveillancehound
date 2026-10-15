@@ -77,6 +77,57 @@ FIELDS: dict[str, dict] = {
         "check": lambda c: c.network.manufacturer_allowlist,
         "want": ["198.51.100.0/24"],
     },
+    "network.lan_subnets": {
+        "raw": "10.77.0.0/16,88.255.5.0/24",
+        "check": lambda c: [str(x) for x in c.network.lan_subnets],
+        "want": ["10.77.0.0/16", "88.255.5.0/24"],
+    },
+    # The combined fixture renders ONE config, and a relay is either an
+    # agent or a collector, never both. Collector fields assert; the
+    # agent-only fields below are coverage-only and are asserted by
+    # _check_relay_agent_round_trip against an agent-mode config.
+    "relay.mode": {
+        "raw": "collector", "check": lambda c: c.relay.mode,
+        "want": "collector",
+    },
+    "relay.listen_host": {
+        "raw": "10.77.0.250", "check": lambda c: c.relay.listen_host,
+        "want": "10.77.0.250",
+    },
+    "relay.listen_port": {
+        "raw": "19443", "check": lambda c: c.relay.listen_port, "want": 19443,
+    },
+    "relay.cert_file": {
+        "raw": "/var/lib/hound/t.crt", "check": lambda c: c.relay.cert_file,
+        "want": "/var/lib/hound/t.crt",
+    },
+    "relay.key_file": {
+        "raw": "/var/lib/hound/t.key", "check": lambda c: c.relay.key_file,
+        "want": "/var/lib/hound/t.key",
+    },
+    "relay.sensors": {
+        "raw": "frigate = top-secret-one",
+        "check": lambda c: [(x.id, x.key) for x in c.relay.sensors],
+        "want": [("frigate", "top-secret-one")],
+    },
+    "relay.remote_retention_days": {
+        "raw": "17.5", "check": lambda c: c.relay.remote_retention_days,
+        "want": 17.5,
+    },
+    "relay.max_rows_per_sensor": {
+        "raw": "4242", "check": lambda c: c.relay.max_rows_per_sensor,
+        "want": 4242,
+    },
+    "relay.min_free_disk_mb": {
+        "raw": "123.5", "check": lambda c: c.relay.min_free_disk_mb,
+        "want": 123.5,
+    },
+    "relay.sensor_id": {"raw": "edge-box"},
+    "relay.url": {"raw": "https://10.77.0.250:19443/ingest/v1"},
+    "relay.key": {"raw": "agent-secret"},
+    "relay.tls_fingerprint": {
+        "raw": "sha256:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+    },
     "thresholds.silence_seconds": {
         "raw": "777", "check": lambda c: c.thresholds.silence_seconds,
         "want": 777.0,
@@ -387,10 +438,89 @@ def _check_enable_is_wired() -> None:
     print("  enable: ticking Enable sets hound_enable and starts the service")
 
 
+def _check_relay_agent_round_trip() -> None:
+    """Agent mode, and the off case.
+
+    The combined fixture can only render one role at a time, so the
+    agent-only fields would otherwise be inventory-covered but never
+    actually exercised — which is precisely how a form field ends up
+    decorative.
+    """
+    mod = _load_renderer()
+    import xml.etree.ElementTree as ET
+
+    def _render(relay_xml: str) -> str:
+        root = ET.fromstring(
+            "<Hound><general><interface>vlan0.77</interface>"
+            "<snaplen>96</snaplen></general>"
+            "<network><camera_ips>10.77.0.1</camera_ips>"
+            "<lan_subnets>10.77.0.0/16</lan_subnets></network>"
+            "<thresholds><silence_seconds>600.0</silence_seconds></thresholds>"
+            "<uptime><enabled>1</enabled></uptime>"
+            f"{relay_xml}</Hound>"
+        )
+        return mod.render(root, config_path=None)
+
+    toml_text = _render(
+        "<relay><mode>agent</mode><sensor_id>edge-box</sensor_id>"
+        "<url>https://10.77.0.250:19443/ingest/v1</url>"
+        "<key>agent-secret</key>"
+        "<tls_fingerprint>sha256:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77"
+        ":88:99</tls_fingerprint></relay>"
+    )
+    cfg = load_from_dict(tomllib.loads(toml_text))
+    assert cfg.relay.mode == "agent", cfg.relay.mode
+    assert cfg.relay.sensor_id == "edge-box", cfg.relay.sensor_id
+    assert cfg.relay.url == "https://10.77.0.250:19443/ingest/v1", cfg.relay.url
+    assert cfg.relay.key == "agent-secret", "the shared secret must survive"
+    assert len(cfg.relay.tls_fingerprint) == 1, (
+        "the pin is the whole trust decision in agent mode; losing it in "
+        "the renderer would leave the agent unable to connect at all"
+    )
+
+    # Off must emit no [relay] whatsoever, so a box that never touched the
+    # feature renders the same file it rendered before relay existed.
+    off = _render("<relay><mode>off</mode></relay>")
+    assert "[relay]" not in off, "mode=off must not emit a [relay] table"
+    load_from_dict(tomllib.loads(off))
+
+    # Sensor-list parsing: the collector's authorisation list. A line that
+    # cannot be parsed must be DROPPED, never guessed at — a half-read
+    # secret authenticates nothing and the 401 gets blamed on the agent.
+    parsed = mod._parse_sensors(
+        "frigate = secret-one\n"
+        "# comment\n"
+        "garage : secret-two\n"
+        "frigate = shadowing-duplicate\n"
+        "no-separator-here\n"
+        "   \n"
+        "trailing = secret-three  "
+    )
+    assert parsed == [
+        ("frigate", "secret-one"),
+        ("garage", "secret-two"),
+        ("trailing", "secret-three"),
+    ], parsed
+
+    collector = _render(
+        "<relay><mode>collector</mode><listen_host>10.77.0.250</listen_host>"
+        "<listen_port>19443</listen_port>"
+        "<cert_file>/var/lib/hound/t.crt</cert_file>"
+        "<key_file>/var/lib/hound/t.key</key_file>"
+        "<sensors>a = one\nb = two</sensors></relay>"
+    )
+    ccfg = load_from_dict(tomllib.loads(collector))
+    assert [(x.id, x.key) for x in ccfg.relay.sensors] == [
+        ("a", "one"), ("b", "two")], ccfg.relay.sensors
+    print("  relay: agent/collector/off all render and parse; sensor list "
+          "drops malformed and duplicate entries")
+
+
 def main() -> int:
     print("=== OPNsense field wiring ===")
     _check_inventories()
     _check_round_trip()
+    _check_relay_agent_round_trip()
     _check_interface_is_resolved()
     _check_ui_endpoints_exist()
     _check_enable_is_wired()

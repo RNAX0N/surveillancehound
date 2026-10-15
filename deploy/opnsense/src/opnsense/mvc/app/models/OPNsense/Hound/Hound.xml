@@ -42,6 +42,11 @@
                 <Mask>/^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(\/(3[0-2]|[12]?\d))?|[0-9A-Fa-f:]+(\/(12[0-8]|1[01]\d|[1-9]?\d))?)$/u</Mask>
                 <ValidationMessage>Enter CIDR ranges such as 203.0.113.0/24. Hostnames are not supported.</ValidationMessage>
             </manufacturer_allowlist>
+            <lan_subnets type="CSVListField">
+                <Required>N</Required>
+                <Mask>/^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(\/(3[0-2]|[12]?\d))?|[0-9A-Fa-f:]+(\/(12[0-8]|1[01]\d|[1-9]?\d))?)$/u</Mask>
+                <ValidationMessage>Enter CIDR ranges such as 192.168.0.0/16. Leave empty to use RFC-1918 only. Add a tunnel or carrier range here if your collector sits on one that looks public but is genuinely yours.</ValidationMessage>
+            </lan_subnets>
         </network>
         <thresholds>
             <silence_seconds type="NumericField">
@@ -126,5 +131,87 @@
                 <Mask>/^([\/].*|)$/u</Mask>
             </key_file>
         </web>
+        <relay>
+            <mode type="OptionField">
+                <default>off</default>
+                <Required>Y</Required>
+                <OptionValues>
+                    <off>Off (single sensor)</off>
+                    <collector>Collector (receive from agents)</collector>
+                    <agent>Agent (send to a collector)</agent>
+                </OptionValues>
+                <ValidationMessage>Choose a relay role.</ValidationMessage>
+            </mode>
+            <listen_host type="TextField">
+                <Required>N</Required>
+                <Mask>/^(|(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}|[0-9A-Fa-f:]+)$/u</Mask>
+                <ValidationMessage>A specific address to listen on. 0.0.0.0 is refused on purpose - name the interface address that faces your sensors.</ValidationMessage>
+            </listen_host>
+            <listen_port type="IntegerField">
+                <default>18443</default>
+                <Required>N</Required>
+                <MinimumValue>1</MinimumValue>
+                <MaximumValue>65535</MaximumValue>
+                <ValidationMessage>Port 1-65535.</ValidationMessage>
+            </listen_port>
+            <cert_file type="TextField">
+                <default>/var/lib/hound/hound-ingest.crt</default>
+                <Required>N</Required>
+                <Mask>/^(|\/[\w.\-\/]+)$/u</Mask>
+                <ValidationMessage>Absolute path to the ingest certificate.</ValidationMessage>
+            </cert_file>
+            <key_file type="TextField">
+                <default>/var/lib/hound/hound-ingest.key</default>
+                <Required>N</Required>
+                <Mask>/^(|\/[\w.\-\/]+)$/u</Mask>
+                <ValidationMessage>Absolute path to the ingest private key.</ValidationMessage>
+            </key_file>
+            <sensors type="TextField">
+                <Required>N</Required>
+                <Mask>/^[\w\-. =:,\r\n+\/]*$/u</Mask>
+                <ValidationMessage>One sensor per line, as "id = shared-secret".</ValidationMessage>
+            </sensors>
+            <remote_retention_days type="NumericField">
+                <default>30.0</default>
+                <Required>N</Required>
+                <MinimumValue>0.0</MinimumValue>
+                <MaximumValue>3650.0</MaximumValue>
+                <ValidationMessage>Days of relayed history to keep (0 keeps forever).</ValidationMessage>
+            </remote_retention_days>
+            <max_rows_per_sensor type="IntegerField">
+                <default>250000</default>
+                <Required>N</Required>
+                <MinimumValue>0</MinimumValue>
+                <MaximumValue>100000000</MaximumValue>
+                <ValidationMessage>Row cap per sensor per table (0 disables).</ValidationMessage>
+            </max_rows_per_sensor>
+            <min_free_disk_mb type="NumericField">
+                <default>256.0</default>
+                <Required>N</Required>
+                <MinimumValue>0.0</MinimumValue>
+                <MaximumValue>1048576.0</MaximumValue>
+                <ValidationMessage>Refuse ingest below this much free disk (0 disables).</ValidationMessage>
+            </min_free_disk_mb>
+            <sensor_id type="TextField">
+                <Required>N</Required>
+                <Mask>/^[\w\-.]*$/u</Mask>
+                <ValidationMessage>Letters, digits, dash, dot and underscore only.</ValidationMessage>
+            </sensor_id>
+            <url type="TextField">
+                <Required>N</Required>
+                <Mask>/^(|https:\/\/[\w.\-:\[\]]+\/[\w.\-\/]*)$/u</Mask>
+                <ValidationMessage>The collector ingest URL, e.g. https://10.0.0.1:18443/ingest/v1 - must be https and an IP literal.</ValidationMessage>
+            </url>
+            <key type="TextField">
+                <Required>N</Required>
+                <Mask>/^[\w\-.~+\/=]*$/u</Mask>
+                <ValidationMessage>The shared secret this agent signs with.</ValidationMessage>
+            </key>
+            <tls_fingerprint type="CSVListField">
+                <Required>N</Required>
+                <Mask>/^(sha256:)?[0-9A-Fa-f:]{32,}$/u</Mask>
+                <ValidationMessage>The collector certificate fingerprint, e.g. sha256:AB:CD:... Run "hound relay" on the collector to print it.</ValidationMessage>
+            </tls_fingerprint>
+        </relay>
     </items>
 </model>
