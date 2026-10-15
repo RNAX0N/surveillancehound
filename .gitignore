@@ -25,7 +25,3 @@ dist/
 
 # Playwright MCP scratch output (screenshots, console logs)
 .playwright-mcp/
-
-# local working notes — not part of the shipped project
-
-/docs/
