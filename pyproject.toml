@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "surveillancehound"
-version = "0.1.1"
+version = "0.1.2"
 description = "Always-running NVR / IP-camera network monitor — logs and flags anomalous traffic on the surveillance segment."
 requires-python = ">=3.11"
 readme = "README.md"

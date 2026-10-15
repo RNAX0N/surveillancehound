@@ -279,10 +279,12 @@ $(document).ready(function() {
                     <tbody></tbody>
                 </table>
             </div>
+            <br/>
             <div class="text-muted">
                 {{ lang._('Liveness is inferred from traffic observed on the monitored interface, not from active probing. A camera that is powered but no longer visible to this sensor reads the same as one that is off. Availability counts only time the monitor was running; it shows n/a rather than a figure invented from no observation.') }}
             </div>
 
+            <br/>
             <h4>{{ lang._('Recent alerts') }}</h4>
             <div class="table-responsive">
                 <table class="table table-striped table-condensed" id="tbl-alerts">
@@ -299,6 +301,7 @@ $(document).ready(function() {
                 </table>
             </div>
 
+            <br/>
             <h4>{{ lang._('Recent flows') }}</h4>
             <div class="table-responsive">
                 <table class="table table-striped table-condensed" id="tbl-flows">
