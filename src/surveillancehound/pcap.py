@@ -20,7 +20,7 @@ parser handles offline replay and live monitoring.
 
 Not supported (a packet hitting one of these is skipped, counted, and the
 count surfaced — never silently dropped): IPv6 extension-header chains beyond
-the first next-header, SLL2, exotic link types, truncated records.
+the first next-header, exotic link types, truncated records.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ LINKTYPE_NULL = 0
 LINKTYPE_ETHERNET = 1
 LINKTYPE_RAW = 101
 LINKTYPE_LINUX_SLL = 113
+LINKTYPE_LINUX_SLL2 = 276
 LINKTYPE_IPV4 = 228
 LINKTYPE_IPV6 = 229
 
@@ -316,11 +317,37 @@ def _parse_link(linktype: int, data: bytes, ts: float) -> Packet | None:
         if len(data) < 16:
             return None
         ethertype = struct.unpack(">H", data[14:16])[0]
-        if ethertype == 0x0800:
-            return _parse_ipv4(data[16:], ts)
-        if ethertype == 0x86DD:
-            return _parse_ipv6(data[16:], ts)
-        return None
+        return _parse_sll_payload(ethertype, data[16:], ts)
+    if linktype == LINKTYPE_LINUX_SLL2:
+        # Linux "cooked" v2, the DEFAULT for `tcpdump -i any` since libpcap
+        # 1.10. Without this, an agent told to watch every VLAN interface at
+        # once parses zero packets and reports a perfectly healthy, totally
+        # empty segment — the worst possible failure for a monitor.
+        #
+        # 20-byte header: protocol u16be, reserved u16, ifindex u32,
+        # ARPHRD u16, pkt type u8, lladdr len u8, lladdr[8].
+        if len(data) < 20:
+            return None
+        ethertype = struct.unpack(">H", data[:2])[0]
+        return _parse_sll_payload(ethertype, data[20:], ts)
+    return None
+
+
+def _parse_sll_payload(ethertype: int, rest: bytes, ts: float) -> Packet | None:
+    """Shared tail for both cooked-capture encapsulations.
+
+    A VLAN tag can still appear inside a cooked frame when the capture is on
+    a parent interface, so handle one level of 802.1Q here too.
+    """
+    if ethertype == 0x8100:  # one level of 802.1Q
+        if len(rest) < 4:
+            return None
+        ethertype = struct.unpack(">H", rest[2:4])[0]
+        rest = rest[4:]
+    if ethertype == 0x0800:
+        return _parse_ipv4(rest, ts)
+    if ethertype == 0x86DD:
+        return _parse_ipv6(rest, ts)
     return None
 
 

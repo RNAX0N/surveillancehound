@@ -87,6 +87,63 @@ def _check_lan_subnets() -> None:
     print("  lan_subnets: widens 'local' without changing the default")
 
 
+def _check_cooked_capture_linktypes() -> None:
+    """`tcpdump -i any` must actually parse.
+
+    An agent watching a host with one VLAN interface per camera is told to
+    capture on `any`. Since libpcap 1.10 that device defaults to LINUX_SLL2
+    (DLT 276), not SLL. Without SLL2 support every packet is skipped and the
+    sensor reports a perfectly healthy, completely empty segment — the worst
+    failure mode available to a monitor, because nothing looks wrong.
+    """
+    import io
+    import socket
+    import struct
+
+    from surveillancehound.pcap import (
+        LINKTYPE_ETHERNET, LINKTYPE_LINUX_SLL, LINKTYPE_LINUX_SLL2,
+        read_packets_from_stream,
+    )
+
+    def ipv4_tcp(src, dst, sport, dport, payload=20):
+        ip = struct.pack(
+            ">BBHHHBBH4s4s", 0x45, 0, 20 + 20 + payload, 1, 0, 64, 6, 0,
+            socket.inet_aton(src), socket.inet_aton(dst),
+        )
+        tcp = struct.pack(">HHIIBBHHH", sport, dport, 1, 0, 5 << 4, 0x10, 8192, 0, 0)
+        return ip + tcp + b"\x00" * payload
+
+    def one_packet_pcap(linktype, frame):
+        out = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, linktype)
+        return out + struct.pack("<IIII", 1000, 0, len(frame), len(frame)) + frame
+
+    pkt = ipv4_tcp("10.0.0.5", "10.0.0.9", 554, 40000)
+    cases = [
+        ("SLL2", LINKTYPE_LINUX_SLL2,
+         struct.pack(">HHIHBB", 0x0800, 0, 3, 1, 0, 6) + b"\xaa" * 8 + pkt),
+        ("SLL2+802.1Q", LINKTYPE_LINUX_SLL2,
+         struct.pack(">HHIHBB", 0x8100, 0, 3, 1, 0, 6) + b"\xaa" * 8
+         + struct.pack(">HH", 0x0064, 0x0800) + pkt),
+        ("SLL", LINKTYPE_LINUX_SLL,
+         struct.pack(">HHH", 0, 1, 6) + b"\xaa" * 8 + struct.pack(">H", 0x0800) + pkt),
+        ("Ethernet", LINKTYPE_ETHERNET,
+         b"\x11" * 6 + b"\x22" * 6 + struct.pack(">H", 0x0800) + pkt),
+    ]
+    for name, linktype, frame in cases:
+        gen, stats = read_packets_from_stream(
+            io.BytesIO(one_packet_pcap(linktype, frame)),
+        )
+        got = list(gen)
+        assert len(got) == 1, (
+            f"{name}: parsed {len(got)} packets, skipped {stats.packets_skipped} "
+            f"— a capture on this link type would see nothing"
+        )
+        assert got[0].src_ip == "10.0.0.5" and got[0].dst_port == 40000, (
+            f"{name}: wrong fields {got[0]}"
+        )
+    print(f"  link types: {len(cases)} cooked/ethernet encapsulations parse")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -205,6 +262,7 @@ def main() -> int:
 
         store.close()
         _check_lan_subnets()
+        _check_cooked_capture_linktypes()
         print("\nHOUND END-TO-END VERIFICATION PASSED")
     return 0
 
