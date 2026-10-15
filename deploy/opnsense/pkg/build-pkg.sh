@@ -82,6 +82,11 @@ mkdir -p "$STAGE/usr/local/bin"
 cat > "$STAGE/usr/local/bin/hound" <<'WRAP'
 #!/bin/sh
 # SurveillanceHound CLI (packaged). Bundled sources live under /usr/local/share/hound/lib.
+# service(8) execs rc scripts with `env -i ... PATH=/sbin:/bin:/usr/sbin:/usr/bin`,
+# which omits /usr/local/bin — where FreeBSD/OPNsense installs python3. Without
+# this prepend `service hound start` dies in a daemon(8) restart loop logging
+# "python 3.11+ not found" even though python3 is installed.
+PATH="/usr/local/bin:/usr/local/sbin:$PATH"; export PATH
 PY=""
 for c in python3.11 python3.12 python3.13 python3; do
     if command -v "$c" >/dev/null 2>&1; then PY=$(command -v "$c"); break; fi
@@ -89,6 +94,28 @@ done
 [ -n "$PY" ] || { echo "hound: python 3.11+ not found (pkg install python311)" >&2; exit 1; }
 exec env PYTHONPATH=/usr/local/share/hound/lib "$PY" -m surveillancehound.cli "$@"
 WRAP
+
+# 4) OPNsense plugin metadata → /usr/local/opnsense/version/hound
+# Load-bearing, not cosmetic: firmware/register.php's plugins_disk_get() globs
+# /usr/local/opnsense/version/* and only registers a plugin in config.xml
+# (system/firmware/plugins) when a file there carries product_id == the package
+# name. Without it `register.php install os-hound` is a no-op, the plugin never
+# becomes "configured", the Plugins UI labels it "(orphaned)", and
+# firmware/sync.subr.sh will NOT reinstall it after a firmware upgrade — i.e.
+# the whole durability claim of a subscribed repo silently does not apply.
+mkdir -p "$STAGE/usr/local/opnsense/version"
+PRODUCT_ABI=$(opnsense-version -a 2>/dev/null || echo "")
+cat > "$STAGE/usr/local/opnsense/version/hound" <<META
+{
+    "product_abi": "${PRODUCT_ABI}",
+    "product_arch": "$(uname -p)",
+    "product_email": "${MAINTAINER}",
+    "product_id": "${PKGNAME}",
+    "product_name": "hound",
+    "product_version": "${VERSION}",
+    "product_website": "${WWW}"
+}
+META
 
 # strip caches + set exec bits (pkg captures on-disk modes)
 find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} +
