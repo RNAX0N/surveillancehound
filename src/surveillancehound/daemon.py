@@ -78,6 +78,9 @@ _RELAY_ALERT_QUEUE = 1000
 # Per batch, independent of the queue: one batch should not be able to
 # consume the whole queue and starve every other sensor.
 _RELAY_ALERTS_PER_BATCH = 200
+# How often to retry a listener that could not bind. The address may come
+# up after the daemon does; a first failure is not a permanent one.
+_INGEST_REBIND_EVERY_S = 60.0
 
 
 @dataclass
@@ -170,6 +173,7 @@ class Hound:
         # collector's disk finite; without this sweep `remote_retention_days`
         # is a config field that does nothing.
         self._last_remote_prune = 0.0
+        self._last_ingest_bind_try = 0.0
         # Bounded hand-off from the ingest threads to one dispatch worker.
         self._relay_alertq: queue.Queue | None = (
             queue.Queue(maxsize=_RELAY_ALERT_QUEUE)
@@ -418,6 +422,25 @@ class Hound:
             self.baseliner.maybe_flush(self.store, now)
         # 4) age out relayed rows (collector only, hourly)
         self._maybe_prune_remote(now)
+        # 5) retry a listener that could not bind at startup
+        self._maybe_retry_ingest_bind(now)
+
+    def _maybe_retry_ingest_bind(self, now: float) -> None:
+        """Retry binding the ingest listener.
+
+        The listen address may legitimately not exist yet when the daemon
+        starts — on a firewall the interface can come up after the service
+        does. Treating the first failure as final meant the collector
+        silently never listened for the life of the process, which is the
+        worst outcome: the UI says collector, and nothing arrives.
+        """
+        if self.ingest is None or self.ingest.started:
+            return
+        if (now - self._last_ingest_bind_try) < _INGEST_REBIND_EVERY_S:
+            return
+        self._last_ingest_bind_try = now
+        if self.ingest.start():
+            log.info("relay: ingest listener bound on a retry")
 
     def _maybe_prune_remote(self, now: float) -> None:
         """Age out relayed rows on an hourly cadence.
@@ -629,8 +652,14 @@ class Hound:
         now = time.time()
         window = self.cfg.alerts.dedup_window_seconds
         key = f"{sensor_id}/{raw['dedup_key']}"
-        last = self.store.remote_alert_last_at(sensor_id, raw["dedup_key"])
-        if last is not None and (now - last) < window and raw["ts"] <= last:
+        # Exclude this alert: the listener already stored the batch, so
+        # without the exclusion it is compared against itself and nothing
+        # is ever notified. The window is measured against when WE
+        # received the previous one, never against the sensor-supplied ts.
+        last = self.store.remote_alert_last_at(
+            sensor_id, raw["dedup_key"], exclude_remote_id=raw["remote_id"],
+        )
+        if last is not None and (now - last) < window:
             return
         alert = Alert(
             ts=raw["ts"], device_ip=raw["device_ip"], kind=raw["kind"],

@@ -403,10 +403,22 @@ def _check_remote_store(tmp: Path) -> None:
             "as inventing one from no observation"
         )
 
-        # dedup lookups are scoped to remote_alerts
-        assert store.remote_alert_last_at(
-            "frigate", "camera_offline:117.111.101.2:1") == T0
+        # Dedup lookups are scoped to remote_alerts, and report when WE
+        # received the alert rather than the ts the sensor claimed —
+        # otherwise backdating an alert walks it past the dedup window.
+        key = "camera_offline:117.111.101.2:1"
+        assert store.remote_alert_last_at("frigate", key) == T0 + 100, (
+            "dedup must key on ingested_at (collector time), not the "
+            "sensor-supplied ts"
+        )
         assert store.remote_alert_last_at("frigate", "nope") is None
+        # Excluding the row under consideration is what stops an alert
+        # being compared against itself and suppressed forever.
+        only_id = store._conn.execute(
+            "SELECT remote_id FROM remote_alerts WHERE dedup_key = ?",
+            (key,)).fetchone()["remote_id"]
+        assert store.remote_alert_last_at(
+            "frigate", key, exclude_remote_id=only_id) is None
 
         gone = store.forget_remote_sensor("frigate")
         assert gone["remote_sensors"] == 1 and store.list_remote_sensors() == []
@@ -1188,6 +1200,50 @@ def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
         )
         assert "refused" in failed[0]["error"], failed[0]["error"]
 
+
+        # A FRESH relayed alert MUST be notified. The listener stores the
+        # batch before dispatching, so a dedup gate that does not exclude
+        # the alert under consideration compares it against itself and
+        # suppresses everything. On a collector — the only host that
+        # notifies at all — that silently disables relayed alerting while
+        # the dashboard still looks correct.
+        import time as _time
+        class _Count:
+            type, level = "stdout", "info"
+            n = 0
+
+            def dispatch(self, alert):
+                _Count.n += 1
+
+        hound.dispatcher.channels = [_Count()]
+        real_now = _time.time()
+
+        def _fresh(rid, ts, key="camera_offline:10.9.0.7"):
+            r = V.validate_records({"alerts": [{
+                "remote_id": rid, "ts": ts, "device_ip": "10.9.0.7",
+                "kind": "camera_offline", "severity": "high",
+                "summary": "down", "detail": "", "dedup_key": key,
+            }]}, 100)
+            store.ingest_remote_batch("frigate", "inst", 50 + rid, r, real_now)
+            before_n = _Count.n
+            hound._dispatch_relayed_alert("frigate", r["alerts"][0])
+            return _Count.n > before_n
+
+        assert _fresh(201, real_now) is True, (
+            "a fresh relayed alert must be notified; the collector is the "
+            "only host that notifies, so suppressing it pages nobody"
+        )
+        assert _fresh(202, real_now) is False, (
+            "an immediate repeat of the same dedup_key must be suppressed"
+        )
+        # Dedup must use OUR receipt time, not the sensor-supplied ts, or
+        # backdating an alert walks it straight past the window.
+        assert _fresh(203, real_now - 108_000) is False, (
+            "a backdated duplicate must still be suppressed — dedup keyed "
+            "on the sensor-supplied ts is attacker-controlled"
+        )
+        print("  relayed dispatch: fresh alerts notify, repeats suppress, "
+              "backdating cannot bypass the window")
 
         # The ingest thread must only ENQUEUE. Dispatching inline would let
         # one authenticated batch hold an ingest thread for as long as its

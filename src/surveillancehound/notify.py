@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import smtplib
+import threading
 import socket
 import time
 import urllib.error
@@ -446,6 +447,13 @@ class Dispatcher:
     ) -> None:
         self.channels = channels
         self.store = store
+        # Local alerts dispatch from the packet/tick path; relayed alerts
+        # dispatch from the relay worker thread. The channels were written
+        # when only one caller existed: `_maybe_rotate` is a check-then-
+        # rename, so two threads crossing max_bytes together both rotate
+        # and one clobbers the other's .1 file, losing the alert lines a
+        # SIEM tails. Appends can interleave mid-line for the same reason.
+        self._lock = threading.Lock()
 
     def dispatch(self, alert: Alert, alert_id: int | None,
                  on_attempt=None) -> list[str]:
@@ -463,6 +471,10 @@ class Dispatcher:
         columns decorative.
         """
         delivered: list[str] = []
+        with self._lock:
+            return self._dispatch_locked(alert, alert_id, on_attempt, delivered)
+
+    def _dispatch_locked(self, alert, alert_id, on_attempt, delivered):
         for ch in self.channels:
             if not _passes_level(alert.severity, ch.level):
                 continue

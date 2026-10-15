@@ -1147,19 +1147,36 @@ class HoundStore:
         counts["trimmed"] = trimmed
         return counts
 
-    def remote_alert_last_at(self, sensor_id: str, dedup_key: str) -> float | None:
+    def remote_alert_last_at(self, sensor_id: str, dedup_key: str,
+                             exclude_remote_id: int | None = None) -> float | None:
         """Dedup lookup for relayed alerts — against remote_alerts only.
 
         Evaluating a relayed alert against the local `alerts` table would let
         a relayed alert suppress a local one.
+
+        Two things here are deliberate and were both bugs before:
+
+        `exclude_remote_id` omits the alert being considered. The listener
+        writes the batch BEFORE handing it to dispatch, so without this the
+        alert is compared against itself, is always "a duplicate of
+        something seen just now", and is never notified. On a collector —
+        the only host that notifies at all — that silently disables
+        notification for every relayed alert.
+
+        The comparison is on `ingested_at`, not `ts`. `ts` is supplied by
+        the sensor, so dedup keyed on it is attacker-controlled: backdating
+        an alert walks it straight past a window measured against the
+        collector's clock. `ingested_at` is when WE received it.
         """
+        sql = """SELECT MAX(ingested_at) AS t FROM remote_alerts
+                  WHERE sensor_id = ? AND dedup_key = ?"""
+        args: list = [sensor_id, dedup_key]
+        if exclude_remote_id is not None:
+            sql += " AND remote_id != ?"
+            args.append(int(exclude_remote_id))
         with self._lock:
-            r = self._conn.execute(
-                """SELECT MAX(ts) AS ts FROM remote_alerts
-                   WHERE sensor_id = ? AND dedup_key = ?""",
-                (sensor_id, dedup_key),
-            ).fetchone()
-        return r["ts"] if r is not None and r["ts"] is not None else None
+            r = self._conn.execute(sql, tuple(args)).fetchone()
+        return r["t"] if r is not None and r["t"] is not None else None
 
     def record_remote_notification(
         self, sensor_id: str, remote_alert_id: int, channel_type: str,

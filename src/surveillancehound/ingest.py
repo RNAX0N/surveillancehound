@@ -60,10 +60,30 @@ class _RateLimiter:
             if len(q) >= self.per_minute:
                 return False
             q.append(now)
-            if len(self._hits) > 1024:          # bound the keyspace itself
-                for k in [k for k, v in self._hits.items() if not v][:512]:
-                    del self._hits[k]
+            if len(self._hits) > 1024:
+                self._sweep(now)
             return True
+
+    def _sweep(self, now: float) -> None:
+        """Drop keys whose window has fully expired.
+
+        Sweeping only EMPTY deques was not a bound: a deque is only
+        emptied when that same source is seen again, so a one-shot source
+        leaves a permanently non-empty entry. Anyone with a large address
+        range — a /64 of IPv6 is free — grows the dict without limit by
+        sending one request per address. Expiry has to be judged by the
+        timestamps, not by emptiness.
+        """
+        stale = [k for k, v in self._hits.items()
+                 if not v or (now - v[-1]) > 60.0]
+        for k in stale:
+            del self._hits[k]
+        if len(self._hits) > 4096:
+            # Still oversized: a genuine flood from many live sources.
+            # Keep the most recent and let the rest re-register; the
+            # alternative is unbounded growth driven by a remote peer.
+            for k in sorted(self._hits, key=lambda k: self._hits[k][-1])[:2048]:
+                del self._hits[k]
 
 
 class IngestServer:
@@ -152,8 +172,32 @@ class IngestServer:
     def handle_batch(self, source: str, body: bytes, headers) -> tuple[int, dict]:
         now = self.now()
 
-        sensor_hint = headers.get(relay.SENSOR_HEADER, "")
+        sensor_hint = str(headers.get(relay.SENSOR_HEADER, ""))[:128]
         signature = headers.get(relay.SIG_HEADER, "")
+
+        # AUTHENTICATE BEFORE PARSING.
+        #
+        # json.loads on an 8 MB body can allocate a couple of hundred MB —
+        # `[[],[],...]` is ~24x amplification — and this process is also
+        # doing packet capture, so an OOM kill stops the monitor. Parsing
+        # first meant any peer who could reach the port could do that
+        # without holding a key at all. The HMAC is over the raw bytes, so
+        # it does not need the parse; the header only selects which key to
+        # try, and the signed body is still checked against it below.
+        key = self.cfg.key_for(sensor_hint)
+        if key is None:
+            # Burn a comparable HMAC anyway. Returning early on an unknown
+            # id makes "unknown sensor" measurably faster than "bad
+            # signature", which is the oracle the shared 401 exists to
+            # avoid.
+            relay.verify("\x00" * 32, body, signature)
+            ok = False
+        else:
+            ok = relay.verify(key, body, signature)
+        if not ok:
+            log.warning("relay: rejected batch from %s (sensor=%r)",
+                        source, sensor_hint[:64])
+            return HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"}
 
         try:
             doc = validate.loads_strict(body)
@@ -169,21 +213,13 @@ class IngestServer:
             }
 
         sensor_id = str(doc.get("sensor_id", ""))
-        # The signed body is authoritative. Without this check a holder of
-        # one sensor's key could set the header to their own id (so the
-        # right key verifies) and claim another sensor's in the body.
-        if sensor_hint and sensor_hint != sensor_id:
+        # The signed body remains authoritative. Without this a holder of
+        # one sensor's key could put their own id in the header (so their
+        # key verifies) and another sensor's id in the body.
+        if sensor_id != sensor_hint:
             return HTTPStatus.BAD_REQUEST, {
                 "error": "sensor id in the header does not match the signed body",
             }
-
-        key = self.cfg.key_for(sensor_id)
-        if key is None or not relay.verify(key, body, signature):
-            # One status for both, deliberately: distinguishing "unknown
-            # sensor" from "bad signature" is a probing oracle.
-            log.warning("relay: rejected batch from %s (sensor=%r)",
-                        source, sensor_id[:64])
-            return HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"}
 
         sent_at = doc.get("sent_at")
         if not isinstance(sent_at, (int, float)):
@@ -281,10 +317,40 @@ class _Server(ThreadingHTTPServer):
         log.debug("ingest: connection from %s failed", client_address,
                   exc_info=True)
 
-    # Bounded backlog; the handler timeout below bounds how long any one
-    # connection can occupy a thread.
+    # The LISTEN backlog — how many connections the kernel queues before
+    # we accept them. It is NOT a bound on worker threads; see max_workers.
     request_queue_size = 16
     allow_reuse_address = True
+
+    # ThreadingHTTPServer spawns one thread per connection with no ceiling,
+    # so anyone who can reach the port can exhaust threads and memory
+    # without ever authenticating. This daemon is also doing packet
+    # capture, so the ceiling keeps that failure on the relay.
+    max_workers = 32
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._slots = threading.BoundedSemaphore(self.max_workers)
+        self.rejected_overload = 0
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.rejected_overload += 1
+            log.warning(
+                "relay: refusing a connection from %s — all %d ingest "
+                "workers are busy. Agents retry from their spool, so this "
+                "costs a delay, not data.",
+                client_address[0] if client_address else "?", self.max_workers,
+            )
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
@@ -299,6 +365,13 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             # Wrap per connection, not on the listening socket: wrapping the
             # listener runs the handshake on the accept thread, so one
             # dribbled ClientHello blocks every other sensor.
+            #
+            # The timeout goes on BEFORE the handshake. wrap_socket() on a
+            # blocking socket blocks indefinitely, so setting it afterwards
+            # bounds only the request — a peer that opens a connection,
+            # sends one byte and stops would pin a worker thread forever
+            # without ever authenticating or reaching the rate limiter.
+            self.request.settimeout(self.timeout)
             self.connection = ctx.wrap_socket(self.request, server_side=True)
             self.request = self.connection
             self.connection.settimeout(self.timeout)
