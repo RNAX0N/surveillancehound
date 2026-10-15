@@ -223,7 +223,7 @@ many `[[notify]]` blocks as you want, each with its own minimum severity.
 
 ## Tests
 
-No pytest. Six end-to-end scripts, each of which exercises the real pipeline:
+No pytest. Seven end-to-end scripts, each of which exercises the real pipeline:
 
 ```bash
 PYTHONPATH=src python tests/verify_hound_end_to_end.py        # core daemon
@@ -232,6 +232,7 @@ PYTHONPATH=src:tests python tests/verify_snapshots_and_cli.py # snapshots, web, 
 PYTHONPATH=src python tests/verify_channels.py                # notify channels + audit log
 PYTHONPATH=src:tests python tests/verify_uptime.py            # liveness, outages, availability
 PYTHONPATH=src:tests python tests/verify_plugins.py           # opnsense, pfsense, wazuh
+PYTHONPATH=src:tests python tests/verify_opnsense_fields.py   # every plugin field round-trips
 ```
 
 There's also a disposable OPNsense VM rig under `deploy/dev/opnsense-vm/` that
