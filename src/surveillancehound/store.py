@@ -31,11 +31,14 @@ daemon's continuous write load.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -366,15 +369,31 @@ class HoundStore:
     # ----- devices -----
 
     def upsert_device(
-        self, ip: str, role: str, ts: float, packets: int, bytes_: int
+        self, ip: str, role: str, ts: float, packets: int, bytes_: int,
+        *, first_seen: float | None = None,
     ) -> None:
+        """Record observed activity for a device.
+
+        `ts` must be when the traffic was SEEN, not when it was processed.
+        `last_seen` only ever moves forward and `first_seen` only ever moves
+        backward: flows are flushed out of time order relative to each other
+        (eviction batches, shutdown drain), and a device's clock must not
+        jitter backwards just because an older flow was processed last.
+        A seeded-but-unobserved device carries `last_seen = 0.0`, and the
+        MAX() keeps that marker from being resurrected as a real sighting.
+        """
+        fs = first_seen if first_seen is not None else ts
         with self._lock, self._conn:
             self._conn.execute(
                 """INSERT INTO devices (ip, role, first_seen, last_seen,
                                         packet_count, byte_count)
                    VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(ip) DO UPDATE SET
-                       last_seen = excluded.last_seen,
+                       last_seen = MAX(devices.last_seen, excluded.last_seen),
+                       first_seen = CASE
+                           WHEN devices.first_seen <= 0.0 THEN excluded.first_seen
+                           ELSE MIN(devices.first_seen, excluded.first_seen)
+                       END,
                        packet_count = packet_count + excluded.packet_count,
                        byte_count = byte_count + excluded.byte_count,
                        role = CASE
@@ -382,7 +401,7 @@ class HoundStore:
                            ELSE devices.role
                        END
                 """,
-                (ip, role, ts, ts, packets, bytes_),
+                (ip, role, fs, ts, packets, bytes_),
             )
 
     def get_device(self, ip: str) -> DeviceRow | None:
@@ -411,6 +430,24 @@ class HoundStore:
             )
             for r in rows
         ]
+
+    def latest_device_activity(self) -> float:
+        """Newest observed activity across all devices, or 0.0 if none.
+
+        Reader processes use this to judge whether the daemon is still
+        seeing traffic. Do NOT use the flows table for that: a flow row is
+        only written when the flow is EVICTED, which is `flow_ttl_seconds`
+        (default 300) after its last packet, so the newest flow row is
+        structurally always several minutes old and any freshness threshold
+        below the TTL reads as permanently stalled. `devices.last_seen` is
+        refreshed every tick by `touch_devices_last_seen`, so it tracks
+        reality.
+        """
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT MAX(last_seen) AS t FROM devices"
+            ).fetchone()
+        return float(r["t"]) if r is not None and r["t"] is not None else 0.0
 
     def device_ips(self) -> set[str]:
         with self._lock:
@@ -517,7 +554,41 @@ class HoundStore:
     # ----- monitor sessions -----
 
     def start_monitor_session(self, now: float, source: str) -> int:
+        """Open a session, closing any that were orphaned by a hard kill.
+
+        A SIGKILL or power loss leaves `ended_at` NULL forever, and
+        `monitored_spans` reads an open session as "running until now". That
+        would count the entire dead period as monitored, and since no
+        outages were recorded while nothing was running, every camera would
+        report 100% availability for time nothing was watched — the exact
+        fabricated figure this schema exists to prevent.
+
+        An orphan is closed at the last moment we have evidence the monitor
+        was alive: the newest device activity it recorded, floored at its
+        own start and capped at now. `clean_exit` stays 0, which is how an
+        operator tells a crash from a deliberate stop.
+        """
         with self._lock, self._conn:
+            evidence = self._conn.execute(
+                "SELECT MAX(last_seen) AS t FROM devices"
+            ).fetchone()
+            last_activity = float(evidence["t"] or 0.0)
+            orphans = self._conn.execute(
+                "SELECT id, started_at FROM monitor_sessions WHERE ended_at IS NULL"
+            ).fetchall()
+            for o in orphans:
+                ended = min(now, max(float(o["started_at"]), last_activity))
+                self._conn.execute(
+                    """UPDATE monitor_sessions
+                       SET ended_at = ?, clean_exit = 0 WHERE id = ?""",
+                    (ended, o["id"]),
+                )
+            if orphans:
+                log.warning(
+                    "store: closed %d monitor session(s) left open by an "
+                    "unclean shutdown; their blind time is excluded from "
+                    "availability", len(orphans),
+                )
             cur = self._conn.execute(
                 """INSERT INTO monitor_sessions (started_at, ended_at, source, clean_exit)
                    VALUES (?, NULL, ?, 0)""",

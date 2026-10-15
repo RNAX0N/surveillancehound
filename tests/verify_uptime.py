@@ -104,6 +104,30 @@ def _check_store(tmp: Path) -> None:
         ]
         print("  monitored_spans: disjoint sessions preserved")
 
+        # latest_device_activity tracks the tick-refreshed device clock, not
+        # the flows table. Flow rows are only written at eviction —
+        # flow_ttl_seconds after the fact — so any freshness check built on
+        # them reads as permanently stalled.
+        assert store.latest_device_activity() == T0 + 50, (
+            store.latest_device_activity()
+        )
+        print("  latest_device_activity: tracks the tick-refreshed clock")
+
+        # an orphaned session (SIGKILL / power loss) must not be counted as
+        # monitored forever — that reports 100% availability for time
+        # nothing was watching
+        store.start_monitor_session(T0 + 100, "eth0")
+        # while it looks open, it reads as monitored right up to `until`
+        assert store.monitored_spans(T0 + 100, T0 + 9999)[-1][1] == T0 + 9999
+        store.start_monitor_session(T0 + 5000, "eth0")   # next daemon start
+        monitored = sum(
+            b - a for a, b in store.monitored_spans(T0 + 100, T0 + 5000)
+        )
+        assert monitored == 0.0, (
+            f"orphaned session still counted as monitored: {monitored}s"
+        )
+        print("  orphaned session: closed on next start, blind time excluded")
+
         # prune never deletes an OPEN outage or a RUNNING session
         live = store.open_outage(OutageRow(None, CAM2, T0, None, 0.0, "silence", None))
         store.start_monitor_session(T0, "eth0")
@@ -111,7 +135,9 @@ def _check_store(tmp: Path) -> None:
             outages_older_than=T0 + 10_000, sessions_older_than=T0 + 10_000,
         )
         assert deleted["outages"] == 1, deleted
-        assert deleted["monitor_sessions"] == 2, deleted
+        # 4: the two early sessions, the orphan closed above, and the one
+        # that closed it — only the still-running newest survives
+        assert deleted["monitor_sessions"] == 4, deleted
         assert store.open_outage_for(CAM2).id == live
         print("  prune: closed/ended only, live state preserved")
     finally:
@@ -372,6 +398,64 @@ def _check_restart_resumes_outage(tmp: Path) -> None:
         assert len(store.list_outages(CAM)) == before
         assert store.open_outage_for(CAM) is not None
         print("  restart mid-outage: resumed, no duplicate, no re-alert")
+    finally:
+        store.close()
+
+
+def _check_restart_does_not_fake_recovery(tmp: Path) -> None:
+    """A dead camera must not be resurrected by flow-eviction bookkeeping.
+
+    `_check_restart_resumes_outage` drives the tracker directly and so never
+    exercises the flow path. This one does: a flow is evicted
+    flow_ttl_seconds AFTER its last packet, and the device row is stamped
+    then. If that stamp uses the processing time instead of the packet time,
+    `devices.last_seen` lands later than the outage's `down_since`, and the
+    next restart reads it back as "activity after the outage started" —
+    closing the outage and telling the operator a dead camera came back.
+    """
+    store = _store(tmp, "fake_recovery.sqlite")
+    try:
+        net = NetworkCfg(camera_ips=[CAM])
+        store.start_monitor_session(T0, "eth0")
+
+        # the camera's last real packet is at T0; its flow is evicted 300s
+        # later and the device row is written at that point
+        store.upsert_device(CAM, "camera", T0, 50, 5000)
+        assert store.get_device(CAM).last_seen == T0, store.get_device(CAM).last_seen
+
+        # it then goes quiet and an outage opens with the true down_since
+        tr = _tracker()
+        tr.bootstrap(store, net, T0)
+        tr.touch(CAM, T0)
+        for i in range(1, 30):
+            t = T0 + i * TICK
+            tr.observe_packet(t)
+            tr.tick(store, t, saw_packets=True)
+        outage = store.open_outage_for(CAM)
+        assert outage is not None, "no outage opened"
+
+        # a late flush of an older flow must not drag last_seen forward
+        store.upsert_device(CAM, "camera", T0 - 100, 10, 100)
+        assert store.get_device(CAM).last_seen == T0, (
+            "an older flow moved last_seen forward"
+        )
+
+        # Now the hostile case the original bug produced: something stamps
+        # the device row AFTER the outage began (the old code did exactly
+        # this, using the eviction tick instead of the packet time).
+        store.touch_devices_last_seen({CAM: outage.down_since + 200})
+        assert store.get_device(CAM).last_seen > outage.down_since
+
+        # restart: the camera is still dead, so nothing should recover
+        tr2 = _tracker()
+        tr2.bootstrap(store, net, T0 + 400)
+        trs = tr2.tick(store, T0 + 405, saw_packets=True)
+        assert [t.kind for t in trs] == [], f"faked a recovery: {trs}"
+        assert store.open_outage_for(CAM) is not None, (
+            "the outage was closed for a camera that never came back"
+        )
+        print("  restart: a still-dead camera is not reported as recovered, "
+              "even when its device row claims later activity")
     finally:
         store.close()
 
@@ -685,6 +769,7 @@ def main() -> int:
         _check_stall_suppression(tmp)
         _check_no_blame_without_evidence(tmp)
         _check_restart_resumes_outage(tmp)
+        _check_restart_does_not_fake_recovery(tmp)
         _check_availability(tmp)
         _check_never_seen_state_in_report(tmp)
         _check_alerts(tmp)

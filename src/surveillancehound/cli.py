@@ -162,7 +162,12 @@ _PASSIVE_NOTE = (
 
 def cmd_uptime(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
-    window = args.window if args.window else cfg.uptime.report_window_seconds
+    # `is not None`, not truthiness — `--window 0` is a real request, not an
+    # omitted flag
+    window = (
+        args.window if args.window is not None
+        else cfg.uptime.report_window_seconds
+    )
     now = time.time()
     store = HoundStore(path=cfg.store.path)
     try:
@@ -173,11 +178,12 @@ def cmd_uptime(args: argparse.Namespace) -> int:
             running = session.ended_at is None
             state = "running" if running else "stopped"
             stall_window = cfg.uptime.capture_stall_seconds
-            recent = store.recent_flows(limit=1)
-            last_flow = recent[0].last_seen if recent else 0.0
+            # devices.last_seen, not flows: flow rows are written at
+            # eviction, flow_ttl_seconds late, so they always look stale
+            last_activity = store.latest_device_activity()
             blind = (
-                running and stall_window > 0
-                and (now - last_flow) > stall_window
+                running and stall_window > 0 and last_activity > 0.0
+                and (now - last_activity) > stall_window
             )
             print(
                 f"monitor: {state} on {session.source!r} since "
@@ -322,8 +328,9 @@ def cmd_prune(args: argparse.Namespace) -> int:
             kwargs["sessions_older_than"] = now - args.sessions_days * 86400.0
         if not kwargs:
             sys.exit(
-                "no cutoff given. specify --flows-days, --alerts-days, "
-                "and/or --notifications-days",
+                "no cutoff given. specify one or more of --flows-days, "
+                "--alerts-days, --notifications-days, --outages-days, "
+                "--sessions-days",
             )
         deleted = store.prune(**kwargs)
         if not any(deleted.values()):

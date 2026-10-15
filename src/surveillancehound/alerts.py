@@ -309,22 +309,11 @@ class AlertEngine:
             summary=summary, detail=detail, dedup_key=dedup_key,
         )
 
-    def camera_offline(self, ip: str, silent_for: float, now: float) -> Alert | None:
-        dedup_key = f"camera_offline:{ip}"
-        if self._suppressed(dedup_key, now):
-            return None
-        return Alert(
-            ts=now, device_ip=ip, kind=KIND_CAMERA_OFFLINE, severity="medium",
-            summary=(
-                f"camera {ip} has been silent for {silent_for:.0f}s — "
-                "possibly offline."
-            ),
-            detail=(
-                f"no flows involving {ip} have been observed for {silent_for:.0f} "
-                "seconds. Check that the camera is online and recording."
-            ),
-            dedup_key=dedup_key,
-        )
+    # `camera_offline` is emitted by `from_transition` above, driven by
+    # uptime.UptimeTracker. The old standalone method that the daemon's
+    # deleted `_check_silence` called has been removed rather than left as
+    # dead code — its per-camera dedup key was the bug that swallowed a
+    # second outage inside the dedup window.
 
     # ----- dedup -----
 

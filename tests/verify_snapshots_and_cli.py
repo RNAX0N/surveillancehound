@@ -230,9 +230,14 @@ def _check_web(cfg: HoundCfg) -> None:
             up = json.loads(resp.read())
         assert up["evidence"] == "passive", up.get("evidence")
         assert up["window_seconds"] == 3600.0, up["window_seconds"]
-        assert isinstance(up["cameras"], list) and isinstance(up["outages"], list)
+        assert isinstance(up["cameras"], list)
+        # outage history is opt-in: the dashboard polls this endpoint every
+        # few seconds and never renders the list, so it is not sent by default
+        assert up["outages"] == [], up["outages"]
+        with urllib.request.urlopen(base + "/api/uptime?outages=1") as resp:
+            assert isinstance(json.loads(resp.read())["outages"], list)
         mon = up["monitor"]
-        for field in ("source", "running", "stalled", "last_flow_ts"):
+        for field in ("source", "running", "stalled", "last_activity_ts"):
             assert field in mon, (field, mon)
         if up["cameras"]:
             cam = up["cameras"][0]

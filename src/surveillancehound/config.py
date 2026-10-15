@@ -30,7 +30,8 @@ Schema (see hound.toml.example):
   dedup_window_seconds = 1800   # don't re-notify on the same alert within this window
 
   [uptime]
-  enabled               = true     # per-camera liveness tracking + outage history
+  enabled               = true     # per-camera liveness + outage history;
+                                   # false also disables camera_offline
   startup_grace_seconds = 600.0    # 0 -> inherit thresholds.silence_seconds
   capture_stall_seconds = 120.0    # no packets at all for this long -> CAPTURE_STALLED; 0 disables
   recovery_alerts       = true     # emit camera_recovered when a camera comes back
@@ -134,6 +135,10 @@ class UptimeCfg:
     arrive for that long, the sensor is blind, so a single `capture_stalled`
     alert fires and per-camera offline alerts are suppressed. Without it, a
     dead tcpdump looks exactly like every camera failing at once.
+
+    NOTE: `enabled = false` turns off ALL liveness alerting, including
+    `camera_offline` — this engine is the only thing that emits it. Disable
+    only if you genuinely do not want to be told when a camera goes dark.
     """
     enabled: bool = True
     startup_grace_seconds: float = 600.0   # 0 -> inherit silence_seconds

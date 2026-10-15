@@ -165,6 +165,20 @@ class UptimeTracker:
             # an already-announced outage must not re-announce on restart
             if o.cause == NEVER_SEEN:
                 self._never_seen_alerted.add(o.camera_ip)
+            # Defence in depth: recovery is "activity newer than down_since",
+            # so any device row claiming activity after the outage began
+            # would fake a recovery for a camera that is still dead. Trust
+            # the outage over the device row — the outage records a
+            # decision, the device row is a cache other writers touch.
+            hydrated = self._last_activity.get(o.camera_ip)
+            if hydrated is not None and hydrated > o.down_since:
+                log.warning(
+                    "uptime: %s last_seen (%.0f) is newer than its open "
+                    "outage (%.0f); clamping so the outage is not closed "
+                    "by stale bookkeeping", o.camera_ip, hydrated,
+                    o.down_since,
+                )
+                self._last_activity[o.camera_ip] = o.down_since
 
         if self._open:
             log.info(

@@ -15,7 +15,10 @@ Endpoints:
   GET /                  — the dashboard HTML (cache-controlled to no-store)
   GET /api/status        — daemon liveness + counters
   GET /api/devices       — observed devices, sorted by recency
-  GET /api/uptime        — per-camera liveness + availability (passive)
+  GET /api/uptime        — per-camera liveness + availability (passive).
+                           ?window=<seconds>, ?outages=1 to include history
+                           (omitted by default — the dashboard polls this
+                           endpoint and does not render the outage list)
   GET /api/alerts        — recent alerts (limit param)
   GET /api/flows         — recent flows (limit, classification params)
   GET /api/baselines     — Welford buckets (camera param)
@@ -82,7 +85,10 @@ class _Handler(BaseHTTPRequestHandler):
             if url.path == "/api/devices":
                 return self._api_devices()
             if url.path == "/api/uptime":
-                return self._api_uptime(params.get("window"))
+                return self._api_uptime(
+                    params.get("window"),
+                    params.get("outages", "") in ("1", "true", "yes"),
+                )
             if url.path == "/api/alerts":
                 return self._api_alerts(int(params.get("limit", 100)))
             if url.path == "/api/flows":
@@ -154,7 +160,7 @@ class _Handler(BaseHTTPRequestHandler):
             store.close()
         _json(self, HTTPStatus.OK, {"devices": [r.__dict__ for r in rows]})
 
-    def _api_uptime(self, window: str | None) -> None:
+    def _api_uptime(self, window: str | None, want_outages: bool = False) -> None:
         """Per-camera liveness + availability.
 
         `evidence` is always "passive" and clients are expected to surface
@@ -178,16 +184,21 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             cameras = store.uptime_report(seconds, now)
             session = store.current_monitor_session()
-            recent = store.recent_flows(limit=1)
-            outages = store.list_outages(since=now - seconds, limit=200)
+            # devices.last_seen, not the flows table: flow rows are written
+            # at eviction, flow_ttl_seconds after the fact, so they are
+            # always minutes stale and would read as permanently stalled
+            last_activity = store.latest_device_activity()
+            outages = (
+                store.list_outages(since=now - seconds, limit=200)
+                if want_outages else []
+            )
         finally:
             store.close()
-        last_flow_ts = recent[0].last_seen if recent else 0.0
         stall_window = self.cfg.uptime.capture_stall_seconds
         running = session is not None and session.ended_at is None
         stalled = bool(
-            running and stall_window > 0
-            and (now - last_flow_ts) > stall_window
+            running and stall_window > 0 and last_activity > 0.0
+            and (now - last_activity) > stall_window
         )
         _json(self, HTTPStatus.OK, {
             "window_seconds": seconds,
@@ -201,7 +212,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "ended_at": session.ended_at if session else 0.0,
                 "running": running,
                 "stalled": stalled,
-                "last_flow_ts": last_flow_ts,
+                "last_activity_ts": last_activity,
                 "stall_window_seconds": stall_window,
             },
         })
@@ -982,7 +993,7 @@ function renderUptime(u) {
   } else if (m.stalled) {
     mon = '<span class="mon-state bad">capture stalled</span>'
         + `<span>source ${escapeHTML(m.source)}</span>`
-        + `<span>last packet ${m.last_flow_ts ? fmtAgo(m.last_flow_ts) : "never"}</span>`
+        + `<span>last packet ${m.last_activity_ts ? fmtAgo(m.last_activity_ts) : "never"}</span>`
         + '<span>per-camera offline alerts suppressed</span>';
   } else if (m.running) {
     mon = '<span class="mon-state ok">watching</span>'

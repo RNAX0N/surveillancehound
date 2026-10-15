@@ -213,12 +213,15 @@ class Hound:
             self._stop_flag = True
             if self._watchdog is not None:
                 self._watchdog.join(timeout=_TICK_S * 2)
-            if self._session_id is not None:
-                self.store.end_monitor_session(
-                    self._session_id, self._now() or time.time(), clean,
-                )
-            handle.close()
-            self.store.close()
+            # Close out under the loop lock so no watchdog tick can be
+            # mid-transition against the store while it is being closed.
+            with self._loop_lock:
+                if self._session_id is not None:
+                    self.store.end_monitor_session(
+                        self._session_id, self._now() or time.time(), clean,
+                    )
+                handle.close()
+                self.store.close()
             self.stats.stopped_at = time.time()
             log.info(
                 "hound stopped: packets=%s flows_flushed=%s alerts=%s "
@@ -256,10 +259,15 @@ class Hound:
         def _run() -> None:
             while not self._stop_flag:
                 time.sleep(_TICK_S)
-                if self._stop_flag:
-                    return
                 try:
                     with self._loop_lock:
+                        # Re-check INSIDE the lock. Shutdown sets the flag
+                        # and then closes the store under this same lock, so
+                        # checking outside it leaves a window where a tick
+                        # starts against a connection that is about to go
+                        # away — losing whatever alert it was emitting.
+                        if self._stop_flag:
+                            return
                         self._tick(self._now())
                 except Exception:  # noqa: BLE001 - a tick must never kill the daemon
                     log.exception("hound: tick failed")
@@ -355,13 +363,21 @@ class Hound:
                 classification=fc.classification,
             )
             self.store.insert_flow(row)
-            # device-count update — first endpoint is the camera side when known
+            # device-count update — first endpoint is the camera side when known.
+            # Stamp with the flow's OWN last packet time, not the tick clock.
+            # A flow is evicted flow_ttl_seconds (default 300) after its last
+            # packet, so stamping with `now` claimed we had seen the device
+            # five minutes more recently than we had — which, for a camera
+            # that had just died, was enough to make a restart think it had
+            # recovered and close its outage.
             cam_role = self.devices.role_for(fc.src_ip)
             self.store.upsert_device(
-                fc.src_ip, cam_role, now, fl.packets, fl.bytes,
+                fc.src_ip, cam_role, fl.last_ts, fl.packets, fl.bytes,
+                first_seen=fl.first_ts,
             )
             self.store.upsert_device(
-                fc.dst_ip, self.devices.role_for(fc.dst_ip), now, 0, 0,
+                fc.dst_ip, self.devices.role_for(fc.dst_ip), fl.last_ts, 0, 0,
+                first_seen=fl.first_ts,
             )
             # alert from the flow
             alert = self.alerts.from_flow(fc, now)

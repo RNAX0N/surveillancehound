@@ -53,6 +53,8 @@ dedup_window_seconds = 1800.0      # don't re-notify on the same alert within th
 # zero packets of ANY kind for that long means the sensor itself is blind, so
 # one `capture_stalled` fires and per-camera offline alerts are suppressed.
 [uptime]
+# false turns off ALL liveness alerting, camera_offline included —
+# this engine is the only thing that emits it.
 enabled               = true
 startup_grace_seconds = 600.0      # 0 -> inherit thresholds.silence_seconds
 capture_stall_seconds = 120.0      # 0 -> disable the dead-man's-switch
