@@ -105,6 +105,16 @@ def _check_store(tmp: Path) -> None:
         ]
         print("  monitored_spans: disjoint sessions preserved")
 
+        # the heartbeat is independent of device rows, which is the whole
+        # point: when every camera is dead, devices.last_seen is stale by
+        # design and a reader using it would call a healthy sensor blind
+        assert store.heartbeat() == (0.0, 0.0)
+        store.set_heartbeat(T0 + 900, T0 + 901)
+        assert store.heartbeat() == (T0 + 900, T0 + 901)
+        store.set_heartbeat(T0 + 905, T0 + 906)       # upsert, not insert
+        assert store.heartbeat() == (T0 + 905, T0 + 906)
+        print("  heartbeat: single row, independent of device activity")
+
         # latest_device_activity tracks the tick-refreshed device clock, not
         # the flows table. Flow rows are only written at eviction —
         # flow_ttl_seconds after the fact — so any freshness check built on
@@ -795,6 +805,48 @@ def _check_full_pipeline_replay(tmp: Path) -> None:
         store.close()
 
 
+def _check_stall_readout_with_no_live_camera(tmp: Path) -> None:
+    """A healthy sensor must not read as stalled when no camera is alive.
+
+    This is the case the indicator exists for, and the one where the
+    obvious signals lie: `devices.last_seen` only advances for camera/NVR
+    roles, and flow rows are only written at eviction. With every camera
+    dead and only other hosts chattering, both are minutes stale, so a
+    reader built on either reports CAPTURE STALLED on a sensor that is
+    seeing traffic perfectly well.
+    """
+    store = _store(tmp, "stall_readout.sqlite")
+    try:
+        tr = UptimeTracker(
+            UptimeCfg(startup_grace_seconds=GRACE, capture_stall_seconds=STALL),
+            ThresholdCfg(silence_seconds=SILENCE), replay=False,
+        )
+        store.start_monitor_session(T0, "eth0")
+        tr.bootstrap(store, NetworkCfg(camera_ips=[CAM]), T0)
+        # the camera never talks; everything else on the segment does
+        for i in range(1, 60):
+            t = T0 + i * TICK
+            tr.observe_packet(t)
+            tr.tick(store, t, saw_packets=True)
+        now = T0 + 60 * TICK
+
+        hb_packet, hb_updated = store.heartbeat()
+        assert now - hb_packet < STALL, (
+            f"heartbeat is stale ({now - hb_packet:.0f}s) on a sensor that "
+            f"is seeing traffic"
+        )
+        assert hb_updated > 0.0
+        # the signal a reader must NOT use, demonstrating why
+        assert now - store.latest_device_activity() > STALL, (
+            "expected devices.last_seen to be stale here — if it is not, "
+            "this test is no longer exercising the case it was written for"
+        )
+        print("  stall readout: heartbeat stays fresh with no live camera "
+              "(devices.last_seen does not)")
+    finally:
+        store.close()
+
+
 def _check_capture_death_is_reported(tmp: Path) -> None:
     """tcpdump exiting must not look like a clean shutdown.
 
@@ -861,6 +913,7 @@ def main() -> int:
         _check_never_seen(tmp)
         _check_stall_suppression(tmp)
         _check_no_blame_without_evidence(tmp)
+        _check_stall_readout_with_no_live_camera(tmp)
         _check_restart_resumes_outage(tmp)
         _check_restart_does_not_fake_recovery(tmp)
         _check_availability(tmp)

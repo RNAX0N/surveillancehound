@@ -53,6 +53,13 @@ hound_prestart() {
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 /var/log/${name}
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 /var/lib/hound
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 "${piddir}"
+    # install -d only fixes the directories. A hound.sqlite left behind
+    # root-owned by an earlier run as root crash-loops the service with
+    # "attempt to write a readonly database" — and because daemon(8) -r
+    # keeps restarting it, `service hound status` cheerfully reports it
+    # as running. Re-own the state and log trees so that is self-healing.
+    chown -R "${hound_user}:${hound_user}" /var/lib/hound /var/log/${name} \
+        2>/dev/null || true
     hound_grant_bpf
 }
 
@@ -74,16 +81,24 @@ hound_prestart() {
 # Set hound_grant_bpf=NO in rc.conf to manage BPF access yourself.
 hound_grant_bpf() {
     [ "${hound_grant_bpf}" = "YES" ] || return 0
+    _granted=0
     for dev in /dev/bpf /dev/bpf0; do
         [ -c "${dev}" ] || continue
-        chgrp "${hound_user}" "${dev}" 2>/dev/null &&
-            chmod 0660 "${dev}" 2>/dev/null
+        chgrp "${hound_user}" "${dev}" 2>/dev/null || continue
+        chmod 0660 "${dev}" 2>/dev/null || continue
+        # Verify the mode we actually ended up with. Testing `-r` here
+        # would be useless: start_precmd runs as root, and root's
+        # access(2) succeeds on 0600 root:wheel, so the check would pass
+        # even when the grant had plainly failed.
+        if [ "$(stat -f '%Sg %Lp' "${dev}" 2>/dev/null)" = "${hound_user} 660" ]; then
+            _granted=1
+        fi
     done
-    if [ ! -r /dev/bpf ] && [ ! -r /dev/bpf0 ]; then
+    if [ "${_granted}" -ne 1 ]; then
         echo "hound: warning: could not grant ${hound_user} access to" \
-             "/dev/bpf — live capture will fail. Either set" \
-             "hound_grant_bpf=NO and arrange access yourself, or run" \
-             "the daemon as root." >&2
+             "/dev/bpf — live capture will fail with a permission error." \
+             "Either set hound_grant_bpf=NO and arrange access yourself," \
+             "or run the daemon as root." >&2
     fi
 }
 

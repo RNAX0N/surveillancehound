@@ -178,9 +178,11 @@ def cmd_uptime(args: argparse.Namespace) -> int:
             running = session.ended_at is None
             state = "running" if running else "stopped"
             stall_window = cfg.uptime.capture_stall_seconds
-            # devices.last_seen, not flows: flow rows are written at
-            # eviction, flow_ttl_seconds late, so they always look stale
-            last_activity = store.latest_device_activity()
+            # the daemon's heartbeat: flow rows are written late (at
+            # eviction) and device rows only tick for camera/NVR roles, so
+            # both read stale exactly when every camera is dead
+            hb_packet, _hb_updated = store.heartbeat()
+            last_activity = hb_packet or store.latest_device_activity()
             blind = (
                 running and stall_window > 0 and last_activity > 0.0
                 and (now - last_activity) > stall_window

@@ -184,10 +184,13 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             cameras = store.uptime_report(seconds, now)
             session = store.current_monitor_session()
-            # devices.last_seen, not the flows table: flow rows are written
-            # at eviction, flow_ttl_seconds after the fact, so they are
-            # always minutes stale and would read as permanently stalled
-            last_activity = store.latest_device_activity()
+            # The daemon's heartbeat, not the flows table and not
+            # devices.last_seen: flow rows are only written at eviction
+            # (flow_ttl_seconds late) and device rows only tick for
+            # camera/NVR roles, so both are stale by design precisely when
+            # every camera is dead — the case this indicator is for.
+            hb_packet, hb_updated = store.heartbeat()
+            last_activity = hb_packet or store.latest_device_activity()
             outages = (
                 store.list_outages(since=now - seconds, limit=200)
                 if want_outages else []
@@ -213,6 +216,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "running": running,
                 "stalled": stalled,
                 "last_activity_ts": last_activity,
+                "heartbeat_ts": hb_updated,
                 "stall_window_seconds": stall_window,
             },
         })

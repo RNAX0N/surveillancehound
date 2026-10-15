@@ -237,6 +237,12 @@ class UptimeTracker:
         #     camera false-tripping: last_seen used to advance only when a
         #     flow was evicted, and a 24/7 RTSP stream never goes idle.
         self.flush(store, now)
+        # Heartbeat for reader processes. Must be its own signal rather
+        # than max(devices.last_seen): device rows only tick for
+        # camera/NVR roles, so when every camera is dead — the one case
+        # the stall indicator is for — that number is stale by design and
+        # a healthy sensor would read as blind.
+        store.set_heartbeat(self._last_packet_at, now)
 
         # (b) capture stall — evaluate before anything per-camera
         stall = self._tick_stall(now, saw_packets)

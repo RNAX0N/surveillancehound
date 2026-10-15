@@ -298,6 +298,19 @@ CREATE TABLE IF NOT EXISTS monitor_sessions (
     clean_exit  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_monitor_sessions_started ON monitor_sessions(started_at);
+
+-- Single-row heartbeat: when the daemon last saw a packet of ANY kind.
+-- Reader processes (web, CLI) cannot contact the daemon, so this is how
+-- they tell "the sensor is watching" from "the sensor is blind". It has to
+-- be its own signal: devices.last_seen only ticks for camera/NVR roles,
+-- and the flows table only gains rows at eviction, so both are stale by
+-- design exactly when every camera is dead — which is the case the stall
+-- indicator exists for.
+CREATE TABLE IF NOT EXISTS monitor_heartbeat (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    last_packet_at  REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
 """
 
 
@@ -430,6 +443,28 @@ class HoundStore:
             )
             for r in rows
         ]
+
+    def set_heartbeat(self, last_packet_at: float, now: float) -> None:
+        """Record when the daemon last saw any packet. Called each tick."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO monitor_heartbeat (id, last_packet_at, updated_at)
+                   VALUES (1, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       last_packet_at = excluded.last_packet_at,
+                       updated_at = excluded.updated_at""",
+                (last_packet_at, now),
+            )
+
+    def heartbeat(self) -> tuple[float, float]:
+        """(last_packet_at, updated_at); (0.0, 0.0) if never written."""
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT last_packet_at, updated_at FROM monitor_heartbeat WHERE id = 1"
+            ).fetchone()
+        if r is None:
+            return (0.0, 0.0)
+        return (float(r["last_packet_at"]), float(r["updated_at"]))
 
     def latest_device_activity(self) -> float:
         """Newest observed activity across all devices, or 0.0 if none.
