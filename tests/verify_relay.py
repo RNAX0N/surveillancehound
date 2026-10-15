@@ -1073,6 +1073,155 @@ def _check_capture_exclusion() -> None:
               "compile-checked)")
 
 
+def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
+    """Execute the REAL Hound._on_relayed_alerts and prove it stays remote.
+
+    This test exists because of a specific near-miss. Every other relay
+    test substitutes a stub for `on_alerts`, so `_on_relayed_alerts` was
+    never executed by the suite at all — and the v1 design's three
+    breaches all lived in exactly that method. Replacing its body with
+    `self._emit(alert)` reintroduces all three at once and every other
+    suite still passes. This one must not.
+
+    What `_emit` would do that this path must not:
+      * insert into `alerts`          (a remote host authoring local alerts)
+      * call `set_alert_channels`     (a second write to that row)
+      * write `notifications`         (whose alert_id means alerts.id, so a
+                                       relayed row would point at an
+                                       unrelated local alert)
+      * run the snapshot engine       (letting a remote alert overwrite a
+                                       LOCAL alert's forensic pcap)
+    """
+    from surveillancehound import daemon as daemon_mod
+    from surveillancehound.config import load_from_dict
+
+    cfg = load_from_dict({
+        "capture": {"interface": "test0"},
+        "network": {"camera_ips": ["10.9.0.5"]},
+        "store": {"path": str(tmp / "dispatch.sqlite")},
+        # A real channel, so dispatch actually runs and returns a delivery.
+        "notify": [{"type": "stdout", "level": "info"}],
+        # Snapshots ON: if this path ever reaches the snapshot engine we
+        # want a row to appear, not a silent no-op that hides the bug.
+        "snapshot": {"enabled": True},
+        "relay": {
+            "mode": "collector", "listen_host": "127.0.0.1",
+            "listen_port": 0,
+            "cert_file": str(FIXTURES / "ingest-test.crt"),
+            "key_file": str(FIXTURES / "ingest-test.key"),
+            "sensor": [{"id": "frigate", "key": "shared-secret"}],
+        },
+    })
+    hound = daemon_mod.Hound(cfg)
+    try:
+        store = hound.store
+        # A local alert with a snapshot-eligible camera, so there is
+        # something for a misrouted relayed alert to collide with.
+        recs = V.validate_records({"alerts": [{
+            "remote_id": 7, "ts": T0, "device_ip": "10.9.0.5",
+            "kind": "camera_offline", "severity": "high",
+            "summary": "relayed camera is down", "detail": "",
+            "dedup_key": "camera_offline:10.9.0.5",
+        }]}, 100)
+        store.ingest_remote_batch("frigate", "inst", 1, recs, T0)
+
+        before = _snapshot_central(store)
+        for raw in recs["alerts"]:
+            hound._dispatch_relayed_alert("frigate", raw)
+        after = _snapshot_central(store)
+
+        assert before == after, (
+            "dispatching a relayed alert modified central state. Tables "
+            "that changed: "
+            + ", ".join(t for t in before if before[t] != after[t])
+        )
+
+        # Positive side: it must actually have been delivered and audited
+        # in the REMOTE audit table, or the quarantine is just "does
+        # nothing", which would also pass the comparison above.
+        remote_notes = store._conn.execute(
+            "SELECT sensor_id, channel_type, ok FROM remote_notifications"
+        ).fetchall()
+        assert len(remote_notes) == 1, (
+            f"relayed dispatch must be audited in remote_notifications; "
+            f"got {[tuple(r) for r in remote_notes]}"
+        )
+        assert remote_notes[0]["sensor_id"] == "frigate"
+        assert remote_notes[0]["channel_type"] == "stdout"
+
+        # Named explicitly, because these are the four v1 breaches.
+        for table in ("alerts", "notifications", "snapshots"):
+            n = store._conn.execute(
+                f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
+            assert n == 0, (
+                f"{table} must stay empty: a relayed alert reached it "
+                f"({n} row(s)). This is the v1 breach rev 2 exists to close."
+            )
+        # A FAILED relayed delivery must be audited too, with its error.
+        # Recording only successes made ok/error unable to say anything
+        # else, and a failed relayed alert is the row an operator looks for.
+        class _Boom:
+            type, level = "webhook", "info"
+
+            def dispatch(self, alert):
+                raise OSError("collector-side webhook refused")
+
+        hound.dispatcher.channels = [_Boom()]
+        recs2 = V.validate_records({"alerts": [{
+            "remote_id": 8, "ts": T0 + 1, "device_ip": "10.9.0.6",
+            "kind": "new_device", "severity": "high", "summary": "x",
+            "detail": "", "dedup_key": "new_device:10.9.0.6",
+        }]}, 100)
+        store.ingest_remote_batch("frigate", "inst", 2, recs2, T0 + 1)
+        before2 = _snapshot_central(store)
+        for raw in recs2["alerts"]:
+            hound._dispatch_relayed_alert("frigate", raw)
+        assert _snapshot_central(store) == before2, (
+            "a FAILING relayed dispatch must still not touch central state"
+        )
+        failed = store._conn.execute(
+            "SELECT ok, error FROM remote_notifications WHERE ok = 0"
+        ).fetchall()
+        assert len(failed) == 1, (
+            f"a failed relayed delivery must be audited; got "
+            f"{[tuple(r) for r in failed]}"
+        )
+        assert "refused" in failed[0]["error"], failed[0]["error"]
+
+
+        # The ingest thread must only ENQUEUE. Dispatching inline would let
+        # one authenticated batch hold an ingest thread for as long as its
+        # slowest channel takes.
+        import queue as _queue
+        hound.dispatcher.channels = []
+        hound.stats.relayed_alerts_dropped = 0
+        while True:
+            try:
+                hound._relay_alertq.get_nowait()
+            except _queue.Empty:
+                break
+        many = [dict(recs["alerts"][0], remote_id=100 + i, dedup_key=f"k{i}")
+                for i in range(500)]
+        hound._on_relayed_alerts("frigate", many)
+        queued = hound._relay_alertq.qsize()
+        assert queued == 200, (
+            f"a single batch must be capped at 200 enqueued alerts so it "
+            f"cannot starve other sensors; queued {queued}"
+        )
+        assert hound.stats.relayed_alerts_dropped == 300, (
+            f"the overflow must be COUNTED, not silently discarded; "
+            f"counter says {hound.stats.relayed_alerts_dropped}"
+        )
+        print("  relayed dispatch: ingest thread only enqueues; per-batch "
+              "cap holds and overflow is counted")
+
+        print("  relayed dispatch: real dispatch path audited to "
+              "remote_notifications (successes AND failures); "
+              "alerts/notifications/snapshots untouched")
+    finally:
+        hound.store.close()
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -1090,6 +1239,7 @@ def main() -> int:
         _check_remote_store(Path(td))
         _check_quarantine(Path(td))
         _check_resource_bounds(Path(td))
+        _check_relayed_dispatch_is_quarantined(Path(td))
     print("=== listener ===")
     with tempfile.TemporaryDirectory() as td:
         _check_listener(Path(td))

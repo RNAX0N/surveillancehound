@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import queue
 import sqlite3
 import threading
 import time
@@ -68,6 +69,16 @@ _TICK_S = 5.0
 # bound disk and rare enough that it never competes with packet handling.
 _REMOTE_PRUNE_EVERY_S = 3600.0
 
+# Relayed alerts are dispatched off the ingest thread. The queue is bounded
+# because the alternative to dropping is unbounded memory growth driven by a
+# remote host: a channel like ftp or email can take seconds per alert, and a
+# single authenticated batch may carry max_records_per_batch of them.
+# Dropping and COUNTING the overflow is honest; silently queueing it is not.
+_RELAY_ALERT_QUEUE = 1000
+# Per batch, independent of the queue: one batch should not be able to
+# consume the whole queue and starve every other sensor.
+_RELAY_ALERTS_PER_BATCH = 200
+
 
 @dataclass
 class RunStats:
@@ -75,6 +86,7 @@ class RunStats:
     flows_flushed: int = 0
     alerts_emitted: int = 0
     uptime_transitions: int = 0
+    relayed_alerts_dropped: int = 0
     started_at: float = 0.0
     stopped_at: float | None = None
 
@@ -158,6 +170,12 @@ class Hound:
         # collector's disk finite; without this sweep `remote_retention_days`
         # is a config field that does nothing.
         self._last_remote_prune = 0.0
+        # Bounded hand-off from the ingest threads to one dispatch worker.
+        self._relay_alertq: queue.Queue | None = (
+            queue.Queue(maxsize=_RELAY_ALERT_QUEUE)
+            if cfg.relay.is_collector else None
+        )
+        self._relay_worker: threading.Thread | None = None
         self.stats = RunStats()
         self._stop_flag = False
         # guards everything the watchdog tick and the packet path share
@@ -218,6 +236,7 @@ class Hound:
             if self.relay is not None:
                 self.relay.start()
             if self.ingest is not None:
+                self._start_relay_dispatch()
                 self.ingest.start()
         clean = False
         died = False
@@ -258,7 +277,9 @@ class Hound:
             if self.relay is not None:
                 self.relay.stop()
             if self.ingest is not None:
+                # Listener first: stop accepting, then drain what is queued.
                 self.ingest.stop()
+                self._stop_relay_dispatch()
             if self._watchdog is not None:
                 self._watchdog.join(timeout=_TICK_S * 2)
             # Close out under the loop lock so no watchdog tick can be
@@ -531,33 +552,103 @@ class Hound:
             self.store.set_outage_alert(tr.outage_id, alert_id)
 
     def _on_relayed_alerts(self, sensor_id: str, alerts: list[dict]) -> None:
-        """Dispatch alerts that arrived from a relay agent.
+        """Hand relayed alerts to the dispatch worker. Called ON AN INGEST
+        THREAD, so it must not block.
+
+        Dispatching inline would let one authenticated batch hold an ingest
+        thread for as long as its slowest channel takes — ftp and email are
+        seconds each, and a batch may carry thousands of alerts. The queue
+        is bounded and overflow is counted rather than buffered, because
+        the queue depth would otherwise be chosen by the remote host.
+        """
+        q = self._relay_alertq
+        if q is None:
+            return
+        for raw in alerts[:_RELAY_ALERTS_PER_BATCH]:
+            try:
+                q.put_nowait((sensor_id, raw))
+            except queue.Full:
+                self.stats.relayed_alerts_dropped += 1
+        over = max(0, len(alerts) - _RELAY_ALERTS_PER_BATCH)
+        if over:
+            self.stats.relayed_alerts_dropped += over
+            log.warning(
+                "relay: sensor %r sent %d alerts in one batch; dispatching "
+                "the first %d and dropping %d. They remain in remote_alerts "
+                "and on the dashboard — only the notification is skipped.",
+                sensor_id, len(alerts), _RELAY_ALERTS_PER_BATCH, over,
+            )
+
+    def _start_relay_dispatch(self) -> None:
+        if self._relay_alertq is None:
+            return
+
+        def _run() -> None:
+            while True:
+                item = self._relay_alertq.get()
+                if item is None:            # shutdown sentinel
+                    return
+                try:
+                    self._dispatch_relayed_alert(*item)
+                except Exception:           # noqa: BLE001
+                    log.exception("relay: dispatching a relayed alert failed")
+
+        self._relay_worker = threading.Thread(
+            target=_run, name="hound-relay-dispatch", daemon=True)
+        self._relay_worker.start()
+
+    def _stop_relay_dispatch(self) -> None:
+        """Drain before the store closes, or the worker writes to a dead
+        handle. Bounded wait: a wedged channel must not block shutdown."""
+        if self._relay_alertq is None or self._relay_worker is None:
+            return
+        try:
+            self._relay_alertq.put_nowait(None)
+        except queue.Full:
+            pass
+        self._relay_worker.join(timeout=10)
+        self._relay_worker = None
+        if self.stats.relayed_alerts_dropped:
+            log.warning(
+                "relay: %d relayed alert(s) were never dispatched because "
+                "the dispatch queue was full. The alerts themselves are "
+                "stored; only the notifications were skipped.",
+                self.stats.relayed_alerts_dropped,
+            )
+
+    def _dispatch_relayed_alert(self, sensor_id: str, raw: dict) -> None:
+        """Dispatch one relayed alert.
 
         Deliberately not `_emit`. That writes `alerts`, updates it again via
         set_alert_channels, records into `notifications` (whose alert_id
         means alerts.id), and can make the snapshot engine overwrite a local
         alert's pcap — four ways for a remote host to reach central state.
-        This path touches remote_* only.
+        This path touches remote_* only. tests/verify_relay.py executes this
+        method directly and fails if it reaches any central table.
         """
         now = time.time()
         window = self.cfg.alerts.dedup_window_seconds
-        for raw in alerts:
-            key = f"{sensor_id}/{raw['dedup_key']}"
-            last = self.store.remote_alert_last_at(sensor_id, raw["dedup_key"])
-            if last is not None and (now - last) < window and raw["ts"] <= last:
-                continue
-            alert = Alert(
-                ts=raw["ts"], device_ip=raw["device_ip"], kind=raw["kind"],
-                severity=raw["severity"], summary=raw["summary"],
-                detail=raw["detail"], dedup_key=key, sensor=sensor_id,
-            )
-            remote_id = self.store.remote_alert_id_for(sensor_id, raw["remote_id"])
-            delivered = self.dispatcher.dispatch(alert, None)
-            for channel in delivered or []:
-                self.store.record_remote_notification(
-                    sensor_id, remote_id or 0, channel, True,
-                )
-            self.stats.alerts_emitted += 1
+        key = f"{sensor_id}/{raw['dedup_key']}"
+        last = self.store.remote_alert_last_at(sensor_id, raw["dedup_key"])
+        if last is not None and (now - last) < window and raw["ts"] <= last:
+            return
+        alert = Alert(
+            ts=raw["ts"], device_ip=raw["device_ip"], kind=raw["kind"],
+            severity=raw["severity"], summary=raw["summary"],
+            detail=raw["detail"], dedup_key=key, sensor=sensor_id,
+        )
+        remote_id = self.store.remote_alert_id_for(sensor_id, raw["remote_id"])
+
+        # Audit every attempt, not just the successful ones. A relayed
+        # alert that failed to deliver is exactly the row an operator
+        # goes looking for, and recording only successes made the
+        # ok/error columns unable to ever say anything else.
+        def _audit(channel: str, ok: bool, err: str,
+                   _sid=sensor_id, _rid=remote_id or 0) -> None:
+            self.store.record_remote_notification(_sid, _rid, channel, ok, err)
+
+        self.dispatcher.dispatch(alert, None, on_attempt=_audit)
+        self.stats.alerts_emitted += 1
 
     def _emit(self, alert: Alert) -> int:
         row = AlertRow(

@@ -447,7 +447,8 @@ class Dispatcher:
         self.channels = channels
         self.store = store
 
-    def dispatch(self, alert: Alert, alert_id: int | None) -> list[str]:
+    def dispatch(self, alert: Alert, alert_id: int | None,
+                 on_attempt=None) -> list[str]:
         """Push to every applicable channel. Returns the channel types that
         accepted the alert (used for the alert row's notified_channels column).
 
@@ -455,7 +456,11 @@ class Dispatcher:
         relayed path, which must write remote_notifications rather than
         `notifications`, whose alert_id implicitly means alerts.id. Recording
         a relayed delivery there would make the audit trail ambiguous and
-        remotely writable.
+        remotely writable. Such a caller passes `on_attempt` to receive
+        every attempt as (channel_type, ok, error) — including FAILED
+        ones, which the return value cannot express. Without it a relayed
+        audit row could only ever say "delivered", making the ok/error
+        columns decorative.
         """
         delivered: list[str] = []
         for ch in self.channels:
@@ -476,6 +481,8 @@ class Dispatcher:
                 log.exception("notify %s errored", ch.type)
             if alert_id is not None:
                 self.store.record_notification(alert_id, ch.type, ok, err)
+            if on_attempt is not None:
+                on_attempt(ch.type, ok, err)
             if ok:
                 delivered.append(ch.type)
         return delivered

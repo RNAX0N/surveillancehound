@@ -129,6 +129,13 @@ class Spool:
         self.dropped_size = 0
         self.dropped_age = 0
         self.dropped_stale = 0
+        # append/ack/drop are each a read-modify-write of one file. Two
+        # of them interleaving loses whichever batch the loser read
+        # before the winner wrote — the exact data loss the spool exists
+        # to prevent. The pusher thread and a shutdown flush can both be
+        # in here at once, so the serialisation has to live in the spool
+        # rather than in its callers.
+        self._lock = threading.RLock()
 
     def _read(self) -> list[dict]:
         if not self.path.is_file():
@@ -152,11 +159,12 @@ class Spool:
         os.replace(tmp, self.path)
 
     def append(self, seq: int, body: bytes, now: float) -> None:
-        entries = self._read()
-        entries.append({"seq": int(seq), "at": float(now),
-                        "body": body.decode("utf-8")})
-        entries = self._enforce_caps(entries, now)
-        self._write(entries)
+        with self._lock:
+            entries = self._read()
+            entries.append({"seq": int(seq), "at": float(now),
+                            "body": body.decode("utf-8")})
+            entries = self._enforce_caps(entries, now)
+            self._write(entries)
 
     def _enforce_caps(self, entries: list[dict], now: float) -> list[dict]:
         before = len(entries)
@@ -172,29 +180,33 @@ class Spool:
         return entries
 
     def pending(self, now: float) -> list[tuple[int, bytes]]:
-        entries = self._enforce_caps(self._read(), now)
-        return [(e["seq"], e["body"].encode("utf-8")) for e in entries]
+        with self._lock:
+            entries = self._enforce_caps(self._read(), now)
+            return [(e["seq"], e["body"].encode("utf-8")) for e in entries]
 
     def ack(self, seq: int) -> None:
         """Drop everything up to and including `seq` — it is now durable."""
-        self._write([e for e in self._read() if e["seq"] > seq])
+        with self._lock:
+            self._write([e for e in self._read() if e["seq"] > seq])
 
     def drop(self, seq: int, reason: str) -> None:
         """Discard one batch the collector will never accept."""
-        self.dropped_stale += 1
-        log.warning("relay: dropping spooled batch seq=%s (%s)", seq, reason)
-        self._write([e for e in self._read() if e["seq"] != seq])
+        with self._lock:
+            self.dropped_stale += 1
+            log.warning("relay: dropping spooled batch seq=%s (%s)", seq, reason)
+            self._write([e for e in self._read() if e["seq"] != seq])
 
     def stats(self, now: float) -> SpoolStats:
-        entries = self._read()
-        return SpoolStats(
-            pending=len(entries),
-            bytes=sum(len(e["body"]) for e in entries),
-            oldest_age=(now - min(e["at"] for e in entries)) if entries else 0.0,
-            dropped_size=self.dropped_size,
-            dropped_age=self.dropped_age,
-            dropped_stale=self.dropped_stale,
-        )
+        with self._lock:
+            entries = self._read()
+            return SpoolStats(
+                pending=len(entries),
+                bytes=sum(len(e["body"]) for e in entries),
+                oldest_age=(now - min(e["at"] for e in entries)) if entries else 0.0,
+                dropped_size=self.dropped_size,
+                dropped_age=self.dropped_age,
+                dropped_stale=self.dropped_stale,
+            )
 
 
 @dataclass
@@ -552,7 +564,15 @@ class RelayClient:
             self._thread = None
 
     def final_flush(self) -> None:
-        """Last attempt on clean shutdown so the tail is not lost."""
+        """Last attempt on clean shutdown so the tail is not lost.
+
+        Quiesces the pusher thread FIRST. The spool serialises its own
+        read-modify-write, but two concurrent flushes can still each post
+        the same batch, and the shutdown path has no reason to race the
+        periodic one. `stop()` is idempotent, so the caller stopping us
+        again afterwards is fine.
+        """
+        self.stop()
         try:
             self.enqueue()
             self.flush()
