@@ -11,6 +11,7 @@
 #   hound_config    = /usr/local/etc/hound.toml
 #   hound_user      = hound
 #   hound_bin       = /usr/local/bin/hound
+#   hound_grant_bpf = YES   # see "BPF access" below
 
 # PROVIDE: hound
 # REQUIRE: NETWORKING SERVERS
@@ -28,6 +29,7 @@ load_rc_config $name
 : ${hound_config:=/usr/local/etc/hound.toml}
 : ${hound_user:=hound}
 : ${hound_bin:=/usr/local/bin/hound}
+: ${hound_grant_bpf:=YES}
 
 # The pidfile must live somewhere ${hound_user} can write. /var/run is
 # root-owned 0755, so rc.subr dropping privileges turned `service hound
@@ -51,6 +53,38 @@ hound_prestart() {
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 /var/log/${name}
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 /var/lib/hound
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 "${piddir}"
+    hound_grant_bpf
+}
+
+# BPF access.
+#
+# FreeBSD has no capabilities(7) — the Linux answer of granting tcpdump
+# CAP_NET_RAW has no equivalent here. /dev/bpf is crw------- root:wheel,
+# so an unprivileged capture cannot open it and tcpdump fails with
+# "You don't have permission to perform this capture on that device".
+#
+# The alternative is running the whole daemon as root, which is what the
+# pfSense script does and what we would rather not do for a process whose
+# entire job is parsing untrusted bytes off the wire. Granting group
+# access to the one device it needs is the smaller privilege.
+#
+# This is re-applied on every start rather than written into
+# /etc/devfs.rules, so it survives reboots via the service itself and
+# does not fight OPNsense for ownership of the global devfs ruleset.
+# Set hound_grant_bpf=NO in rc.conf to manage BPF access yourself.
+hound_grant_bpf() {
+    [ "${hound_grant_bpf}" = "YES" ] || return 0
+    for dev in /dev/bpf /dev/bpf0; do
+        [ -c "${dev}" ] || continue
+        chgrp "${hound_user}" "${dev}" 2>/dev/null &&
+            chmod 0660 "${dev}" 2>/dev/null
+    done
+    if [ ! -r /dev/bpf ] && [ ! -r /dev/bpf0 ]; then
+        echo "hound: warning: could not grant ${hound_user} access to" \
+             "/dev/bpf — live capture will fail. Either set" \
+             "hound_grant_bpf=NO and arrange access yourself, or run" \
+             "the daemon as root." >&2
+    fi
 }
 
 run_rc_command "$1"

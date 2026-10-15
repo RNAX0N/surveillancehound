@@ -17,6 +17,7 @@ SurveillanceHound Python package the operator installed separately.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -279,7 +280,34 @@ def main(argv: list[str]) -> int:
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     tmp.write_text(rendered)
     os.replace(tmp, out_path)
+    _secure_output(out_path)
     return 0
+
+
+def _secure_output(path: Path, owner: str = "hound") -> None:
+    """Make the rendered config readable by the service user, and nobody else.
+
+    configd runs its scripts with umask 027, so the file lands 0640 owned
+    by root — and the daemon, running as an unprivileged user, crash-looped
+    with PermissionError on its own config. `required_files` in the rc
+    script does not catch this because rc.subr tests readability as root.
+
+    0640 with group ownership, not 0644: this file carries webhook URLs,
+    SMTP passwords and FTP credentials, so world-readable is the wrong
+    trade. Failures are non-fatal — on a box without the hound user
+    (a packaging dry-run, a test) the render itself still succeeded.
+    """
+    try:
+        os.chmod(path, 0o640)
+    except OSError as e:  # pragma: no cover - depends on host permissions
+        sys.stderr.write(f"warning: could not chmod {path}: {e}\n")
+    try:
+        shutil.chown(path, user=owner, group=owner)
+    except (OSError, LookupError) as e:
+        sys.stderr.write(
+            f"warning: could not chown {path} to {owner}: {e}; "
+            f"the daemon may not be able to read its own config\n",
+        )
 
 
 if __name__ == "__main__":
