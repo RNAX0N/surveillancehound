@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -28,8 +30,9 @@ from surveillancehound.alerts import AlertEngine  # noqa: E402
 from surveillancehound.config import (  # noqa: E402
     AlertsCfg, NetworkCfg, ThresholdCfg, UptimeCfg, load_from_dict,
 )
+from surveillancehound.pcap import Packet  # noqa: E402
 from surveillancehound.store import (  # noqa: E402
-    AlertRow, HoundStore, MonitorSessionRow, OutageRow,
+    AlertRow, HoundStore, OutageRow,
 )
 from surveillancehound.uptime import Transition, UptimeTracker  # noqa: E402
 
@@ -195,8 +198,13 @@ def _check_silence_and_recovery(tmp: Path) -> int:
         tr.tick(store, T0, saw_packets=True)
 
         kinds: list[str] = []
-        for i in range(1, 30):          # 145s of silence
-            kinds += _kinds(tr.tick(store, T0 + i * TICK, saw_packets=True))
+        for i in range(1, 30):          # 145s of camera silence
+            t = T0 + i * TICK
+            # the sensor itself is healthy — other hosts on the segment are
+            # still talking, which is what makes the camera's silence its
+            # own fault rather than ours
+            tr.observe_packet(t)
+            kinds += _kinds(tr.tick(store, t, saw_packets=True))
         assert kinds.count("down") == 1, f"expected one down, got {kinds}"
         out = store.open_outage_for(CAM)
         assert out is not None and out.cause == "silence"
@@ -215,7 +223,9 @@ def _check_silence_and_recovery(tmp: Path) -> int:
         # dedup key and is not silently swallowed by the 1800s window
         kinds = []
         for i in range(1, 30):
-            kinds += _kinds(tr.tick(store, t_back + i * TICK, saw_packets=True))
+            t = t_back + i * TICK
+            tr.observe_packet(t)
+            kinds += _kinds(tr.tick(store, t, saw_packets=True))
         assert kinds.count("down") == 1, kinds
         ids = {o.id for o in store.list_outages(CAM)}
         assert len(ids) == 2, f"flap did not create a second outage: {ids}"
@@ -232,9 +242,12 @@ def _check_never_seen(tmp: Path) -> None:
         store.start_monitor_session(T0, "eth0")
         tr.bootstrap(store, NetworkCfg(camera_ips=[NEVER]), T0)
         # before the grace elapses: silence is expected, not alertable
+        tr.observe_packet(T0 + 10)
         assert _kinds(tr.tick(store, T0 + 10, saw_packets=True)) == []
+        tr.observe_packet(T0 + GRACE + 1)
         assert _kinds(tr.tick(store, T0 + GRACE + 1, saw_packets=True)) == ["never_seen"]
         # and only once
+        tr.observe_packet(T0 + 120)
         assert _kinds(tr.tick(store, T0 + 120, saw_packets=True)) == []
         out = store.open_outage_for(NEVER)
         assert out is not None and out.cause == "never_seen"
@@ -282,13 +295,55 @@ def _check_stall_suppression(tmp: Path) -> None:
         # permanent
         kinds = []
         for i in range(1, 30):
-            kinds += _kinds(tr.tick(store, t + i * TICK, saw_packets=True))
+            tt = t + i * TICK
+            tr.observe_packet(tt)
+            kinds += _kinds(tr.tick(store, tt, saw_packets=True))
         assert kinds.count("down") == 2, f"detection did not resume: {kinds}"
         # neither is charged for the blind window: the silence clock
         # restarted when visibility came back
         for ip in (CAM, CAM2):
             assert store.open_outage_for(ip).down_since >= t, ip
         print("  stall cleared: detection resumes, blind window not charged")
+    finally:
+        store.close()
+
+
+def _check_no_blame_without_evidence(tmp: Path) -> None:
+    """A camera is not blamed when the sensor has seen nothing since.
+
+    The failure this guards against: an operator sets capture_stall_seconds
+    higher than silence_seconds, every camera trips before the stall is ever
+    declared, and the alert storm the dead-man's-switch exists to prevent
+    happens anyway.
+    """
+    store = _store(tmp, "evidence.sqlite")
+    try:
+        tr = UptimeTracker(
+            # stall threshold deliberately LONGER than the silence threshold
+            UptimeCfg(startup_grace_seconds=GRACE, capture_stall_seconds=600.0),
+            ThresholdCfg(silence_seconds=SILENCE),
+            replay=False,
+        )
+        store.start_monitor_session(T0, "eth0")
+        tr.bootstrap(store, NetworkCfg(camera_ips=[CAM]), T0)
+        tr.touch(CAM, T0)
+
+        # nothing at all observed after T0: no down, despite silence_seconds
+        # being long past, because we cannot tell the camera from ourselves
+        kinds: list[str] = []
+        for i in range(1, 40):
+            kinds += _kinds(tr.tick(store, T0 + i * TICK, saw_packets=False))
+        assert "down" not in kinds, f"blamed a camera with no evidence: {kinds}"
+        assert store.open_outage_for(CAM) is None
+        print("  no-blame rule: silent camera + blind sensor -> no camera_offline")
+
+        # the moment other traffic proves the sensor can still see, the
+        # camera's silence becomes its own fault and is reported
+        t = T0 + 300
+        tr.observe_packet(t)
+        kinds = _kinds(tr.tick(store, t, saw_packets=True))
+        assert kinds.count("down") == 1, f"expected one down, got {kinds}"
+        print("  no-blame rule: other traffic seen -> camera_offline fires")
     finally:
         store.close()
 
@@ -302,7 +357,9 @@ def _check_restart_resumes_outage(tmp: Path) -> None:
         tr.bootstrap(store, net, T0)
         tr.touch(CAM, T0)
         for i in range(1, 30):
-            tr.tick(store, T0 + i * TICK, saw_packets=True)
+            t = T0 + i * TICK
+            tr.observe_packet(t)
+            tr.tick(store, t, saw_packets=True)
         before = len(store.list_outages(CAM))
         assert before == 1 and store.open_outage_for(CAM) is not None
 
@@ -310,6 +367,7 @@ def _check_restart_resumes_outage(tmp: Path) -> None:
         # re-firing it or double-opening — the no-re-alert-on-restart rule
         tr2 = _tracker()
         tr2.bootstrap(store, net, T0 + 200)
+        tr2.observe_packet(T0 + 205)
         assert tr2.tick(store, T0 + 205, saw_packets=True) == []
         assert len(store.list_outages(CAM)) == before
         assert store.open_outage_for(CAM) is not None
@@ -458,6 +516,99 @@ def _check_alerts(tmp: Path) -> None:
         store.close()
 
 
+# --------------------------------------------------------------------------
+# (5) the watchdog, at the daemon level
+# --------------------------------------------------------------------------
+
+def _check_watchdog_fires_when_capture_wedges(tmp: Path) -> None:
+    """The dead-man's-switch, exercised through a real Hound instance.
+
+    This is the scenario the watchdog thread exists for and the one a unit
+    test of the tracker cannot reach: the capture generator blocks forever
+    (tcpdump alive but delivering nothing, NIC down, mirror port pulled).
+    A tick driven from inside `for pkt in packets` would never run here, so
+    `capture_stalled` would never fire and the daemon would sit silently
+    blind — which is the single worst failure mode for a monitor.
+    """
+    from surveillancehound import daemon as daemon_mod
+
+    wedge = threading.Event()
+
+    class _Handle:
+        def close(self) -> None:
+            wedge.set()
+
+    def _fake_stream(cfg, *, keep_raw=False, snaplen_override=None):
+        def _gen():
+            # one real packet so the session starts and a camera is known,
+            # then block exactly like a wedged capture
+            yield Packet(
+                ts=time.time(), src_ip=CAM, dst_ip="10.9.0.1",
+                src_port=554, dst_port=51000, proto="tcp",
+                length=800, tcp_flags="PA", raw_record=b"",
+            )
+            wedge.wait(timeout=30)
+        return _gen(), None, _Handle()
+
+    orig_stream = daemon_mod.stream_packets
+    orig_tick = daemon_mod._TICK_S
+    daemon_mod.stream_packets = _fake_stream
+    daemon_mod._TICK_S = 0.2        # keep the test fast
+    try:
+        cfg = load_from_dict({
+            "capture": {"interface": "test0"},
+            "network": {"camera_ips": [CAM]},
+            "store": {"path": str(tmp / "watchdog.sqlite")},
+            "thresholds": {"silence_seconds": 0.6},
+            "uptime": {
+                "capture_stall_seconds": 0.5, "startup_grace_seconds": 30.0,
+            },
+            "notify": [{"type": "stdout", "level": "critical"}],
+        })
+        hound = daemon_mod.Hound(cfg)
+        runner = threading.Thread(target=hound.run, daemon=True)
+        runner.start()
+
+        deadline = time.time() + 15.0
+        store = _store(tmp, "watchdog.sqlite")
+        try:
+            kinds: set[str] = set()
+            while time.time() < deadline:
+                kinds = {a.kind for a in store.list_alerts(limit=50)}
+                if "capture_stalled" in kinds:
+                    break
+                time.sleep(0.2)
+            assert "capture_stalled" in kinds, (
+                f"watchdog never fired while the capture was wedged: {kinds}"
+            )
+            # and the storm is suppressed: no per-camera offline alert even
+            # though silence_seconds (0.6s) elapsed long ago
+            assert "camera_offline" not in kinds, (
+                f"stall did not suppress per-camera offline alerts: {kinds}"
+            )
+            print("  watchdog: capture_stalled fired on a wedged capture, "
+                  "per-camera offline suppressed")
+
+            # the blind window must be carved out of monitored time, or a
+            # wedged sensor reports as perfect camera uptime
+            sessions = store.monitored_spans(0.0, time.time())
+            assert sessions, "no monitored span recorded"
+            assert store.current_monitor_session().ended_at is not None, (
+                "the stalled session was not closed, so blind time would "
+                "still count as monitored"
+            )
+            print("  watchdog: monitor session closed at the stall, blind "
+                  "time excluded from availability")
+        finally:
+            store.close()
+        hound.stop()
+        wedge.set()
+        runner.join(timeout=10)
+    finally:
+        daemon_mod.stream_packets = orig_stream
+        daemon_mod._TICK_S = orig_tick
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -468,10 +619,13 @@ def main() -> int:
         _check_silence_and_recovery(tmp)
         _check_never_seen(tmp)
         _check_stall_suppression(tmp)
+        _check_no_blame_without_evidence(tmp)
         _check_restart_resumes_outage(tmp)
         _check_availability(tmp)
         _check_never_seen_state_in_report(tmp)
         _check_alerts(tmp)
+        print("=== watchdog (daemon-level) ===")
+        _check_watchdog_fires_when_capture_wedges(tmp)
     print("\nUPTIME VERIFICATION PASSED")
     return 0
 

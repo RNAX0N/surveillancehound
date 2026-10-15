@@ -288,6 +288,11 @@ class Hound:
         self.devices.observe(pkt.src_ip, pkt.dst_ip, pkt.src_port, pkt.dst_port)
         self.flows.ingest(pkt)
         now = self._now()
+        if self.uptime is not None:
+            # every packet, camera or not — this is the evidence that the
+            # sensor can still see, which is what keeps a blind capture from
+            # being reported as a fleet of failed cameras
+            self.uptime.observe_packet(pkt.ts or now)
         for ip in (pkt.src_ip, pkt.dst_ip):
             self._maybe_new_device(ip, now)
         # snapshot ring buffer + uptime liveness both key off the endpoint

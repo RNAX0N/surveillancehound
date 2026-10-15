@@ -19,6 +19,14 @@ Three things make the inference trustworthy enough to alert on:
     stall. Without it, every camera would alert the instant the daemon came
     back from a blind window, purely because the last packet we happen to
     hold predates the gap.
+  * **No blame without evidence.** A camera is only declared down if some
+    packet — from anything, not just that camera — has been observed more
+    recently than the camera's own last packet. If nothing newer exists, the
+    sensor has seen nothing since the camera went quiet, so "the camera
+    died" and "we went blind" are the same observation and there is no
+    honest basis for picking one. This also neutralizes the config
+    foot-gun where `capture_stall_seconds >= silence_seconds`, which would
+    otherwise trip every camera before the stall was ever declared.
   * **Stall suppression.** When NO packets at all arrive for
     `capture_stall_seconds`, the sensor is blind: tcpdump died, the NIC went
     down, the mirror port changed. In that state exactly one `stalled`
@@ -100,8 +108,12 @@ class UptimeTracker:
         self._started_at = 0.0
         # silence only counts from here — see the module docstring
         self._silence_floor = 0.0
+        # timestamp of the most recent packet from ANY source (not just
+        # cameras). This is evidence that the sensor can still see, which is
+        # what separates "that camera died" from "we went blind".
         self._last_packet_at = 0.0
         self._stalled = False
+        self._stalled_since = 0.0
 
     @property
     def stalled(self) -> bool:
@@ -158,6 +170,18 @@ class UptimeTracker:
             self.cfg.capture_stall_seconds,
         )
 
+    def observe_packet(self, ts: float) -> None:
+        """Record that SOME packet was seen. Called for every packet.
+
+        Separate from `touch` on purpose: `touch` records which camera is
+        alive, this records that the sensor itself is still receiving. A
+        camera is only blamed for silence when something newer than its own
+        last packet has been observed — otherwise the two explanations
+        (camera down / sensor blind) are indistinguishable from here.
+        """
+        if ts > self._last_packet_at:
+            self._last_packet_at = ts
+
     def touch(self, ip: str, now: float) -> None:
         """Record activity for a camera/NVR IP. Called per packet."""
         prev = self._last_activity.get(ip, 0.0)
@@ -166,6 +190,7 @@ class UptimeTracker:
         self._last_activity[ip] = now
         self._pending_touch[ip] = now
         self._never_seen.discard(ip)
+        self.observe_packet(now)
 
     def flush(self, store: HoundStore, now: float) -> None:
         """Persist pending last_seen updates. Called on shutdown."""
@@ -210,12 +235,10 @@ class UptimeTracker:
         if window <= 0:
             return None  # disabled by config
         if saw_packets:
-            was_stalled = self._stalled
-            stall_began = self._last_packet_at
-            self._last_packet_at = max(self._last_packet_at, now)
-            if not was_stalled:
+            if not self._stalled:
                 return None
             self._stalled = False
+            stall_began = self._stalled_since
             # visibility regained: restart every camera's silence clock, or
             # each one alerts purely because its last packet predates the gap
             self._silence_floor = now
@@ -229,6 +252,7 @@ class UptimeTracker:
         silent_for = now - self._last_packet_at
         if not self._stalled and silent_for >= window:
             self._stalled = True
+            self._stalled_since = self._last_packet_at
             log.warning(
                 "uptime: no packets for %.0fs — capture stalled, per-camera "
                 "offline alerts suppressed", silent_for,
@@ -286,6 +310,7 @@ class UptimeTracker:
             ))
 
         # cameras that have gone quiet
+        stall_enabled = self.cfg.capture_stall_seconds > 0
         for ip, last in sorted(self._last_activity.items()):
             if ip in self._open:
                 continue
@@ -293,6 +318,19 @@ class UptimeTracker:
             effective_last = max(last, self._silence_floor)
             silent_for = now - effective_last
             if silent_for < silence:
+                continue
+            if stall_enabled and self._last_packet_at <= effective_last:
+                # The newest packet seen from ANY source is no newer than
+                # this camera's own last packet. So the sensor has observed
+                # nothing at all since this camera went quiet, and "the
+                # camera died" and "the sensor went blind" are the same
+                # observation — there is no evidence that distinguishes
+                # them. Stay quiet and let the stall detector speak.
+                #
+                # This also covers the config foot-gun where
+                # capture_stall_seconds >= silence_seconds: without it, every
+                # camera would trip before the stall was ever declared, which
+                # is precisely the storm the stall detector exists to prevent.
                 continue
             outage_id = store.open_outage(OutageRow(
                 id=None, camera_ip=ip, down_since=effective_last,
