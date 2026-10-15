@@ -481,6 +481,24 @@ def _networks(section: dict, key: str) -> list[str]:
     return out
 
 
+# The shared secret is the only thing standing between a host that can
+# reach the ingest port and the ability to author alerts on the collector.
+# A short one is brute-forceable offline against a single captured batch.
+_MIN_KEY_LEN = 16
+
+
+def _require_strong_key(key: str, where: str) -> None:
+    if len(key) < _MIN_KEY_LEN:
+        raise ValueError(
+            f"config: {where} is {len(key)} characters; at least "
+            f"{_MIN_KEY_LEN} are required. This secret is the only thing "
+            f"authenticating a relay sensor, and a short one can be "
+            f"brute-forced offline from one captured batch. Generate one "
+            f'with: python3 -c "import secrets; '
+            f'print(secrets.token_urlsafe(32))"'
+        )
+
+
 def _pins(raw) -> list[str]:
     """Normalise and validate pinned fingerprints.
 
@@ -564,6 +582,7 @@ def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
             raise ValueError("config: [relay].sensor_id is required in agent mode")
         if not cfg.key:
             raise ValueError("config: [relay].key is required in agent mode")
+        _require_strong_key(cfg.key, "[relay].key")
         if not cfg.url:
             raise ValueError("config: [relay].url is required in agent mode")
         host = _relay_url_host(cfg.url)
@@ -623,6 +642,7 @@ def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
                 raise ValueError(
                     f"config: duplicate [[relay.sensor]] id {sensor.id!r}"
                 )
+            _require_strong_key(sensor.key, f"[[relay.sensor]] {sensor.id!r} key")
             seen.add(sensor.id)
     return cfg
 

@@ -106,9 +106,9 @@ FIELDS: dict[str, dict] = {
         "want": "/var/lib/hound/t.key",
     },
     "relay.sensors": {
-        "raw": "frigate = top-secret-one",
+        "raw": "frigate = top-secret-one-abcdefgh-abcdef",
         "check": lambda c: [(x.id, x.key) for x in c.relay.sensors],
-        "want": [("frigate", "top-secret-one")],
+        "want": [("frigate", "top-secret-one-abcdefgh-abcdef")],
     },
     "relay.remote_retention_days": {
         "raw": "17.5", "check": lambda c: c.relay.remote_retention_days,
@@ -124,7 +124,7 @@ FIELDS: dict[str, dict] = {
     },
     "relay.sensor_id": {"raw": "edge-box"},
     "relay.url": {"raw": "https://10.77.0.250:19443/ingest/v1"},
-    "relay.key": {"raw": "agent-secret"},
+    "relay.key": {"raw": "agent-secret-abcdef"},
     "relay.tls_fingerprint": {
         "raw": "sha256:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11",
     },
@@ -464,14 +464,14 @@ def _check_relay_agent_round_trip() -> None:
     toml_text = _render(
         "<relay><mode>agent</mode><sensor_id>edge-box</sensor_id>"
         "<url>https://10.77.0.250:19443/ingest/v1</url>"
-        "<key>agent-secret</key>"
+        "<key>agent-secret-abcdef</key>"
         "<tls_fingerprint>sha256:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11:AA:BB:CC:DD:EE:FF:00:11</tls_fingerprint></relay>"
     )
     cfg = load_from_dict(tomllib.loads(toml_text))
     assert cfg.relay.mode == "agent", cfg.relay.mode
     assert cfg.relay.sensor_id == "edge-box", cfg.relay.sensor_id
     assert cfg.relay.url == "https://10.77.0.250:19443/ingest/v1", cfg.relay.url
-    assert cfg.relay.key == "agent-secret", "the shared secret must survive"
+    assert cfg.relay.key == "agent-secret-abcdef", "the shared secret must survive"
     assert len(cfg.relay.tls_fingerprint) == 1, (
         "the pin is the whole trust decision in agent mode; losing it in "
         "the renderer would leave the agent unable to connect at all"
@@ -487,18 +487,18 @@ def _check_relay_agent_round_trip() -> None:
     # cannot be parsed must be DROPPED, never guessed at — a half-read
     # secret authenticates nothing and the 401 gets blamed on the agent.
     parsed = mod._parse_sensors(
-        "frigate = secret-one\n"
+        "frigate = secret-one-abcdefgh\n"
         "# comment\n"
-        "garage : secret-two\n"
-        "frigate = shadowing-duplicate\n"
+        "garage : secret-two-abcdefgh\n"
+        "frigate = shadowing-duplicate-x\n"
         "no-separator-here\n"
         "   \n"
-        "trailing = secret-three  "
+        "trailing = secret-three-abcdef  "
     )
     assert parsed == [
-        ("frigate", "secret-one"),
-        ("garage", "secret-two"),
-        ("trailing", "secret-three"),
+        ("frigate", "secret-one-abcdefgh"),
+        ("garage", "secret-two-abcdefgh"),
+        ("trailing", "secret-three-abcdef"),
     ], parsed
 
     collector = _render(
@@ -506,11 +506,11 @@ def _check_relay_agent_round_trip() -> None:
         "<listen_port>19443</listen_port>"
         "<cert_file>/var/lib/hound/t.crt</cert_file>"
         "<key_file>/var/lib/hound/t.key</key_file>"
-        "<sensors>a = one\nb = two</sensors></relay>"
+        "<sensors>a = one-secret-abcdef\nb = two-secret-abcdef</sensors></relay>"
     )
     ccfg = load_from_dict(tomllib.loads(collector))
     assert [(x.id, x.key) for x in ccfg.relay.sensors] == [
-        ("a", "one"), ("b", "two")], ccfg.relay.sensors
+        ("a", "one-secret-abcdef"), ("b", "two-secret-abcdef")], ccfg.relay.sensors
     print("  relay: agent/collector/off all render and parse; sensor list "
           "drops malformed and duplicate entries")
 

@@ -169,7 +169,7 @@
             <sensors type="TextField">
                 <Required>N</Required>
                 <Mask>/^[\w\-. =:,\r\n+\/]*$/u</Mask>
-                <ValidationMessage>One sensor per line, as "id = shared-secret".</ValidationMessage>
+                <ValidationMessage>One sensor per line, as "id = shared-secret". Each secret must be at least 16 characters; shorter ones are refused when the config is loaded.</ValidationMessage>
             </sensors>
             <remote_retention_days type="NumericField">
                 <default>30.0</default>
@@ -204,8 +204,8 @@
             </url>
             <key type="TextField">
                 <Required>N</Required>
-                <Mask>/^[\w\-.~+\/=]*$/u</Mask>
-                <ValidationMessage>The shared secret this agent signs with.</ValidationMessage>
+                <Mask>/^(|[\w\-.~+\/=]{16,})$/u</Mask>
+                <ValidationMessage>The shared secret this agent signs with. At least 16 characters - this is the only thing authenticating the sensor, and a short secret can be brute-forced offline from one captured batch.</ValidationMessage>
             </key>
             <tls_fingerprint type="CSVListField">
                 <Required>N</Required>

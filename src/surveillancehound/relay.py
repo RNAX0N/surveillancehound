@@ -159,12 +159,29 @@ class Spool:
         os.replace(tmp, self.path)
 
     def append(self, seq: int, body: bytes, now: float) -> None:
+        """Append one batch, compacting only when a cap is actually at risk.
+
+        This used to read and rewrite the whole spool on every enqueue.
+        With a 64 MB cap and a 30 s cadence that is O(n^2) disk churn on
+        an NVR, for a file that is append-only in the normal case. The
+        file is JSON-lines precisely so a new batch is one write.
+        """
+        line = json.dumps(
+            {"seq": int(seq), "at": float(now), "body": body.decode("utf-8")},
+            separators=(",", ":"),
+        ) + "\n"
         with self._lock:
-            entries = self._read()
-            entries.append({"seq": int(seq), "at": float(now),
-                            "body": body.decode("utf-8")})
-            entries = self._enforce_caps(entries, now)
-            self._write(entries)
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+            # Compact only when the file has actually grown past the byte
+            # cap. The age cap is applied on read (`pending`), so a stale
+            # entry is never replayed even between compactions.
+            try:
+                oversized = self.path.stat().st_size > self.max_bytes
+            except OSError:
+                oversized = True
+            if oversized:
+                self._write(self._enforce_caps(self._read(), now))
 
     def _enforce_caps(self, entries: list[dict], now: float) -> list[dict]:
         before = len(entries)
@@ -273,7 +290,11 @@ class AgentState:
         return st
 
     def save(self) -> None:
-        tmp = self.path.with_suffix(".tmp")
+        # Unique temp name: the pusher thread and the shutdown path both
+        # save, and a shared "state.json.tmp" lets one truncate the other
+        # mid-write. A torn state file loses next_seq and the agent mints
+        # a fresh instance_id, which resets the collector's sequence.
+        tmp = self.path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps({
             "instance_id": self.instance_id,
             "next_seq": self.next_seq,
@@ -410,7 +431,7 @@ class RelayClient:
 
     # ----- collection -----
 
-    def collect(self) -> dict:
+    def collect(self) -> tuple:
         """Everything new since the last successful push."""
         wm = self.state.watermark
         flows = self.store.flows_since(wm.flow_id)

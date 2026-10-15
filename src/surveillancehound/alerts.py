@@ -34,6 +34,8 @@ KIND_CAMERA_RECOVERED = "camera_recovered"
 KIND_CAMERA_NEVER_SEEN = "camera_never_seen"
 KIND_CAPTURE_STALLED = "capture_stalled"
 KIND_BEHAVIORAL_ANOMALY = "behavioral_anomaly"
+KIND_SENSOR_OFFLINE = "sensor_offline"
+KIND_SENSOR_RECOVERED = "sensor_recovered"
 
 # Appended to every liveness alert. Detection is passive — a camera that is
 # powered but no longer visible to this sensor is indistinguishable from one
@@ -205,6 +207,56 @@ class AlertEngine:
                 ),
             )
         return None
+
+    def sensor_offline(self, sensor_id: str, silent_for: float,
+                       now: float) -> Alert | None:
+        """A relay agent has stopped reporting.
+
+        This is not a camera alert and must not be mistaken for one. The
+        collector cannot see that segment itself — that is the entire
+        reason the agent exists — so when the agent goes quiet the
+        collector knows nothing about those cameras at all. Their rows go
+        to `unknown`, which is honest but silent, and silence is only
+        visible to someone already looking at the dashboard.
+
+        It is also the first thing an intruder on the camera segment
+        would do, so it is treated as high severity rather than as
+        routine housekeeping.
+        """
+        return self._mk(
+            f"sensor_offline:{sensor_id}", now,
+            device_ip="", kind=KIND_SENSOR_OFFLINE, severity="high",
+            summary=(
+                f"relay sensor {sensor_id!r} has not reported for "
+                f"{silent_for:.0f}s."
+            ),
+            detail=(
+                f"No batch has arrived from sensor {sensor_id!r} in "
+                f"{silent_for:.0f} seconds. Everything it watches is now "
+                f"UNMONITORED, and its cameras are reported as unknown "
+                f"rather than up — their last known state is no longer "
+                f"evidence of anything. Causes range from the agent host "
+                f"being down or the link failing, to someone on that "
+                f"segment stopping the agent. Check the agent host before "
+                f"assuming the cameras are fine."
+            ),
+        )
+
+    def sensor_recovered(self, sensor_id: str, down_for: float,
+                         now: float) -> Alert | None:
+        return self._mk(
+            f"sensor_recovered:{sensor_id}", now,
+            device_ip="", kind=KIND_SENSOR_RECOVERED, severity="info",
+            summary=(
+                f"relay sensor {sensor_id!r} is reporting again after "
+                f"{down_for:.0f}s."
+            ),
+            detail=(
+                f"Batches from {sensor_id!r} have resumed. Its segment was "
+                f"unmonitored for {down_for:.0f} seconds; that gap is "
+                f"excluded from availability rather than counted as uptime."
+            ),
+        )
 
     def _mk(
         self, dedup_key: str, now: float, *, device_ip: str, kind: str,

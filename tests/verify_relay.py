@@ -227,7 +227,7 @@ def _check_relay_config() -> None:
 
     assert load({}).relay.mode == "off", "relay must default to off"
 
-    agent = {"mode": "agent", "sensor_id": "frigate", "key": "k",
+    agent = {"mode": "agent", "sensor_id": "frigate", "key": "test-secret-abcdefgh",
              "url": "https://88.255.5.1:18443/ingest/v1",
              "tls_fingerprint": "sha256:" + "ab" * 32}
     cfg = load(agent)
@@ -245,8 +245,8 @@ def _check_relay_config() -> None:
             "agent mode with no shared key")
 
     coll = {"mode": "collector", "listen_host": "88.255.5.1",
-            "sensor": [{"id": "frigate", "key": "k"}]}
-    assert load(coll).relay.key_for("frigate") == "k"
+            "sensor": [{"id": "frigate", "key": "test-secret-abcdefgh"}]}
+    assert load(coll).relay.key_for("frigate") == "test-secret-abcdefgh"
     assert load(coll).relay.key_for("nope") is None
     rejects({**coll, "listen_host": "0.0.0.0"},
             "a collector listening on every interface")
@@ -254,10 +254,15 @@ def _check_relay_config() -> None:
                  "listen_allow_any": True}).relay.is_collector
     rejects({"mode": "collector", "listen_host": "88.255.5.1"},
             "a collector with no sensors")
-    rejects({**coll, "sensor": [{"id": "a", "key": "k"}, {"id": "a", "key": "j"}]},
+    rejects({**coll, "sensor": [{"id": "a", "key": "test-secret-abcdefgh"},
+                               {"id": "a", "key": "test-secret-abcdefgh2"}]},
             "duplicate sensor ids")
+    # The shared secret is the only thing authenticating a sensor.
+    rejects({**agent, "key": "short"}, "a brute-forceable relay key")
+    rejects({**coll, "sensor": [{"id": "a", "key": "short"}]},
+            "a brute-forceable sensor key")
     rejects({"mode": "sideways"}, "an unknown relay mode")
-    print("  config: 12 relay guards hold; mode defaults to off")
+    print("  config: 14 relay guards hold; mode defaults to off")
 
 
 def _check_key_never_printed() -> None:
@@ -529,7 +534,7 @@ def _collector_cfg(port: int, **over):
         mode="collector", listen_host="127.0.0.1", listen_port=port,
         cert_file=str(FIXTURES / "ingest-test.crt"),
         key_file=str(FIXTURES / "ingest-test.key"),
-        sensors=[RelaySensorCfg(id="frigate", key="shared-secret")],
+        sensors=[RelaySensorCfg(id="frigate", key="shared-secret-abcdef")],
     )
     for k, v in over.items():
         setattr(cfg, k, v)
@@ -562,7 +567,7 @@ def _check_listener(tmp: Path) -> None:
     url = f"https://127.0.0.1:{port}/ingest/v1"
     pins = _pin()
 
-    def send(seq=1, key="shared-secret", sensor="frigate", instance="inst-1",
+    def send(seq=1, key="shared-secret-abcdef", sensor="frigate", instance="inst-1",
              sent_at=None, records=None, mutate=None):
         body = R.build_batch(sensor, instance, seq,
                              records if records is not None else _good_records(),
@@ -601,7 +606,7 @@ def _check_listener(tmp: Path) -> None:
         # this is the v1 contradiction that made the spool unreplayable
         old = R.build_batch("frigate", "inst-1", 3, _good_records(), T0 - 86400)
         fresh = R.restamp(old, clock["t"])
-        st, _ = R.post_batch(url, fresh, "shared-secret", "frigate", 3, pins)
+        st, _ = R.post_batch(url, fresh, "shared-secret-abcdef", "frigate", 3, pins)
         assert st == 200, f"re-stamped spooled batch rejected: {st}"
 
         st, _ = send(seq=4, records={"flows": "not a list"})
@@ -681,10 +686,10 @@ def _check_pinning(tmp: Path) -> None:
     url = f"https://127.0.0.1:{port}/ingest/v1"
     body = R.build_batch("frigate", "i", 1, _good_records(), T0)
     try:
-        st, _ = R.post_batch(url, body, "shared-secret", "frigate", 1, _pin())
+        st, _ = R.post_batch(url, body, "shared-secret-abcdef", "frigate", 1, _pin())
         assert st == 200
         try:
-            R.post_batch(url, body, "shared-secret", "frigate", 2,
+            R.post_batch(url, body, "shared-secret-abcdef", "frigate", 2,
                          ["sha256:" + "0" * 64])
             raise AssertionError("a wrong pinned fingerprint was accepted")
         except R.RelayError as e:
@@ -750,7 +755,7 @@ def _check_end_to_end(tmp: Path) -> None:
 
     agent_store, _ = _seed_agent_store(tmp / "agent.sqlite")
     agent_cfg = RelayCfg(
-        mode="agent", sensor_id="frigate", key="shared-secret",
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
         url=f"https://127.0.0.1:{port}/ingest/v1",
         tls_fingerprint=_pin(), batch_seconds=1.0,
     )
@@ -825,7 +830,8 @@ def _check_agent_is_silent(tmp: Path) -> None:
                     "lan_subnets": ["88.255.0.0/16"]},
         "store": {"path": str(tmp / "silent.sqlite")},
         "notify": [{"type": "stdout", "level": "info"}],
-        "relay": {"mode": "agent", "sensor_id": "frigate", "key": "k",
+        "relay": {"mode": "agent", "sensor_id": "frigate",
+                  "key": "test-secret-abcdefgh",
                   "url": "https://88.255.5.1:18443/ingest/v1",
                   "tls_fingerprint": ["sha256:" + "ab" * 32]},
     })
@@ -1121,7 +1127,7 @@ def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
             "listen_port": 0,
             "cert_file": str(FIXTURES / "ingest-test.crt"),
             "key_file": str(FIXTURES / "ingest-test.key"),
-            "sensor": [{"id": "frigate", "key": "shared-secret"}],
+            "sensor": [{"id": "frigate", "key": "shared-secret-abcdef"}],
         },
     })
     hound = daemon_mod.Hound(cfg)
@@ -1278,6 +1284,70 @@ def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
         hound.store.close()
 
 
+def _check_sensor_offline_alerts(tmp: Path) -> None:
+    """A sensor going quiet must ALERT, not just render grey.
+
+    Stopping the agent is the first thing an intruder on the camera
+    segment would do. Its cameras correctly degrade to `unknown`, but
+    that is silent — visible only to someone already looking at the
+    dashboard — and the collector is the only host that notifies.
+    """
+    from surveillancehound import daemon as daemon_mod
+    from surveillancehound.config import load_from_dict
+
+    cfg = load_from_dict({
+        "capture": {"interface": "test0"},
+        "network": {"camera_ips": ["10.9.0.5"]},
+        "store": {"path": str(tmp / "sensorlive.sqlite")},
+        "notify": [{"type": "stdout", "level": "info"}],
+        "relay": {
+            "mode": "collector", "listen_host": "127.0.0.1",
+            "listen_port": 0,
+            "cert_file": str(FIXTURES / "ingest-test.crt"),
+            "key_file": str(FIXTURES / "ingest-test.key"),
+            "sensor_timeout_seconds": 180.0,
+            "sensor": [{"id": "frigate", "key": "shared-secret-abcdef"}],
+        },
+    })
+    hound = daemon_mod.Hound(cfg)
+    hound.ingest = object()          # mark collector mode without binding
+    try:
+        store = hound.store
+        recs = V.validate_records(_good_records(), 100)
+        store.ingest_remote_batch("frigate", "inst", 1, recs, T0)
+
+        def kinds():
+            return [a.kind for a in store.list_alerts(limit=50)]
+
+        hound._check_sensor_liveness(T0 + 10)
+        assert "sensor_offline" not in kinds(), (
+            "a sensor that reported 10s ago is not offline"
+        )
+
+        hound._check_sensor_liveness(T0 + 1000)
+        assert "sensor_offline" in kinds(), (
+            "a sensor silent for 1000s with a 180s timeout must alert; "
+            "otherwise killing the agent is completely silent"
+        )
+        n_after_first = kinds().count("sensor_offline")
+
+        hound._check_sensor_liveness(T0 + 2000)
+        assert kinds().count("sensor_offline") == n_after_first, (
+            "sensor_offline must fire once per outage, not every tick"
+        )
+
+        # Recovery: a newer batch arrives, the next check clears it.
+        store.ingest_remote_batch("frigate", "inst", 2, recs, T0 + 2100)
+        hound._check_sensor_liveness(T0 + 2110)
+        assert "sensor_recovered" in kinds(), (
+            "the sensor reporting again must be announced, or an operator "
+            "cannot tell a resolved outage from an ongoing one"
+        )
+        print("  sensor liveness: offline alerts once, recovery announced")
+    finally:
+        hound.store.close()
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -1296,6 +1366,7 @@ def main() -> int:
         _check_quarantine(Path(td))
         _check_resource_bounds(Path(td))
         _check_relayed_dispatch_is_quarantined(Path(td))
+        _check_sensor_offline_alerts(Path(td))
     print("=== listener ===")
     with tempfile.TemporaryDirectory() as td:
         _check_listener(Path(td))

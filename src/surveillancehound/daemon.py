@@ -174,6 +174,8 @@ class Hound:
         # is a config field that does nothing.
         self._last_remote_prune = 0.0
         self._last_ingest_bind_try = 0.0
+        # sensor_id -> last_seen at the moment we declared it down
+        self._sensors_down: dict[str, float] = {}
         # Bounded hand-off from the ingest threads to one dispatch worker.
         self._relay_alertq: queue.Queue | None = (
             queue.Queue(maxsize=_RELAY_ALERT_QUEUE)
@@ -424,6 +426,37 @@ class Hound:
         self._maybe_prune_remote(now)
         # 5) retry a listener that could not bind at startup
         self._maybe_retry_ingest_bind(now)
+        # 6) alert if a relay sensor has gone quiet
+        self._check_sensor_liveness(now)
+
+    def _check_sensor_liveness(self, now: float) -> None:
+        """Alert when a relay agent stops reporting.
+
+        Its cameras degrade to `unknown`, which is honest but silent —
+        and silence is only visible to someone already watching the
+        dashboard. The collector cannot see that segment itself, so a
+        quiet agent means those cameras are unmonitored, not fine.
+        """
+        if self.ingest is None:
+            return
+        timeout = self.cfg.relay.sensor_timeout_seconds
+        if timeout <= 0:
+            return
+        for sensor in self.store.list_remote_sensors():
+            silent = now - sensor.last_seen
+            was_down = sensor.sensor_id in self._sensors_down
+            if silent > timeout and not was_down:
+                self._sensors_down[sensor.sensor_id] = sensor.last_seen
+                alert = self.alerts.sensor_offline(
+                    sensor.sensor_id, silent, now)
+                if alert is not None:
+                    self._emit(alert)
+            elif silent <= timeout and was_down:
+                down_since = self._sensors_down.pop(sensor.sensor_id)
+                alert = self.alerts.sensor_recovered(
+                    sensor.sensor_id, max(0.0, now - down_since), now)
+                if alert is not None:
+                    self._emit(alert)
 
     def _maybe_retry_ingest_bind(self, now: float) -> None:
         """Retry binding the ingest listener.

@@ -5,6 +5,11 @@
 #
 # Validate before starting, so a typo surfaces here and not as silence:
 #   docker compose run --rm hound-agent config-check /etc/hound/hound.toml
+#
+# An UNEDITED copy of this file deliberately fails that check: the two
+# CHANGE-ME values below are the shared secret and the collector's
+# certificate pin, and neither has a safe default. The error names which
+# one is still a placeholder.
 
 [capture]
 # The interface that can see camera traffic. With network_mode: host this
@@ -67,9 +72,11 @@ url = "https://88.255.5.1:18443/ingest/v1"
 
 # Shared secret; the same string goes in the collector's
 # [[relay.sensor]] block for this id. Every batch is signed with it.
-# Generate one with:
-#   python -c "import secrets; print(secrets.token_urlsafe(32))"
-key = "CHANGE-ME"
+# Minimum 16 characters — this is the only thing authenticating this
+# sensor, and a short one is brute-forceable offline from one captured
+# batch. Generate one with:
+#   python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+key = "CHANGE-ME-min-16-chars"
 
 # Pin the collector's certificate. That cert is self-signed, so there is
 # no CA to validate against and the fingerprint IS the trust decision.
