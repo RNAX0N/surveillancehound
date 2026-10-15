@@ -1,6 +1,15 @@
 <menu>
+    <!--
+        Shape matters: a top-level element here names an EXISTING menu category
+        (Services), and its ONLY children may be plugin entry nodes. A
+        <VisibleName> *element* child is not a label for the category — the
+        parser (Base/Menu/MenuItem.php::addXmlNode) walks every child element
+        and turns it into a menu item, so <VisibleName>Services</VisibleName>
+        rendered a bogus, empty, collapsible "VisibleName" row inside the
+        Services menu. Labels are attributes, never elements. Compare any core
+        plugin (IDS, Monit): <Services><Plugin VisibleName=".." .../></Services>.
+    -->
     <Services>
-        <VisibleName>Services</VisibleName>
-        <SurveillanceHound VisibleName="SurveillanceHound" url="/ui/hound/" cssClass="fa fa-eye"/>
+        <SurveillanceHound VisibleName="SurveillanceHound" url="/ui/hound/" cssClass="fa fa-eye fa-fw"/>
     </Services>
 </menu>

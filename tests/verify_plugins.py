@@ -448,6 +448,119 @@ def _check_opnsense_pkg_build_script() -> None:
         assert abi in wf, f"workflow no longer publishes a catalogue for {abi}"
     print("  OPNsense pkg: OSVERSION tracks ABI; repo published per-ABI")
 
+    # 5. The lifecycle scripts must flush OPNsense's UI caches. OPNsense
+    #    merges every plugin's Menu/Menu.xml into
+    #    /var/lib/php/tmp/opnsense_menu_cache.xml and trusts it for an hour
+    #    (MenuSystem::$menuCacheTTL = 3600). `service configd restart` and
+    #    `configctl webgui restart` do NOT touch that file, so os-hound 0.1.1
+    #    installed its Menu.xml and showed no Services entry at all until the
+    #    cache happened to expire — reproduced on the dev VM. The official
+    #    plugin framework runs rc.configure_plugins here
+    #    (opnsense/plugins Templates/configure → system_cache_flush()).
+    for var, arg in (("PI=", "POST_INSTALL"), ("POD=", "POST_DEINSTALL")):
+        start = script.index("\n" + var)
+        body = script[start:script.index("\n", start + 1) + 1]
+        assert "cache_flush" in body or "rc.configure_plugins" in body, (
+            f"build-pkg.sh {var[:-1]} no longer flushes the OPNsense UI "
+            f"caches — the Services menu entry will not appear (or will not "
+            f"disappear) for up to an hour after a pkg install/delete"
+        )
+        assert f"cache_flush {arg}" in body or arg in body, (
+            f"build-pkg.sh {var[:-1]} must flush the caches with {arg}"
+        )
+    assert "/usr/local/etc/rc.configure_plugins" in script, (
+        "build-pkg.sh must call rc.configure_plugins (it is what invalidates "
+        "the menu + ACL + model + template caches on every OPNsense version)"
+    )
+    assert "opnsense_menu_cache.xml" in script, (
+        "build-pkg.sh lost the explicit menu-cache fallback for boxes "
+        "without rc.configure_plugins"
+    )
+    print("  OPNsense pkg: install/deinstall flush the menu + ACL caches")
+
+
+
+#: Every one of these is a MenuItem *property* (MenuItem.php has a matching
+#: set<Name>() and the attribute match is case-insensitive). They belong in an
+#: attribute. Written as a child ELEMENT, MenuSystem does not read them as
+#: properties at all — MenuItem::addXmlNode() walks every child element and
+#: appends it as a menu item, so `<VisibleName>Services</VisibleName>` became a
+#: bogus, empty, collapsible nav row literally labelled "VisibleName".
+_MENU_PROPERTY_NAMES = frozenset({
+    "visiblename", "fixedname", "cssclass", "linkclass",
+    "url", "order", "visibility", "isexternal",
+})
+
+
+def _check_opnsense_menu_xml() -> None:
+    """Assert each Menu/Menu.xml has the shape OPNsense's parser expects.
+
+    The published 0.1.1 plugin installed cleanly and rendered no usable
+    Services entry. Its Menu.xml was::
+
+        <menu><Services>
+            <VisibleName>Services</VisibleName>          <!-- wrong -->
+            <SurveillanceHound VisibleName=".." url=".."/>
+        </Services></menu>
+
+    No core plugin does that (grep `<VisibleName>` across
+    /usr/local/opnsense/mvc/app/models/*/*/Menu/Menu.xml on a real box: zero
+    hits). The shape every core plugin uses is a category element whose only
+    children are entry nodes carrying their labels as attributes.
+    """
+    menus = sorted(OPNSENSE.rglob("Menu/Menu.xml"))
+    assert menus, f"no Menu/Menu.xml found under {OPNSENSE}"
+
+    def walk(node, path: str, menu_path: Path) -> None:
+        for child in node:
+            tag = child.tag
+            assert tag.lower() not in _MENU_PROPERTY_NAMES, (
+                f"{menu_path}: <{tag}> is a child ELEMENT of <{path}>. "
+                f"{tag} is a menu-item property — it must be an attribute "
+                f"(e.g. <{path} {tag}=\"...\"/>). As an element OPNsense "
+                f"renders it as an extra, empty menu row instead."
+            )
+            # Menu items are identified by tag name; text content is never read.
+            assert not (child.text or "").strip(), (
+                f"{menu_path}: <{tag}> under <{path}> carries text "
+                f"({(child.text or '').strip()!r}). The menu parser ignores "
+                f"element text entirely; labels go in VisibleName=\"...\"."
+            )
+            walk(child, tag, menu_path)
+
+    for menu_path in menus:
+        root = ET.parse(menu_path).getroot()
+        assert root.tag == "menu", (
+            f"{menu_path}: root element is <{root.tag}>, must be <menu> — "
+            f"MenuSystem::addXML() rejects anything else "
+            f"('seems to be of wrong type') and the whole file is dropped"
+        )
+        categories = list(root)
+        assert categories, f"{menu_path}: <menu> has no category elements"
+        for category in categories:
+            # A category must contribute at least one entry, otherwise the
+            # plugin ships a menu file that adds nothing.
+            assert len(list(category)), (
+                f"{menu_path}: category <{category.tag}> has no entries"
+            )
+            walk(category, category.tag, menu_path)
+
+    # And the entry we actually ship must still point at the UI page.
+    hound = OPNSENSE / ("src/opnsense/mvc/app/models/OPNsense/Hound"
+                        "/Menu/Menu.xml")
+    root = ET.parse(hound).getroot()
+    entry = root.find("./Services/SurveillanceHound")
+    assert entry is not None, (
+        f"{hound}: no Services/SurveillanceHound entry — the plugin would "
+        f"install with no Services menu item"
+    )
+    assert entry.get("url") == "/ui/hound/", (
+        f"{hound}: SurveillanceHound url is {entry.get('url')!r}, "
+        f"expected '/ui/hound/'"
+    )
+    assert entry.get("VisibleName"), f"{hound}: entry has no VisibleName"
+    print(f"  OPNsense menu: {len(menus)} Menu.xml — category/entry shape "
+          f"matches core plugins, properties are attributes")
 
 
 def _check_opnsense_renderer_error_path() -> None:
@@ -842,6 +955,7 @@ def main() -> int:
     _check_sh_syntax()
     _check_php_brace_balance()
     _check_opnsense_layout()
+    _check_opnsense_menu_xml()
     print()
     print("=== OPNsense renderer ===")
     _check_opnsense_renderer()

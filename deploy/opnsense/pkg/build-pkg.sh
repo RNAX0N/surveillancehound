@@ -131,11 +131,30 @@ say "$(wc -l < "$PLIST" | tr -d ' ') files staged"
 
 # --- lifecycle scripts (single-line; embedded in the manifest) --------------
 # post-install: create the service user + state/log dirs, refresh the UI.
-PI='pw groupshow hound >/dev/null 2>&1 || pw groupadd hound; pw usershow hound >/dev/null 2>&1 || pw useradd hound -g hound -s /usr/sbin/nologin -d /var/lib/hound -c SurveillanceHound; install -d -o hound -g hound -m 0750 /var/lib/hound; install -d -o hound -g hound -m 0755 /var/log/hound; if command -v configctl >/dev/null 2>&1; then service configd restart >/dev/null 2>&1 || true; configctl webgui restart >/dev/null 2>&1 || true; fi; true'
+#
+# The cache_flush() step is not optional garnish — it is what makes the menu
+# entry appear. OPNsense merges every plugin's Menu/Menu.xml into
+# /var/lib/php/tmp/opnsense_menu_cache.xml and trusts that file for a full
+# hour (MenuSystem::$menuCacheTTL = 3600); the ACL and Phalcon template
+# caches sit beside it. Neither `service configd restart` nor
+# `configctl webgui restart` touches them, so a plugin installed while an
+# operator is browsing the UI (i.e. every install via System > Firmware >
+# Plugins) lands its Menu.xml on disk and still shows NO Services entry until
+# the cache happens to expire. rc.configure_plugins is exactly what the
+# official plugin framework runs here (opnsense/plugins Templates/configure);
+# it calls system_cache_flush(), which invalidates the menu + ACL + model +
+# template caches for whatever OPNsense version is installed. The rm is the
+# fallback for a box without that script.
+cache_flush() {
+    printf '%s' "if [ -f /usr/local/etc/rc.configure_plugins ]; then /usr/local/etc/rc.configure_plugins $1 >/dev/null 2>&1 || true; else rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json >/dev/null 2>&1 || true; fi;"
+}
+PI="pw groupshow hound >/dev/null 2>&1 || pw groupadd hound; pw usershow hound >/dev/null 2>&1 || pw useradd hound -g hound -s /usr/sbin/nologin -d /var/lib/hound -c SurveillanceHound; install -d -o hound -g hound -m 0750 /var/lib/hound; install -d -o hound -g hound -m 0755 /var/log/hound; if command -v configctl >/dev/null 2>&1; then service configd restart >/dev/null 2>&1 || true; $(cache_flush POST_INSTALL) configctl webgui restart >/dev/null 2>&1 || true; fi; true"
 # pre-deinstall: stop + disable the daemon before files vanish.
 PRD='service hound onestop >/dev/null 2>&1 || true; sysrc -x hound_enable >/dev/null 2>&1 || true; true'
-# post-deinstall: refresh the UI so the menu entry disappears.
-POD='command -v configctl >/dev/null 2>&1 && configctl webgui restart >/dev/null 2>&1 || true; true'
+# post-deinstall: flush the caches + refresh the UI so the menu entry goes
+# away. Without the flush a deleted plugin keeps its Services entry (and a
+# 404 behind it) for up to an hour — the same cache, the other direction.
+POD="$(cache_flush POST_DEINSTALL) command -v configctl >/dev/null 2>&1 && configctl webgui restart >/dev/null 2>&1 || true; true"
 
 # --- manifest (UCL; scripts inlined) ----------------------------------------
 MANIFEST="$WORK/+MANIFEST"
