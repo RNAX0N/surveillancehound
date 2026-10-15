@@ -949,6 +949,65 @@ def _check_opnsense_layout() -> None:
           f"— controllers↔forms↔models↔actions all wired")
 
 
+def _check_opnsense_form_ids() -> None:
+    """Every form field id must be the FULL model path, and must exist.
+
+    The published 0.1.2 plugin rendered its Listen-interface dropdown with no
+    options at all, on 26.1.6 and 26.7 alike. The ids were section-relative
+    ("general.interface") while the API returns the model wrapped in its own
+    name ({"hound": {"general": {...}}}, from
+    ApiMutableModelControllerBase::getAction). opnsense.js setFormData()
+    walks an input's id — split on "." — through that document, so the first
+    key never matched and no field was ever populated; a <select> starts
+    empty, which is why that one field looked broken while blank text inputs
+    looked normal. The same mismatch breaks the other two directions:
+    getFormData() rebuilds the POST body from the ids (so Save posted
+    general[...] rather than hound[general][...]) and handleFormValidation()
+    matches server validation keys, which are also fully qualified.
+
+    Core plugins all use fully-qualified ids (dnsmasq's are "dnsmasq.enable"
+    etc.). This check asserts the prefix AND that the remainder resolves to a
+    real node in the model XML, which also catches renamed/typo'd fields.
+    """
+    ctl_root = OPNSENSE / "src/opnsense/mvc/app/controllers/OPNsense"
+    mdl_root = OPNSENSE / "src/opnsense/mvc/app/models/OPNsense"
+    checked = 0
+    for plug in sorted(d for d in ctl_root.iterdir() if d.is_dir()):
+        model_xml = mdl_root / plug.name / f"{plug.name}.xml"
+        if not model_xml.exists():
+            continue
+        model_name = plug.name.lower()
+        items = ET.parse(model_xml).getroot().find("items")
+        assert items is not None, f"{model_xml}: no <items> element"
+        known = {
+            f"{section.tag}.{field.tag}"
+            for section in items
+            for field in section
+        }
+        for form_xml in sorted((plug / "forms").glob("*.xml")):
+            for node in ET.parse(form_xml).getroot().iter("id"):
+                field_id = (node.text or "").strip()
+                if not field_id:
+                    continue
+                checked += 1
+                head, _, rest = field_id.partition(".")
+                assert head == model_name and rest, (
+                    f"{form_xml}: field id {field_id!r} is not prefixed with "
+                    f"the model name — it must be "
+                    f"'{model_name}.{field_id}'. Unprefixed ids never match "
+                    f"the /api/{model_name}/settings/get document, so the "
+                    f"field renders unpopulated (dropdowns come up empty) "
+                    f"and Save posts the wrong shape."
+                )
+                assert rest in known, (
+                    f"{form_xml}: field id {field_id!r} has no matching node "
+                    f"in {model_xml} (known: {sorted(known)})"
+                )
+    assert checked, f"no form field ids found under {ctl_root}"
+    print(f"  OPNsense forms: {checked} field id(s) fully qualified and "
+          f"present in the model XML")
+
+
 def main() -> int:
     print("=== Plugin static checks ===")
     _check_xml_wellformed()
@@ -956,6 +1015,7 @@ def main() -> int:
     _check_php_brace_balance()
     _check_opnsense_layout()
     _check_opnsense_menu_xml()
+    _check_opnsense_form_ids()
     print()
     print("=== OPNsense renderer ===")
     _check_opnsense_renderer()

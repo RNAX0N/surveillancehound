@@ -1,16 +1,38 @@
+<!--
+    Form definition for /ui/hound/.
+
+    Every <id> MUST be the FULL model path, i.e. prefixed with the model name
+    ("hound."), not just the section. OPNsense's client-side plumbing joins
+    the two ends by id:
+
+      * /api/hound/settings/get returns {"hound": {"general": {...}, ...}}
+        (ApiMutableModelControllerBase::getAction wraps the nodes in
+        $internalModelName), and opnsense.js setFormData() walks an input's
+        id split on "." through that document. An id of "general.interface"
+        looks for a top-level "general" key, never finds it, and the field is
+        left untouched — a <select> then renders with no options at all.
+      * saveFormToEndpoint() does the reverse: getFormData() rebuilds the
+        nested object from the ids, so unprefixed ids POST general[...]
+        instead of hound[general][...] and the model never sees the values.
+      * handleFormValidation() matches server validation keys, which are
+        also returned fully qualified ("hound.general.interface").
+
+    Core plugins all do this (dnsmasq's form ids are "dnsmasq.enable" etc.).
+    tests/verify_plugins.py enforces it.
+-->
 <form>
     <field>
         <type>header</type>
         <label>Capture</label>
     </field>
     <field>
-        <id>general.enabled</id>
+        <id>hound.general.enabled</id>
         <label>Enable</label>
         <type>checkbox</type>
         <help>Run the SurveillanceHound daemon at boot.</help>
     </field>
     <field>
-        <id>general.interface</id>
+        <id>hound.general.interface</id>
         <label>Listen interface</label>
         <type>dropdown</type>
         <style>selectpicker</style>
@@ -19,13 +41,13 @@
               interface only — use a BPF filter below to narrow within it.</help>
     </field>
     <field>
-        <id>general.bpf</id>
+        <id>hound.general.bpf</id>
         <label>BPF filter (optional)</label>
         <type>text</type>
         <help>Berkeley Packet Filter expression, e.g. "host 192.168.10.0/24".</help>
     </field>
     <field>
-        <id>general.snaplen</id>
+        <id>hound.general.snaplen</id>
         <label>Snaplen (bytes)</label>
         <type>text</type>
         <help>Bytes captured per packet for flow analysis. 96 covers all
@@ -37,25 +59,25 @@
         <label>Network roles</label>
     </field>
     <field>
-        <id>network.camera_ips</id>
+        <id>hound.network.camera_ips</id>
         <label>Camera IPs</label>
         <type>text</type>
         <help>Comma-separated camera IPs.</help>
     </field>
     <field>
-        <id>network.camera_subnets</id>
+        <id>hound.network.camera_subnets</id>
         <label>Camera subnets</label>
         <type>text</type>
         <help>Comma-separated CIDRs. Anything in here is treated as a camera
               unless also listed as an NVR.</help>
     </field>
     <field>
-        <id>network.nvr_ips</id>
+        <id>hound.network.nvr_ips</id>
         <label>NVR IPs</label>
         <type>text</type>
     </field>
     <field>
-        <id>network.manufacturer_allowlist</id>
+        <id>hound.network.manufacturer_allowlist</id>
         <label>Manufacturer allowlist (CIDRs)</label>
         <type>text</type>
         <help>The vendor cloud your cameras legitimately talk to.</help>
@@ -66,7 +88,7 @@
         <label>Uptime monitoring</label>
     </field>
     <field>
-        <id>thresholds.silence_seconds</id>
+        <id>hound.thresholds.silence_seconds</id>
         <label>Silence threshold (seconds)</label>
         <type>text</type>
         <help>A camera with no observed packets for this long raises
@@ -78,7 +100,7 @@
               powered down. Default 600.</help>
     </field>
     <field>
-        <id>uptime.enabled</id>
+        <id>hound.uptime.enabled</id>
         <label>Track per-camera uptime</label>
         <type>checkbox</type>
         <help>Record outage history and availability per camera, derived
@@ -87,7 +109,7 @@
               alert kinds. On by default.</help>
     </field>
     <field>
-        <id>uptime.startup_grace_seconds</id>
+        <id>hound.uptime.startup_grace_seconds</id>
         <label>Startup grace (seconds)</label>
         <type>text</type>
         <help>After the daemon starts, wait this long before alerting on a
@@ -97,7 +119,7 @@
               Default 600.</help>
     </field>
     <field>
-        <id>uptime.capture_stall_seconds</id>
+        <id>hound.uptime.capture_stall_seconds</id>
         <label>Capture stall timeout (seconds)</label>
         <type>text</type>
         <help>Dead-man's switch: if ZERO packets at all are captured for
@@ -112,19 +134,19 @@
         <label>Behavioral baselining (opt-in)</label>
     </field>
     <field>
-        <id>baseline.enabled</id>
+        <id>hound.baseline.enabled</id>
         <label>Enable per-camera baselining</label>
         <type>checkbox</type>
     </field>
     <field>
-        <id>baseline.z_threshold</id>
+        <id>hound.baseline.z_threshold</id>
         <label>z threshold</label>
         <type>text</type>
         <help>Standard deviations from the bucket mean before an anomaly
               alert fires (default 4.0).</help>
     </field>
     <field>
-        <id>baseline.min_samples</id>
+        <id>hound.baseline.min_samples</id>
         <label>Min samples per bucket</label>
         <type>text</type>
         <help>Cold-start guard — no anomalies fire until each (camera,
@@ -136,17 +158,17 @@
         <label>Forensic snapshots (opt-in)</label>
     </field>
     <field>
-        <id>snapshot.enabled</id>
+        <id>hound.snapshot.enabled</id>
         <label>Enable per-camera pcap snapshots on alert</label>
         <type>checkbox</type>
     </field>
     <field>
-        <id>snapshot.window_seconds</id>
+        <id>hound.snapshot.window_seconds</id>
         <label>Ring buffer window (seconds)</label>
         <type>text</type>
     </field>
     <field>
-        <id>snapshot.min_severity</id>
+        <id>hound.snapshot.min_severity</id>
         <label>Minimum alert severity to snapshot</label>
         <type>dropdown</type>
     </field>
@@ -156,24 +178,24 @@
         <label>Local dashboard</label>
     </field>
     <field>
-        <id>web.enabled</id>
+        <id>hound.web.enabled</id>
         <label>Enable dashboard</label>
         <type>checkbox</type>
     </field>
     <field>
-        <id>web.host</id>
+        <id>hound.web.host</id>
         <label>Bind host</label>
         <type>text</type>
         <help>127.0.0.1 keeps it loopback-only. Bind to a routable address
               only behind your own auth/proxy.</help>
     </field>
     <field>
-        <id>web.port</id>
+        <id>hound.web.port</id>
         <label>Bind port</label>
         <type>text</type>
     </field>
     <field>
-        <id>web.cert_file</id>
+        <id>hound.web.cert_file</id>
         <label>TLS cert (optional)</label>
         <type>text</type>
         <help>Absolute path to a PEM-encoded TLS certificate. Leave blank
@@ -184,7 +206,7 @@
               block the embedded iframe as mixed content.</help>
     </field>
     <field>
-        <id>web.key_file</id>
+        <id>hound.web.key_file</id>
         <label>TLS private key (optional)</label>
         <type>text</type>
         <help>Absolute path to the matching PEM private key.</help>
