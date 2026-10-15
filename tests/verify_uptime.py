@@ -488,6 +488,15 @@ def _check_alerts(tmp: Path) -> None:
         assert ar.dedup_key == f"camera_recovered:{CAM}:7"
         print("  camera_recovered: info severity, outage-scoped")
 
+        # a never-seen camera showing up has not "come back"
+        first = Transition("up", NEVER, since=T0, duration=90.0,
+                           outage_id=11, last_seen_before=0.0,
+                           cause="never_seen")
+        af = eng.from_transition(first, T0 + 90)
+        assert "first time" in af.summary, af.summary
+        assert "is back" not in af.summary, af.summary
+        print("  camera_recovered: first sighting worded as such, not 'back'")
+
         ns = Transition("never_seen", NEVER, since=T0, duration=30.0,
                         outage_id=3, last_seen_before=0.0)
         an = eng.from_transition(ns, T0 + 30)

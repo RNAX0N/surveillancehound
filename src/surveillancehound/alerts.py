@@ -137,20 +137,29 @@ class AlertEngine:
                 ),
             )
         if tr.kind == "up":
+            # A camera appearing for the first time has not "come back" —
+            # saying so would misdescribe a camera that was never there.
+            first_time = tr.cause == "never_seen"
+            summary = (
+                f"configured {what} {tr.camera_ip} has appeared for the "
+                f"first time, {_dur(tr.duration)} after the monitor started."
+                if first_time else
+                f"{what} {tr.camera_ip} is back after "
+                f"{_dur(tr.duration)} of silence."
+            )
+            detail = (
+                f"{tr.camera_ip} was configured but had never been observed; "
+                f"traffic from it has now been seen, "
+                f"{_dur(tr.duration)} ({tr.duration:.0f}s) after startup. "
+                if first_time else
+                f"Traffic from {tr.camera_ip} resumed after "
+                f"{_dur(tr.duration)} ({tr.duration:.0f}s) with no "
+                f"observed activity. "
+            ) + f"The outage is recorded in the uptime history. {_PASSIVE_CAVEAT}"
             return self._mk(
                 f"camera_recovered:{tr.camera_ip}:{tr.outage_id}", now,
                 device_ip=tr.camera_ip, kind=KIND_CAMERA_RECOVERED,
-                severity="info",
-                summary=(
-                    f"{what} {tr.camera_ip} is back after "
-                    f"{_dur(tr.duration)} of silence."
-                ),
-                detail=(
-                    f"Traffic from {tr.camera_ip} resumed after "
-                    f"{_dur(tr.duration)} ({tr.duration:.0f}s) with no "
-                    f"observed activity. The outage is recorded in the "
-                    f"uptime history. {_PASSIVE_CAVEAT}"
-                ),
+                severity="info", summary=summary, detail=detail,
             )
         if tr.kind == "never_seen":
             return self._mk(

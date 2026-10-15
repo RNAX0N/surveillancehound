@@ -74,6 +74,10 @@ class Transition:
     outage_id: int | None
     last_seen_before: float  # 0.0 when the camera has never been observed
     role: str = "camera"     # camera | nvr — for human-readable alert text
+    # what opened the outage this transition refers to: 'silence' or
+    # 'never_seen'. A camera appearing for the first time has not "come
+    # back", and the recovery alert should not claim it did.
+    cause: str = "silence"
 
 
 class UptimeTracker:
@@ -292,7 +296,7 @@ class UptimeTracker:
                     kind=UP, camera_ip=ip, since=row.down_since,
                     duration=max(0.0, last - row.down_since),
                     outage_id=outage_id, last_seen_before=row.last_seen_before,
-                    role=self._roles.get(ip, "camera"),
+                    role=self._roles.get(ip, "camera"), cause=row.cause,
                 ))
 
         # a camera in config that has never been observed at all
@@ -312,6 +316,7 @@ class UptimeTracker:
                 kind=NEVER_SEEN, camera_ip=ip, since=self._started_at,
                 duration=now - self._started_at, outage_id=outage_id,
                 last_seen_before=0.0, role=self._roles.get(ip, "camera"),
+                cause=NEVER_SEEN,
             ))
 
         # cameras that have gone quiet
