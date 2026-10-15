@@ -967,6 +967,52 @@ def _check_capture_exclusion() -> None:
     # Compile them for real where tcpdump exists. A filter that does not
     # compile takes the capture down on startup, which is the one failure
     # the whole daemon cannot absorb.
+    # Wiring, not just the helper: prove the daemon actually hands the
+    # exclusion to the capture layer in agent mode, and hands nothing in
+    # the default case. A correct helper nobody calls is still a bug.
+    import tempfile
+    from surveillancehound import daemon as daemon_mod
+    from surveillancehound.config import load_from_dict
+
+    def _seen_exclusion(relay_block: dict) -> str:
+        seen: dict = {}
+
+        def _fake_stream(cfg, **kw):
+            seen.update(kw)
+            raise daemon_mod.CaptureError("stop here; wiring already observed")
+
+        with tempfile.TemporaryDirectory() as td:
+            base = {
+                "capture": {"interface": "test0"},
+                "network": {"camera_ips": ["10.9.0.5"]},
+                "store": {"path": f"{td}/wiring.sqlite"},
+            }
+            base.update(relay_block)
+            cfg = load_from_dict(base)
+            orig = daemon_mod.stream_packets
+            daemon_mod.stream_packets = _fake_stream
+            try:
+                h = daemon_mod.Hound(cfg)
+                h.run()
+                h.store.close()
+            finally:
+                daemon_mod.stream_packets = orig
+        return seen.get("exclude_bpf", "<<never passed>>")
+
+    got = _seen_exclusion({"relay": {
+        "mode": "agent", "sensor_id": "s1",
+        "url": "https://10.9.0.250:18443/ingest/v1",
+        "key": "k" * 20,
+        "tls_fingerprint": ["sha256:" + "AB:" * 31 + "CD"],
+    }})
+    assert "10.9.0.250" in got and "18443" in got, (
+        f"agent mode must exclude its own relay traffic at capture; "
+        f"daemon passed {got!r}"
+    )
+    assert _seen_exclusion({}) == "", (
+        "a non-relay daemon must not have its capture filtered"
+    )
+
     # socketserver dispatches connection errors to the SERVER's
     # handle_error. An override on the handler class silently never fires,
     # which let aborted TLS handshakes print tracebacks to stderr — a peer

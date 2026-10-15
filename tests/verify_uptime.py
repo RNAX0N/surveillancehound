@@ -642,7 +642,7 @@ def _check_watchdog_fires_when_capture_wedges(tmp: Path) -> None:
         def close(self) -> None:
             wedge.set()
 
-    def _fake_stream(cfg, *, keep_raw=False, snaplen_override=None):
+    def _fake_stream(cfg, **_kw):   # **_kw: track the real signature
         def _gen():
             # one real packet so the session starts and a camera is known,
             # then block exactly like a wedged capture
@@ -910,7 +910,7 @@ def _check_capture_death_is_reported(tmp: Path) -> None:
         def is_alive(self) -> bool:
             return False
 
-    def _fake_stream(cfg, *, keep_raw=False, snaplen_override=None):
+    def _fake_stream(cfg, **_kw):   # **_kw: track the real signature
         def _gen():
             yield Packet(
                 ts=time.time(), src_ip=CAM, dst_ip="10.9.0.1",
