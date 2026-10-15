@@ -294,6 +294,46 @@ def _check_opnsense_renderer() -> None:
     print(f"  OPNsense renderer: {len(cases)} model variants → valid TOML each")
 
 
+def _check_opnsense_interface_resolution() -> None:
+    """The form stores an interface ALIAS; tcpdump needs the device.
+
+    Writing the alias straight through produced `interface = "lan"`, and
+    the daemon died with `tcpdump: lan: No such device exists` — a config
+    saved from the OPNsense UI could never capture anything.
+    """
+    mod = _load_opnsense_renderer()
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "config.xml"
+        # a config.xml carrying the interfaces block OPNsense really writes
+        body = _opnsense_synthetic_config(interface="opt2")
+        body = body.replace("<opnsense>", """<opnsense>
+  <interfaces>
+    <wan><if>em0</if></wan>
+    <lan><if>igb1</if></lan>
+    <opt2><if>vlan0.20</if></opt2>
+  </interfaces>""", 1)
+        cfg.write_text(body)
+        out = Path(td) / "hound.toml"
+        assert mod.main(["render_config.py", str(cfg), str(out)]) == 0
+        data = tomllib.loads(out.read_text())
+        assert data["capture"]["interface"] == "vlan0.20", (
+            f"alias not resolved to a device: {data['capture']['interface']!r}"
+        )
+        # direct unit checks, including the pass-through cases
+        mod._IFACE_CACHE.clear()
+        assert mod.resolve_interface("lan", cfg) == "igb1"
+        mod._IFACE_CACHE.clear()
+        # an operator who typed a real device name must keep working
+        assert mod.resolve_interface("igb3", cfg) == "igb3"
+        mod._IFACE_CACHE.clear()
+        # unreadable config.xml must not crash the render
+        assert mod.resolve_interface("lan", Path(td) / "nope.xml") == "lan"
+        mod._IFACE_CACHE.clear()
+        assert mod.resolve_interface("", cfg) == ""
+        mod._IFACE_CACHE.clear()
+    print("  OPNsense renderer: interface alias resolves to the real device")
+
+
 def _check_opnsense_renderer_error_path() -> None:
     """Missing config block should fail loudly, not silently emit garbage."""
     mod = _load_opnsense_renderer()
@@ -689,6 +729,7 @@ def main() -> int:
     print()
     print("=== OPNsense renderer ===")
     _check_opnsense_renderer()
+    _check_opnsense_interface_resolution()
     _check_opnsense_renderer_error_path()
     print()
     print("=== pfSense renderer ===")

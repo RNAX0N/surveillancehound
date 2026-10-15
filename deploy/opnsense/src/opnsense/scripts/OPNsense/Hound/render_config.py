@@ -81,8 +81,58 @@ def _webgui_uses_https(config_path: Path | None = None) -> bool:
     return proto == "https"
 
 
-def render(model_root: ET.Element) -> str:
-    """Render the TOML from the parsed model subtree (the Hound block)."""
+_IFACE_CACHE: dict[str, dict[str, str]] = {}
+
+
+def _interface_map(config_path: Path | None = None) -> dict[str, str]:
+    """Map OPNsense interface aliases to real device names.
+
+    `/conf/config.xml` holds `<interfaces><lan><if>igb1</if></lan>…`. The
+    form stores the alias (`lan`, `opt3`), but tcpdump needs the device
+    (`igb1`, `vlan0.20`).
+    """
+    p = str(config_path) if config_path else str(_CONFIG)
+    if p in _IFACE_CACHE:
+        return _IFACE_CACHE[p]
+    mapping: dict[str, str] = {}
+    try:
+        tree = ET.parse(p)
+        node = tree.getroot().find("./interfaces")
+        if node is not None:
+            for child in node:
+                dev = (child.findtext("if") or "").strip()
+                if dev:
+                    mapping[child.tag] = dev
+    except (FileNotFoundError, ET.ParseError):
+        pass
+    _IFACE_CACHE[p] = mapping
+    return mapping
+
+
+def resolve_interface(alias: str, config_path: Path | None = None) -> str:
+    """Translate a form interface value into something tcpdump accepts.
+
+    The OPNsense picker stores an ALIAS (`lan`, `opt3`), but tcpdump only
+    knows device names. Writing the alias through verbatim produced
+    `interface = "lan"` and the daemon died with `tcpdump: lan: No such
+    device exists` — a config saved from the UI could never capture.
+
+    An unknown value is passed through unchanged: an operator who typed a
+    real device name (`igb1`, `vlan0.20`) into the field must keep working,
+    and so must a box whose config.xml is unreadable from here.
+    """
+    if not alias:
+        return alias
+    return _interface_map(config_path).get(alias, alias)
+
+
+def render(model_root: ET.Element, config_path: Path | None = None) -> str:
+    """Render the TOML from the parsed model subtree (the Hound block).
+
+    `config_path` is the /conf/config.xml the model came from; it is read
+    again for the interface alias table and the webgui protocol. Defaults
+    to the real path so existing callers keep working.
+    """
     g = model_root.find("general") or ET.Element("general")
     n = model_root.find("network") or ET.Element("network")
     b = model_root.find("baseline") or ET.Element("baseline")
@@ -91,7 +141,8 @@ def render(model_root: ET.Element) -> str:
     t = model_root.find("thresholds") or ET.Element("thresholds")
     u = model_root.find("uptime") or ET.Element("uptime")
 
-    iface = _xtext(g, "interface")
+    # the picker stores an alias; tcpdump needs the device behind it
+    iface = resolve_interface(_xtext(g, "interface"), config_path)
     snaplen = _xtext(g, "snaplen", "96")
     bpf = _xtext(g, "bpf")
 
@@ -127,7 +178,7 @@ def render(model_root: ET.Element) -> str:
     web_cert = _xtext(w, "cert_file")
     web_key = _xtext(w, "key_file")
     if not (web_cert and web_key):
-        if _webgui_uses_https():
+        if _webgui_uses_https(config_path):
             web_cert = "/var/lib/hound/hound-web.crt"
             web_key = "/var/lib/hound/hound-web.key"
         else:
@@ -222,7 +273,7 @@ def main(argv: list[str]) -> int:
             "enable the plugin in Services > SurveillanceHound first\n",
         )
         return 2
-    rendered = render(hound)
+    rendered = render(hound, config_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # atomic write so a half-rendered file never reaches the daemon
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")

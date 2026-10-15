@@ -29,10 +29,19 @@ load_rc_config $name
 : ${hound_user:=hound}
 : ${hound_bin:=/usr/local/bin/hound}
 
-pidfile=/var/run/${name}.pid
+# The pidfile must live somewhere ${hound_user} can write. /var/run is
+# root-owned 0755, so rc.subr dropping privileges turned `service hound
+# start` into "daemon: ppidfile '/var/run/hound.pid': Permission denied"
+# — the service could not start at all.
+piddir=/var/run/${name}
+pidfile=${piddir}/${name}.pid
 logfile=/var/log/${name}/hound.log
 command=/usr/sbin/daemon
-command_args="-c -P ${pidfile} -o ${logfile} -- ${hound_bin} run ${hound_config}"
+# -r restarts the child if it exits, -R 5 throttles the retry loop.
+# Without -r, daemon(8) does NOT supervise: when the capture dies the
+# daemon exits non-zero and nothing brings it back, so monitoring just
+# stops. (The systemd unit gets this from Restart=always/RestartSec=5s.)
+command_args="-c -r -R 5 -P ${pidfile} -o ${logfile} -- ${hound_bin} run ${hound_config}"
 command_interpreter=""
 required_files="${hound_config}"
 
@@ -41,6 +50,7 @@ start_precmd=hound_prestart
 hound_prestart() {
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 /var/log/${name}
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 /var/lib/hound
+    install -d -o "${hound_user}" -g "${hound_user}" -m 0755 "${piddir}"
 }
 
 run_rc_command "$1"

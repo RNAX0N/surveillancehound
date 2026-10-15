@@ -37,7 +37,10 @@ load_rc_config $name
 : ${hound_enable:=YES}
 pidfile=/var/run/${name}.pid
 command=/usr/sbin/daemon
-command_args="-c -P ${pidfile} -o /var/log/hound/hound.log -- \
+# -r restarts the child if it exits, -R 5 throttles the retry loop. Without
+# -r, daemon(8) does not supervise: when the capture dies hound exits
+# non-zero and nothing brings it back, so monitoring silently stops.
+command_args="-c -r -R 5 -P ${pidfile} -o /var/log/hound/hound.log -- \
     /usr/local/bin/hound run /usr/local/etc/hound.toml"
 required_files=/usr/local/etc/hound.toml
 run_rc_command "$1"
