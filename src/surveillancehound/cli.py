@@ -26,6 +26,12 @@ Subcommands:
       time the monitor was actually watching, so a stopped daemon is never
       charged to a camera as downtime.
 
+  hound export <config.toml> [--window SECONDS] [--limit N]
+      Dump the dashboard's data as one JSON document on stdout. For
+      front-ends that cannot reach the built-in web server — notably the
+      OPNsense plugin, whose pages run under a Content-Security-Policy
+      that blocks cross-origin iframes.
+
   hound baselines <config.toml> [--camera IP | --reset IP | --reset-all]
       Inspect learned per-camera baselines, or wipe them. NOTE: stop the
       daemon before --reset — it holds Welford state in RAM.
@@ -48,6 +54,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -265,6 +272,64 @@ def cmd_uptime(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    """Dump the dashboard's data as one JSON document on stdout.
+
+    This exists for front-ends that cannot reach the built-in web server.
+    The OPNsense plugin is the motivating case: its pages are served under a
+    Content-Security-Policy of `default-src 'self'`, so an iframe pointed at
+    the dashboard's own port is a cross-origin frame and the browser blocks
+    it outright. The plugin instead renders natively and asks configd to run
+    this command, which keeps everything same-origin and means the UI
+    inherits the firewall's own theme.
+
+    One command returning one document, deliberately: each configd round
+    trip spawns a process, so five endpoints would be five of them on every
+    refresh.
+    """
+    cfg = _cfg(args.config)
+    window = (
+        args.window if args.window is not None
+        else cfg.uptime.report_window_seconds
+    )
+    now = time.time()
+    store = HoundStore(path=cfg.store.path)
+    try:
+        alive, blind, last_activity = _monitor_health(store, cfg, now)
+        session = store.current_monitor_session()
+        devices = store.list_devices()
+        report = store.uptime_report(window, now)
+        alerts = store.list_alerts(limit=args.limit)
+        flows = store.recent_flows(limit=args.limit)
+        doc = {
+            "now": now,
+            "window_seconds": window,
+            "evidence": "passive",
+            "monitor": {
+                "alive": alive,
+                "blind": blind,
+                "last_activity_ts": last_activity,
+                "source": session.source if session else "",
+                "started_at": session.started_at if session else 0.0,
+            },
+            "counts": {
+                "devices": len(devices),
+                "cameras": sum(1 for d in devices if d.role == "camera"),
+                "nvrs": sum(1 for d in devices if d.role == "nvr"),
+                "alerts_24h": sum(1 for a in alerts if a.ts >= now - 86400),
+            },
+            "uptime": [r.__dict__ for r in report],
+            "alerts": [a.__dict__ for a in alerts],
+            "devices": [d.__dict__ for d in devices],
+            "flows": [f.__dict__ for f in flows],
+        }
+    finally:
+        store.close()
+    json.dump(doc, sys.stdout, default=str)
+    sys.stdout.write("\n")
+    return 0
+
+
 def cmd_baselines(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
     store = HoundStore(path=cfg.store.path)
@@ -474,6 +539,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_u.add_argument("--outages", action="store_true",
                      help="print the outage history instead of the summary")
     p_u.set_defaults(func=cmd_uptime)
+
+    p_e = sub.add_parser(
+        "export", help="dump dashboard data as JSON (for external front-ends)"
+    )
+    p_e.add_argument("config")
+    p_e.add_argument("--window", type=float, default=None,
+                     help="uptime window in seconds "
+                          "(default [uptime].report_window_seconds)")
+    p_e.add_argument("--limit", type=int, default=100,
+                     help="max alert and flow rows to include")
+    p_e.set_defaults(func=cmd_export)
 
     p_b = sub.add_parser("baselines", help="inspect or reset learned baselines")
     p_b.add_argument("config")

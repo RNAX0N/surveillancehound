@@ -90,6 +90,49 @@ def _check_sh_syntax() -> None:
     print(f"  sh -n syntax: {checked} script(s)")
 
 
+def _php_strip(code: str) -> str:
+    """Remove PHP strings and comments in ONE left-to-right pass.
+
+    Order matters and neither order is safe on its own: stripping strings
+    first means an apostrophe in a comment ("the daemon's socket") opens a
+    phantom string that swallows everything up to the next quote, braces
+    included; stripping comments first means a `//` inside a string literal
+    (every URL) eats the rest of the line. A single scan that decides what
+    it is in context is the only version that is right.
+    """
+    out = []
+    i, n = 0, len(code)
+    while i < n:
+        c = code[i]
+        nxt = code[i + 1] if i + 1 < n else ""
+        if c in "'\"":
+            quote = c
+            i += 1
+            while i < n:
+                if code[i] == "\\":
+                    i += 2
+                    continue
+                if code[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            out.append(" ")
+        elif c == "/" and nxt == "/":
+            while i < n and code[i] != "\n":
+                i += 1
+        elif c == "#":
+            while i < n and code[i] != "\n":
+                i += 1
+        elif c == "/" and nxt == "*":
+            end = code.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            out.append(" ")
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _check_php_brace_balance() -> None:
     """Hand-rolled brace/<?php balance check — we don't have php-cli.
 
@@ -116,17 +159,7 @@ def _check_php_brace_balance() -> None:
         )
         assert php_blocks, f"{f}: no <?php blocks found"
         php_code = "\n".join(php_blocks)
-        # strip strings so we don't false-positive on braces inside them
-        stripped = re.sub(
-            r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|<<<['\"]?[A-Z_]+['\"]?\n.*?\n[A-Z_]+;?",
-            "",
-            php_code,
-            flags=re.DOTALL,
-        )
-        # also strip // and /* */ and # comments
-        stripped = re.sub(r"//.*?$", "", stripped, flags=re.MULTILINE)
-        stripped = re.sub(r"/\*.*?\*/", "", stripped, flags=re.DOTALL)
-        stripped = re.sub(r"#.*?$", "", stripped, flags=re.MULTILINE)
+        stripped = _php_strip(php_code)
         opens = stripped.count("{")
         closes = stripped.count("}")
         assert opens == closes, (
