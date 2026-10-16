@@ -659,6 +659,638 @@ def _check_listener(tmp: Path) -> None:
         store.close()
 
 
+def _check_disk_guard_needs_real_space(tmp: Path) -> None:
+    """Reusable pages are not a substitute for filesystem space.
+
+    The freelist credit was added so one flood could not wedge the
+    collector at 507 forever. Counting ONLY that credit let the guard
+    pass with literally zero bytes free — measured True at 0 MB, 1 MB
+    and 255 MB against a 256 MB floor on a store with a 351 MB
+    freelist. The store is WAL: every write still appends to `-wal`,
+    which is real filesystem space. Below that the next write raises
+    SQLITE_FULL, the handler answers 500 with a traceback, and the
+    agent retries a 500 forever.
+    """
+    import os as _os
+    from surveillancehound.ingest import IngestServer, _ABSOLUTE_DISK_FLOOR
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "guard.sqlite")
+    # Give the store a real freelist: insert, delete, do not vacuum.
+    recs = V.validate_records({"flows": [
+        {"remote_id": i + 1, "src_ip": "192.168.10.11", "src_port": 554,
+         "dst_ip": "203.0.113.9", "dst_port": 8443, "proto": "tcp",
+         "first_seen": T0, "last_seen": T0 + 1, "packets": 1,
+         "bytes": 1, "bytes_to_camera": 1, "bytes_from_camera": 0,
+         "tcp_flags_seen": "SA", "classification": "external_other"}
+        for i in range(40000)]}, 100000)
+    store.ingest_remote_batch("frigate", "inst-aaaa1111", 1, recs, T0)
+    store.prune_remote(T0 + 365 * 86400.0)
+    reusable = store.reusable_bytes()
+    assert reusable > 4 * 1024 * 1024, (
+        f"setup: only {reusable:,} bytes of freelist. The floor below is "
+        f"derived from it, so the credit has to be big enough to paper "
+        f"over that floor or this test cannot tell the difference")
+
+    # The floor is set BELOW the credit on purpose: the whole point is
+    # that a store holding more reusable space than the configured
+    # floor still must not pass on an empty filesystem.
+    floor_mb = (reusable * 0.75) / (1024 * 1024)
+    srv = IngestServer(_collector_cfg(0, min_free_disk_mb=floor_mb), store,
+                       now=lambda: T0)
+
+    real = _os.statvfs
+
+    class _FakeVfs:
+        def __init__(self, free_bytes):
+            self.f_frsize = 4096
+            self.f_bavail = free_bytes // 4096
+
+    try:
+        cases = [(0, False), (1, False),
+                 (int(floor_mb) + 1, True), (4096, True)]
+        for free_mb, want in cases:
+            _os.statvfs = lambda _p, mb=free_mb: _FakeVfs(mb * 1024 * 1024)
+            got = srv._disk_ok()
+            assert got is want, (
+                f"with {free_mb} MB of real filesystem space free, a "
+                f"{floor_mb:.0f} MB floor and {reusable / 1e6:.0f} MB of "
+                f"reusable pages, _disk_ok() returned {got}, wanted "
+                f"{want}. "
+                f"Free pages inside the store cannot hold the WAL, so "
+                f"the guard needs a hard floor of its own "
+                f"({_ABSOLUTE_DISK_FLOOR // (1024 * 1024)} MB) that the "
+                f"credit cannot paper over")
+    finally:
+        _os.statvfs = real
+        store.close()
+    print(f"  disk guard: refuses below "
+          f"{_ABSOLUTE_DISK_FLOOR // (1024 * 1024)} MB of REAL free space "
+          f"however large the in-store freelist is")
+
+
+def _check_instance_reset_log_is_throttled(tmp: Path) -> None:
+    """A valid key holder must not be able to buy a log line per batch.
+
+    40 batches with a rotating `instance_id` produced 39 WARNING
+    lines. This module already reasons about exactly that for the 401
+    — "a peer chooses how often this fires ... a line per rejected
+    batch is a log flood with a remote throttle" — and the reasoning
+    was not carried to the instance-reset branch. The FIRST reset is
+    worth a warning; it is how a wiped agent volume looks.
+    """
+    import logging as _logging
+    from surveillancehound import relay as _R
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "reset.sqlite")
+    srv = IngestServer(_collector_cfg(0), store, now=lambda: T0)
+    dev = [{"ip": "192.168.10.11", "role": "camera", "first_seen": T0,
+            "last_seen": T0, "packet_count": 1, "byte_count": 1}]
+    seen = []
+
+    class _Grab(_logging.Handler):
+        def emit(self, rec):
+            seen.append((rec.levelno, rec.getMessage()))
+
+    grab = _Grab()
+    lg = _logging.getLogger("surveillancehound.ingest")
+    lg.addHandler(grab)
+    try:
+        for i in range(40):
+            body = _R.build_batch("frigate", f"rot{i:04d}", 1,
+                                  {"devices": list(dev), "flows": [],
+                                   "alerts": [], "outages": [],
+                                   "uptime": [], "monitor": None}, T0)
+            status, _ = srv.handle_batch(
+                "10.0.0.9", body,
+                {_R.SENSOR_HEADER: "frigate",
+                 _R.SIG_HEADER: _R.sign("shared-secret-abcdef", body)})
+            assert status == 200, status
+    finally:
+        lg.removeHandler(grab)
+        store.close()
+    warns = [m for lv, m in seen
+             if lv >= _logging.WARNING and "instance id" in m]
+    assert len(warns) == 1, (
+        f"40 batches with a rotating instance_id produced {len(warns)} "
+        f"warning(s). A valid key holder sets the rate, at 60 requests "
+        f"per minute per source address and no limit on addresses")
+    print("  instance resets: 40 rotations produce one warning, not 39")
+
+
+def _check_relayed_outages_have_a_reader(tmp: Path) -> None:
+    """Nothing may be relayed that no surface ever shows.
+
+    `remote_outages` was written, quota-trimmed, pruned and
+    forgotten, with no reader anywhere — so the agent spent batch
+    budget on it, the carry-forward and close-detection machinery ran,
+    and the result went nowhere. Meanwhile `hound uptime --outages` on
+    a collector printed "no outages in the last 24h" while relayed
+    sensors were reporting a fleet of them. A collector's own
+    [network] often has NO cameras, because the cameras sit behind the
+    NVR — that is why relay mode exists.
+    """
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "reader.sqlite")
+    recs = V.validate_records({"outages": [
+        {"remote_id": 1, "camera_ip": "192.168.10.11",
+         "down_since": T0 + 100, "up_at": T0 + 200,
+         "last_seen_before": T0 + 90, "cause": "silence"},
+        {"remote_id": 2, "camera_ip": "192.168.10.12",
+         "down_since": T0 + 300, "up_at": None,
+         "last_seen_before": T0 + 290, "cause": "silence"},
+    ]}, 1000)
+    store.ingest_remote_batch("frigate", "inst-aaaa1111", 1, recs, T0)
+    rows = store.list_remote_outages(since=T0)
+    assert len(rows) == 2, (
+        f"list_remote_outages returned {len(rows)} of 2 relayed outage "
+        f"windows. If nothing reads this table, the agent should not be "
+        f"spending batch budget filling it")
+    by_id = {r["remote_id"]: r for r in rows}
+    assert by_id[1]["up_at"] == T0 + 200
+    assert by_id[2]["up_at"] is None, "the open one must read as open"
+    assert all(r["sensor_id"] == "frigate" for r in rows), rows
+    # An open outage is returned however old it is — it is current.
+    assert len(store.list_remote_outages(since=T0 + 10**6)) == 1, (
+        "an outage that is still open must be shown no matter how long "
+        "ago it started; it is the live state of that camera")
+    store.close()
+    print("  relayed outages: both windows readable, the open one is "
+          "always current")
+
+
+def _check_guards_at_their_call_sites(tmp: Path) -> None:
+    """Defences that a mutation survived because only the helper was tested.
+
+    Each of these was replaced with `if False:` / a no-op while the
+    whole suite stayed green. A unit test on the helper proves the
+    helper works; it says nothing about whether anyone calls it.
+    """
+    from surveillancehound import relay as _R
+    from surveillancehound.config import load_from_dict
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.store import HoundStore
+
+    # --- config: the placeholder secret is not a secret --------------
+    base = {"capture": {"pcap_file": "x.pcap"},
+            "network": {"lan_subnets": ["88.255.0.0/16"]}}
+    for key in ("CHANGE-ME-min-16-chars", "prefix-CHANGE-ME-suffix"):
+        try:
+            load_from_dict({**base, "relay": {
+                "mode": "agent", "sensor_id": "s", "key": key,
+                "url": "https://88.255.5.1:18443/ingest/v1",
+                "tls_fingerprint": ["sha256:" + "ab" * 32]}})
+            raise AssertionError(
+                f"config accepted {key!r} as a shared secret. It is "
+                f"published in this repo, and config-check is the "
+                f"command the deployment docs tell operators to run "
+                f"before starting")
+        except ValueError as e:
+            assert "placeholder" in str(e), e
+
+    # --- config: listen_host is an address, like every other one -----
+    try:
+        load_from_dict({**base, "relay": {
+            "mode": "collector", "listen_host": "collector.example.com",
+            "sensor": [{"id": "s", "key": "shared-secret-abcdef"}]}})
+        raise AssertionError(
+            "collector accepted a HOSTNAME as listen_host. The daemon "
+            "does no DNS resolution, so it would be handed to "
+            "getaddrinfo at bind time and could land on an interface "
+            "the operator did not name")
+    except ValueError as e:
+        assert "not an IP address" in str(e), e
+    # ...and a literal still works.
+    load_from_dict({**base, "relay": {
+        "mode": "collector", "listen_host": "88.255.5.1",
+        "sensor": [{"id": "s", "key": "shared-secret-abcdef"}]}})
+
+    # --- ingest: the container budget runs BEFORE json.loads ---------
+    store = HoundStore(path=tmp / "guards.sqlite")
+    srv = IngestServer(_collector_cfg(0), store, now=lambda: T0)
+    bomb = b'{"a":' + b"[" * (V.MAX_CONTAINERS + 1000) + b"]" * (
+        V.MAX_CONTAINERS + 1000) + b"}"
+    status, payload = srv.handle_batch(
+        "10.0.0.9", bomb,
+        {_R.SENSOR_HEADER: "frigate",
+         _R.SIG_HEADER: _R.sign("shared-secret-abcdef", bomb)})
+    assert status == 400, (
+        f"a container bomb must be refused by the pre-parse budget at "
+        f"the ingest call site, not merely by the helper in isolation; "
+        f"got {status}")
+    assert "container" in str(payload.get("error", "")).lower(), payload
+
+    # --- validate: a remote_id of 0 is not a valid id ----------------
+    try:
+        V.validate_records({"alerts": [{
+            "remote_id": 0, "ts": T0, "device_ip": "10.0.0.1",
+            "kind": "new_device", "severity": "low", "summary": "x",
+            "detail": "", "dedup_key": "k"}]}, 10)
+        raise AssertionError(
+            "remote_id 0 was accepted. The floor is 1 because 0 is what "
+            "a missing or unparsable id degrades to, and two records "
+            "sharing it collapse to one row on the collector")
+    except V.ValidationError as e:
+        assert "remote_id" in str(e), e
+
+    # --- store: the per-sensor quota covers notification rows too ----
+    assert any(t == "remote_notifications" for t, _ in
+               HoundStore._QUOTA_TABLES), (
+        "remote_notifications has no per-sensor quota, so it is "
+        "retention-only and its rows outlive the alerts they cite")
+    # ...and every quota column is one WE stamp, never the sensor's.
+    for table, col in HoundStore._QUOTA_TABLES:
+        assert col in ("ingested_at", "reported_at", "attempted_at"), (
+            f"{table} is trimmed on {col!r}. A quota ordered by a "
+            f"sensor-supplied timestamp lets that sensor choose which "
+            f"of its rows survive — it stamps the ones it wants kept "
+            f"into the future and the trim evicts everything real")
+    store.close()
+    print("  call-site guards: placeholder key, hostname listen_host, "
+          "container budget, remote_id floor and quota columns all "
+          "enforced where they are used")
+
+
+def _check_retention_does_not_block_capture(tmp: Path) -> None:
+    """Retention must free rows WITHOUT stalling the packet loop.
+
+    A previous revision put `VACUUM` in `prune_remote` so retention
+    would free bytes and not just rows. `prune_remote` is called from
+    the daemon tick, which holds `_loop_lock` — the lock the packet
+    path takes per packet — and VACUUM costs time proportional to LIVE
+    data, not to the rows deleted. Measured on NVMe: 1.4s at 30k live
+    relayed alerts, 6.1s at 120k, 28.1s at 250k, which is one sensor's
+    stock `max_rows_per_sensor`. Nothing alerted, because the thread
+    inside the VACUUM is the one that would have fired
+    `capture_stalled`.
+
+    It did not even reclaim: the store is WAL, so VACUUM wrote the
+    rebuilt database into `-wal` and total on-disk usage was unchanged
+    (1053 MB db + 0 wal became 53 MB + 1006 MB). It also zeroed the
+    freelist, removing the credit `ingest._disk_ok` counts — leaving
+    the collector strictly worse off than before the sweep.
+
+    So: the daemon deletes rows and leaves the pages reusable in
+    place; `hound prune --relay-days` is where reclamation lives.
+    """
+    import time as _t
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "sweep.sqlite")
+    n = 1500
+    for batch in range(4):
+        recs = V.validate_records({"alerts": [
+            {"remote_id": batch * n + i + 1, "ts": T0 + i,
+             "device_ip": "192.168.10.11", "kind": "new_device",
+             "severity": "low", "summary": "s" * 512, "detail": "d" * 512,
+             "dedup_key": f"s{batch}-{i}"}
+            for i in range(n)]}, 100000)
+        store.ingest_remote_batch("frigate", "inst-aaaa1111", batch + 1,
+                                  recs, T0 + batch)
+    live = store._conn.execute("SELECT COUNT(*) c FROM remote_alerts"
+                               ).fetchone()["c"]
+    assert live == 4 * n, live
+    # Expire only the first batch, as an hourly sweep would.
+    t0 = _t.monotonic()
+    deleted = store.prune_remote(T0 + 0.5)
+    took = _t.monotonic() - t0
+    assert deleted["remote_alerts"] == n, deleted
+    # The whole point: cost tracks the rows REMOVED, not the rows kept.
+    assert took < 2.0, (
+        f"the retention sweep took {took:.2f}s to delete {n} rows from "
+        f"a store holding {live}. It runs inside the daemon tick, which "
+        f"holds the lock the packet path takes per packet, so its cost "
+        f"must not scale with live data — that is what a VACUUM here "
+        f"did, for 28s at one sensor's stock quota")
+    # And the freed pages are still credited as reusable.
+    assert store.reusable_bytes() > 0, (
+        "retention freed 1500 rows and reports no reusable pages. "
+        "ingest._disk_ok counts this credit, and without it one flood "
+        "is a permanent 507 for every sensor")
+    # Reclamation exists, but only off the daemon's path.
+    assert hasattr(store, "vacuum"), \
+        "there must be a shipped way to return the bytes"
+    before, _ = store.vacuum()
+    assert before > 0
+    store.close()
+    # WAL checkpointed on close; now the file has actually shrunk.
+    after_close = (tmp / "sweep.sqlite").stat().st_size
+    assert after_close < before, (
+        f"after vacuum() and close the file is {after_close:,} bytes, "
+        f"was {before:,}. In WAL mode the shrink lands at the "
+        f"checkpoint, which is why this belongs in a one-shot CLI "
+        f"process and not in the daemon")
+    print(f"  retention: {n} rows expired in {took:.2f}s from a store of "
+          f"{live}, pages stay reusable, vacuum() reclaims "
+          f"{before:,}->{after_close:,} off the tick")
+
+
+def _check_outage_close_is_never_crowded_out(tmp: Path) -> None:
+    """A camera's RECOVERY must reach the collector, always.
+
+    A close is the only thing that clears a camera on the collector,
+    and it is relayed exactly once — the row stops matching
+    `up_at IS NULL` the moment it closes, and by then the watermark
+    has passed its id, so the carry-forward list is the only thing
+    that can still find it.
+
+    That list was being crowded out. `outages_changed_since` also
+    matches every STILL-OPEN outage, and the ordering was by id — so
+    with more outages open than fit in a batch, low-id open rows
+    (repeats of what the collector already has) filled every batch and
+    the close of a high-id camera was returned on no cycle at all.
+    Measured before the fix: 1,020 open, limit 1,000, the close of id
+    1020 undelivered after 2,000 push cycles — about 17 hours at the
+    30s default, and permanent rather than slow, because the window
+    only moved when a lower-id outage closed.
+
+    Closes now sort ahead of open re-sends, which are only filler.
+    """
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import HoundStore, OutageRow
+
+    home = tmp / "crowd"
+    home.mkdir()
+    store = HoundStore(path=home / "agent.sqlite")
+    total, limit = 120, 20
+    ids = []
+    for i in range(total):
+        ids.append(store.open_outage(OutageRow(
+            id=None, camera_ip=f"10.4.{i // 256}.{i % 256}",
+            down_since=T0 + i, up_at=None, last_seen_before=T0 + i - 1,
+            cause="silence")))
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url="https://127.0.0.1:1/ingest/v1",
+        tls_fingerprint=["sha256:" + "ab" * 32],
+        max_records_per_batch=limit,
+    )
+    client = RelayClient(cfg, store, now=lambda: T0 + 10_000)
+
+    def cycle():
+        records, wm = client.collect()
+        client.state.watermark = wm
+        return records["outages"]
+
+    # Deliver all of them first, so the watermark is past every id and
+    # the carry-forward list is the only route left.
+    delivered = set()
+    for _ in range(64):
+        for o in cycle():
+            delivered.add(o["remote_id"])
+        if len(delivered) >= total:
+            break
+    assert len(delivered) == total, (
+        f"only {len(delivered)} of {total} outages were relayed at all")
+
+    # Now the HIGHEST-id camera recovers, with everything else still
+    # down. This is the one the old ordering could never report.
+    target = ids[-1]
+    store.close_outage(target, T0 + 20_000)
+    closed_seen = False
+    for n in range(1, 33):
+        for o in cycle():
+            if o["remote_id"] == target and o["up_at"] is not None:
+                closed_seen = True
+        if closed_seen:
+            break
+    assert closed_seen, (
+        f"the recovery of outage {target} was not relayed in {n} "
+        f"cycles with {total - 1} other cameras still down and a batch "
+        f"limit of {limit}. A close is sent once; if open re-sends can "
+        f"crowd it out, that camera reads down on the collector for "
+        f"good")
+    assert n <= 4, (
+        f"the close took {n} cycles to get out; closes must sort ahead "
+        f"of still-open repeats, not queue behind them")
+    store.close()
+    print(f"  outage close: the highest-id camera's recovery relayed in "
+          f"{n} cycle(s) with {total - 1} cameras still down at a batch "
+          f"limit of {limit}")
+
+
+def _check_asymmetric_caps_defer_rather_than_destroy(tmp: Path) -> None:
+    """A collector configured lower than its agent must not eat data.
+
+    `hound.toml.example` offers "lower max_body_bytes and
+    max_records_per_batch" as the operator knob for collector load and
+    did not say "on both ends". The agent sizes batches from its OWN
+    config because it cannot see the collector's, so the mismatch made
+    every batch a 400 — and 400 is terminal on the agent side, after
+    the watermark advanced at enqueue.
+
+    Measured before the fix: collector at 500 records, agent at the
+    1000 default, 1000 of 1200 alerts destroyed, `flush()` returning
+    True and the spool reporting empty.
+    """
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import AlertRow, HoundStore
+
+    clock = {"t": T0 + 10}
+    now = lambda: clock["t"]                                   # noqa: E731
+    port = _free_port()
+    collector = HoundStore(path=tmp / "lowcap.sqlite")
+    # The collector is configured LOWER than the agent, on both knobs.
+    srv = IngestServer(
+        _collector_cfg(port, max_records_per_batch=500), collector, now=now)
+    assert srv.start()
+
+    home = tmp / "lowagent"
+    home.mkdir()
+    agent = HoundStore(path=home / "agent.sqlite")
+    total = 1200
+    for i in range(total):
+        agent.insert_alert(AlertRow(
+            id=None, ts=T0 + i, device_ip="192.168.10.11",
+            kind="control_channel_suspect", severity="critical",
+            summary="s" * 64, detail="", dedup_key=f"ac{i}"))
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url=f"https://127.0.0.1:{port}/ingest/v1",
+        tls_fingerprint=_pin(), batch_seconds=1.0,
+    )
+    client = RelayClient(cfg, agent, now=now)
+    try:
+        for _ in range(24):
+            clock["t"] += 30.0
+            client.enqueue()
+            client.flush()
+            stored = collector._conn.execute(
+                "SELECT COUNT(*) c FROM remote_alerts").fetchone()["c"]
+            if stored >= total and not client.spool.pending(now()):
+                break
+        stored = collector._conn.execute(
+            "SELECT COUNT(*) c FROM remote_alerts").fetchone()["c"]
+        assert stored == total, (
+            f"{stored} of {total} alerts reached a collector configured "
+            f"below its agent. A cap mismatch must cost a cycle, not the "
+            f"observations — the watermark advances at enqueue, so a "
+            f"dropped batch is gone for good")
+        assert client.spool.stats(now()).dropped_stale == 0, (
+            f"{client.spool.stats(now()).dropped_stale} batch(es) were "
+            f"discarded outright; they should have been split and resent")
+        # And it learned, so it is not relearning every cycle.
+        assert client._learned_records == 500, client._learned_records
+    finally:
+        srv.stop()
+        agent.close()
+        collector.close()
+    print(f"  cap mismatch: all {total} alerts delivered to a collector "
+          f"capped below the agent, nothing discarded, limit learned")
+
+
+def _check_final_flush(tmp: Path) -> None:
+    """The shutdown drain has to actually drain, and stay bounded.
+
+    `final_flush` had ZERO references under tests/, so its budget,
+    its `ignore_stop` pacing and its lock wait were all unexercised —
+    and it is the drain the agent's 90s Docker stop grace exists for.
+    """
+    import time as _t
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import AlertRow, HoundStore
+
+    clock = {"t": T0 + 10}
+    now = lambda: clock["t"]                                   # noqa: E731
+    port = _free_port()
+    collector = HoundStore(path=tmp / "ff-collector.sqlite")
+    srv = IngestServer(_collector_cfg(port, max_batches_per_minute=10000),
+                       collector, now=now)
+    assert srv.start()
+    home = tmp / "ff"
+    home.mkdir()
+    agent = HoundStore(path=home / "agent.sqlite")
+    # Seeded before the client exists so the first enqueue has work.
+    for i in range(30):
+        agent.insert_alert(AlertRow(
+            id=None, ts=T0 + i, device_ip="192.168.10.11",
+            kind="new_device", severity="low", summary="x", detail="",
+            dedup_key=f"ff{i}"))
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url=f"https://127.0.0.1:{port}/ingest/v1",
+        tls_fingerprint=_pin(), batch_seconds=1.0,
+    )
+    client = RelayClient(cfg, agent, now=now)
+    try:
+        # Three batches spooled, link up, nothing flushed yet. New
+        # alerts each cycle, because `enqueue` returns 0 when there is
+        # nothing new and would otherwise spool one batch, not three.
+        for cycle in range(3):
+            clock["t"] += 30.0
+            for i in range(10):
+                agent.insert_alert(AlertRow(
+                    id=None, ts=T0 + 1000 + cycle * 10 + i,
+                    device_ip="192.168.10.11", kind="new_device",
+                    severity="low", summary="x", detail="",
+                    dedup_key=f"ffc{cycle}-{i}"))
+            assert client.enqueue(), f"cycle {cycle} spooled nothing"
+        pend = client.spool.pending(now())
+        assert len(pend) == 3, f"expected 3 spooled batches, got {len(pend)}"
+        # `_stop` is set by stop(); final_flush must send anyway.
+        wall = _t.monotonic()
+        client.final_flush()
+        took = _t.monotonic() - wall
+        left = client.spool.pending(now())
+        assert not left, (
+            f"final_flush left {len(left)} batch(es) spooled with the "
+            f"collector up and the budget unspent; `ignore_stop` must "
+            f"let it send after stop() has set the flag")
+        stored = collector._conn.execute(
+            "SELECT COUNT(*) c FROM remote_alerts").fetchone()["c"]
+        assert stored == 60, f"{stored} of 60 alerts arrived"
+        # Bounded: the pacing between batches must not run on the
+        # wall clock for a replay the operator is waiting on.
+        assert took < 30.0, (
+            f"final_flush took {took:.1f}s for 3 batches; the Docker "
+            f"stop grace is 90s and systemd's default is 90s, so this "
+            f"has to stay well inside it")
+    finally:
+        srv.stop()
+        agent.close()
+        collector.close()
+    print(f"  final_flush: 3 spooled batches drained in {took:.1f}s with "
+          f"stop() already called, nothing left behind")
+
+
+def _check_drain_deadline_is_total(tmp: Path) -> None:
+    """The drain's deadline must bound it, not reset per recv.
+
+    The docstring says "bounded by a TOTAL deadline, not a per-recv
+    timeout". It was checked at the loop top and then `read1` was
+    handed the FULL budget again, so one more whole budget could
+    elapse inside the call: measured 3.84s against a 2s bound for a
+    peer sending one byte every 1.9s.
+    """
+    import socket as _sock
+    import ssl as _ssl
+    import threading as _th
+    import time as _t
+    from surveillancehound.ingest import IngestServer, _DRAIN_BUDGET_S
+    from surveillancehound.store import HoundStore
+
+    port = _free_port()
+    store = HoundStore(path=tmp / "deadline.sqlite")
+    cap = 64 * 1024
+    srv = IngestServer(_collector_cfg(port, max_body_bytes=cap,
+                                      max_batches_per_minute=10000),
+                       store, now=lambda: T0)
+    assert srv.start()
+    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    try:
+        raw = _sock.socket()
+        raw.settimeout(60)
+        raw.connect(("127.0.0.1", port))
+        w = ctx.wrap_socket(raw)
+        w.sendall(f"POST /ingest/v1 HTTP/1.1\r\nHost: x\r\n"
+                  f"Content-Length: {cap + 1024}\r\n\r\n".encode())
+        t0 = _t.monotonic()
+        stop = _th.Event()
+
+        def dribble():
+            # Just under the old per-recv timeout, so each byte used to
+            # buy the peer another full budget.
+            while not stop.wait(_DRAIN_BUDGET_S * 0.95):
+                try:
+                    w.sendall(b"x")
+                except OSError:
+                    return
+
+        _th.Thread(target=dribble, daemon=True).start()
+        try:
+            while w.recv(65536):
+                pass
+        except OSError:
+            pass
+        held = _t.monotonic() - t0
+        stop.set()
+        try:
+            w.close()
+        except OSError:
+            pass
+        # Generous: the point is that it does not scale with how long
+        # the peer keeps dribbling. The pre-fix measurement was 1.92x.
+        assert held < _DRAIN_BUDGET_S * 1.6, (
+            f"a dribbling peer held the drain {held:.2f}s against a "
+            f"stated {_DRAIN_BUDGET_S}s total budget; the per-iteration "
+            f"timeout must come from the REMAINING budget")
+    finally:
+        srv.stop()
+        store.close()
+    print(f"  drain deadline: a peer dribbling under the socket timeout "
+          f"is released in {held:.2f}s, not one budget per byte")
+
+
 def _check_retention_actually_bounds_growth(tmp: Path) -> None:
     """Retention is documented as the ONLY bound on remote_* growth.
 
@@ -3804,6 +4436,15 @@ def main() -> int:
         _check_http_refusals_are_logged(Path(td))
         _check_alert_kinds_cannot_drift(Path(td))
         _check_damaged_spool_line(Path(td))
+        _check_guards_at_their_call_sites(Path(td))
+        _check_disk_guard_needs_real_space(Path(td))
+        _check_instance_reset_log_is_throttled(Path(td))
+        _check_relayed_outages_have_a_reader(Path(td))
+        _check_retention_does_not_block_capture(Path(td))
+        _check_outage_close_is_never_crowded_out(Path(td))
+        _check_final_flush(Path(td))
+        _check_drain_deadline_is_total(Path(td))
+        _check_asymmetric_caps_defer_rather_than_destroy(Path(td))
         _check_agent_state(Path(td))
         _check_shutdown_and_slot_release(Path(td))
     print("=== listener ===")

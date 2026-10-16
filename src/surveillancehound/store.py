@@ -1036,16 +1036,52 @@ class HoundStore:
         guaranteed exactly one more send. The upsert on the collector
         makes the repeat idempotent.
         """
-        # Oldest ids first when the carry-forward list has to be
-        # truncated: those are the ones that have been waiting longest
-        # for a close to be observed.
-        ids = sorted(int(i) for i in open_ids)[:limit]
+        # Take the carry-forward ids AS GIVEN, already ordered by the
+        # caller, and keep well under SQLite's bind-parameter limit.
+        #
+        # This used to sort them and take the lowest `limit`. Oldest
+        # first sounded right and made the window FIXED: with more
+        # outages open than fit in a batch, only the lowest ids were
+        # ever re-queried, so a close was returned on no cycle at all
+        # while any lower-id outage stayed open. Measured: with 1,020
+        # open and a limit of 1,000, the close of id 1020 was not
+        # delivered in 2,000 push cycles — about 17 hours at the 30s
+        # default, and permanent rather than slow, because the window
+        # only slides when a lower-id outage closes. The caller rotates
+        # instead; see `RelayClient._rotate_open`.
+        #
+        # 900, not `limit`: older SQLite builds cap bind parameters at
+        # 999 and the relay's default limit is 1000, which would sit
+        # right on the edge on whatever the OPNsense Python links.
+        ids = [int(i) for i in open_ids][:min(limit, 900)]
         extra = ""
         if ids:
             extra = " OR id IN (%s)" % ",".join("?" * len(ids))
         with self._lock:
             rows = self._conn.execute(
-                # NEW OUTAGES FIRST, then the re-sends.
+                # Three priorities, and the middle one is the fix.
+                #
+                # NEW outages first (`id > ?`): that term strictly
+                # progresses, so the caller's cursor always advances.
+                # Plain `ORDER BY id LIMIT` made this a fixed prefix —
+                # with `limit` or more outages open at once, the
+                # lowest-id open rows filled every batch and a
+                # newly-opened outage was returned on no cycle at all.
+                #
+                # Then CLOSES WE OWE (`up_at IS NOT NULL` among the
+                # carry-forward ids). A close is terminal: it clears
+                # the camera and drops the id from the carry-forward
+                # set. Still-open rows are mere repeats of what the
+                # collector already has, and they were sorting AHEAD
+                # of closes purely by id — so with more outages open
+                # than fit in a batch, the close of a high-id camera
+                # was crowded out by low-id open rows forever and that
+                # camera showed down on the collector permanently.
+                # Rotating the carry-forward list did not help,
+                # because the `up_at IS NULL` term matches every open
+                # row regardless of that list.
+                #
+                # Open re-sends last, as filler.
                 #
                 # Plain `ORDER BY id LIMIT` made this a fixed prefix:
                 # with `limit` or more outages open at once, the
@@ -1058,7 +1094,9 @@ class HoundStore:
                 # left and resume once it has.
                 """SELECT * FROM outages
                    WHERE id > ? OR up_at IS NULL""" + extra + """
-                   ORDER BY (id > ?) DESC, id LIMIT ?""",
+                   ORDER BY (id > ?) DESC,
+                            (up_at IS NOT NULL) DESC,
+                            id LIMIT ?""",
                 (int(after_id), *ids, int(after_id), int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -1423,12 +1461,19 @@ class HoundStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def remote_uptime_report(self, now: float, stale_after: float) -> list[dict]:
+    def remote_uptime_report(self, now: float, stale_after: float,
+                             blind_sensors: "Sequence[str]" = ()
+                             ) -> list[dict]:
         """Relayed camera state, stale-gated.
 
         A sensor that stopped reporting leaves its last snapshot behind. The
         honest rendering of that is `unknown` — NOT the `up` it last claimed,
         which would show a dead segment as healthy.
+
+        `blind_sensors` names sensors that are still reporting but have
+        told us their own capture is not seeing traffic. Their rows get
+        the same treatment, for the same reason: a figure from a blind
+        sensor is not a current figure.
         """
         with self._lock:
             rows = self._conn.execute(
@@ -1443,9 +1488,22 @@ class HoundStore:
             # exactly that and showed every relayed camera as "local".
             # One key, set here, so every reader agrees.
             d["sensor"] = d["sensor_id"]
-            if (now - d["reported_at"]) > stale_after:
+            # Stale for EITHER reason: the link went quiet, or the
+            # sensor told us its own capture is blind.
+            #
+            # Gating on report age alone meant a sensor whose capture
+            # had stalled but whose link was fine kept rendering its
+            # last snapshot as current — `up`, 100% availability — on
+            # both dashboards. That is the same fabrication as
+            # inventing a figure from no observation, which is what
+            # `uptime.py`'s stall suppression exists to prevent
+            # locally; the relayed path had no equivalent.
+            blind = bool(blind_sensors and d["sensor_id"] in blind_sensors)
+            if blind or (now - d["reported_at"]) > stale_after:
                 d["state"] = "unknown"
                 d["stale"] = True
+                d["stale_reason"] = ("sensor capture blind" if blind
+                                     else "sensor not reporting")
                 # Its availability is as stale as its state. Reporting the
                 # last figure as though it were current is the same
                 # fabrication as inventing one from no observation.
@@ -1454,6 +1512,34 @@ class HoundStore:
                 d["stale"] = False
             out.append(d)
         return out
+
+    def list_remote_outages(self, since: float,
+                            limit: int = 500) -> list[dict]:
+        """Outage windows relayed by sensors.
+
+        `remote_outages` had no reader at all: rows were written,
+        quota-trimmed, pruned and forgotten, and nothing displayed
+        them. So the agent spent batch budget relaying them, the
+        carry-forward and close-detection machinery ran, and the
+        result went nowhere — while `hound uptime --outages` on a
+        collector printed "no outages" with a fleet of relayed cameras
+        reporting. For a project whose stated cardinal sin is a
+        surface reporting something it cannot back, a view that omits
+        the only data a collector HAS is the sin in its purest form.
+
+        Filtered on `down_since` so it reads like the local view, but
+        bounded by `ingested_at` too: a sensor controls `down_since`
+        and could otherwise backdate rows out of every window or
+        forward-date them to the top of every one.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM remote_outages
+                   WHERE down_since >= ? OR up_at IS NULL
+                   ORDER BY down_since DESC LIMIT ?""",
+                (float(since), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def remote_quota_usage(self, sensor_id: str) -> dict[str, int]:
         with self._lock:
@@ -1519,26 +1605,59 @@ class HoundStore:
             deleted["remote_uptime"] = self._conn.execute(
                 "DELETE FROM remote_uptime WHERE reported_at < ?", (older_than,)
             ).rowcount
-        # Reclaim, OUTSIDE the transaction above — SQLite refuses a
-        # VACUUM inside one and says so loudly.
+        # NO VACUUM HERE. Read this before adding one back.
         #
-        # Without this, retention freed rows but never bytes: measured,
-        # 40,000 relayed flows grew the file to 2.85 MB, and deleting
-        # all 40,000 left it at 4.86 MB with 1,140 free pages and no
-        # shrink. `ingest._disk_ok()` gates on FILESYSTEM free space,
-        # so a sensor that had inflated the store to the
-        # `min_free_disk_mb` floor kept the collector answering 507 to
-        # every sensor forever, with retention unable to help and no
-        # shipped recovery path.
+        # A previous revision did, to make retention free bytes and not
+        # just rows. It was a worse bug than the one it fixed, twice
+        # over:
         #
-        # `_vacuum_is_safe` can refuse (it needs headroom, and
-        # declines exactly when disk is tight). That is why
-        # `_disk_ok()` also counts the freelist: pages freed here are
-        # reusable whether or not the file shrinks.
-        if any(deleted.values()) and self._vacuum_is_safe():
-            with self._lock:
-                self._conn.execute("VACUUM")
+        # 1. `prune_remote` is called from the daemon tick, which holds
+        #    `_loop_lock` — the lock the packet path takes per packet.
+        #    VACUUM costs time proportional to LIVE data, not to the
+        #    rows deleted, so the hourly sweep rewrote the whole
+        #    database while the capture loop waited. Measured on NVMe:
+        #    1.4s at 30k live relayed alerts, 6.1s at 120k, and 28.1s
+        #    at 250k — which is exactly `max_rows_per_sensor`, i.e. one
+        #    sensor's stock quota. Packet-loop lock acquisitions went
+        #    from 4.0M/s to zero for the whole hold, and nothing
+        #    alerted: the watchdog thread is the one inside the VACUUM,
+        #    so no tick can fire `capture_stalled`.
+        # 2. It did not even reclaim. The store is WAL, so VACUUM
+        #    writes the rebuilt database into `-wal` and the main file
+        #    only shrinks at a checkpoint. Measured: db 1053 MB -> 53 MB
+        #    with wal 0 -> 1006 MB, TOTAL unchanged, and still unchanged
+        #    after 6,000 further writes. A sweep that expired little was
+        #    a net increase (526 MB -> 1002 MB total). It also zeroed
+        #    the freelist, removing the `reusable_bytes` credit that
+        #    `ingest._disk_ok` counts — so the collector was strictly
+        #    worse off for the guard after the sweep than before it.
+        #
+        # Reclamation belongs in `vacuum()`, called only from
+        # `hound prune --relay-days`: a separate short-lived process,
+        # not holding `_loop_lock`, whose exit checkpoints the WAL away.
+        # The daemon's job here is to delete rows; the pages it frees
+        # are reusable in place, which is what the disk guard counts.
         return deleted
+
+    def vacuum(self) -> tuple[int, int]:
+        """Rebuild the database to return free pages to the filesystem.
+
+        NOT for the daemon. See the note in `prune_remote`: this holds
+        the store lock for as long as it takes to rewrite every live
+        page, and in WAL mode the bytes only come back when the
+        connection closes and the WAL is checkpointed away. Both are
+        fine in a one-shot CLI process and unacceptable inside the
+        packet loop.
+
+        Returns (before, after) file sizes. `after` will usually still
+        be the pre-VACUUM size in-process; the shrink lands on close.
+        """
+        before = self.path.stat().st_size
+        if not self._vacuum_is_safe():
+            return before, before
+        with self._lock:
+            self._conn.execute("VACUUM")
+        return before, self.path.stat().st_size
 
     def reusable_bytes(self) -> int:
         """Free pages inside the store, in bytes.

@@ -241,32 +241,67 @@ def cmd_uptime(args: argparse.Namespace) -> int:
             )
 
         if args.outages:
-            rows = store.list_outages(since=now - window, limit=500)
-            if not rows:
+            # Local AND relayed. This read `list_outages` only, so on a
+            # collector — whose own [network] often has no cameras at
+            # all, because the cameras sit behind the NVR — it printed
+            # "no outages" while relayed sensors were reporting a
+            # fleet of them. The dashboard showed both; the CLI showed
+            # one and said nothing about it.
+            local = store.list_outages(since=now - window, limit=500)
+            relayed = (store.list_remote_outages(since=now - window,
+                                                 limit=500)
+                       if cfg.relay.is_collector else [])
+            if not local and not relayed:
                 print(f"no outages in the last {_dur(window)}")
                 return 0
-            print(f"\n{'camera':18s} {'from':19s} {'to':19s} "
-                  f"{'duration':>10s}  cause")
-            for o in rows:
+            print(f"\n{'sensor':12s} {'camera':18s} {'from':19s} "
+                  f"{'to':19s} {'duration':>10s}  cause")
+            rows = [("local", o.camera_ip, o.down_since, o.up_at,
+                     o.duration(now), o.cause) for o in local]
+            rows += [(r["sensor_id"], r["camera_ip"], r["down_since"],
+                      r["up_at"],
+                      ((r["up_at"] or now) - r["down_since"]),
+                      r["cause"]) for r in relayed]
+            rows.sort(key=lambda r: r[2], reverse=True)
+            for sensor, ip, down, up, dur, cause in rows:
                 until = (
-                    f"{datetime.fromtimestamp(o.up_at):%Y-%m-%d %H:%M:%S}"
-                    if o.up_at is not None else "(ongoing)"
+                    f"{datetime.fromtimestamp(up):%Y-%m-%d %H:%M:%S}"
+                    if up is not None else "(ongoing)"
                 )
                 print(
-                    f"{o.camera_ip:18s} "
-                    f"{datetime.fromtimestamp(o.down_since):%Y-%m-%d %H:%M:%S} "
-                    f"{until:19s} {_dur(o.duration(now)):>10s}  {o.cause}"
+                    f"{sensor[:12]:12s} {ip:18s} "
+                    f"{datetime.fromtimestamp(down):%Y-%m-%d %H:%M:%S} "
+                    f"{until:19s} {_dur(dur):>10s}  {cause}"
                 )
             print(f"\n{_PASSIVE_NOTE}")
             return 0
 
         report = store.uptime_report(window, now)
-        if not report:
-            print("no cameras or NVRs known yet — check [network] in the config")
+        # Relayed cameras too, with the same stale/blind gating the
+        # dashboard applies. On a collector the local report is often
+        # EMPTY by design — the cameras sit behind the NVR and never
+        # cross the firewall, which is the whole reason relay mode
+        # exists — so "check [network] in the config" was advice to
+        # fix a correct configuration while hiding the fleet that was
+        # actually reporting.
+        sensors = (store.list_remote_sensors()
+                   if cfg.relay.is_collector else [])
+        blind = [x.sensor_id for x in sensors if x.mon_blind]
+        relayed = (store.remote_uptime_report(
+            now, cfg.relay.sensor_timeout_seconds, blind_sensors=blind)
+            if cfg.relay.is_collector else [])
+        if not report and not relayed:
+            if cfg.relay.is_collector:
+                print("no cameras known yet — none in [network] here, and "
+                      "no sensor has reported. Check `hound sensors`.")
+            else:
+                print("no cameras or NVRs known yet — check [network] in "
+                      "the config")
             return 0
         print(f"\nwindow: last {_dur(window)}")
-        print(f"{'IP':18s} {'role':7s} {'state':11s} {'last seen':19s} "
-              f"{'down for':>10s} {'outages':>8s} {'avail':>7s}")
+        print(f"{'sensor':12s} {'IP':18s} {'role':7s} {'state':11s} "
+              f"{'last seen':19s} {'down for':>10s} {'outages':>8s} "
+              f"{'avail':>7s}")
         for r in report:
             last = (
                 f"{datetime.fromtimestamp(r.last_seen):%Y-%m-%d %H:%M:%S}"
@@ -274,10 +309,28 @@ def cmd_uptime(args: argparse.Namespace) -> int:
             )
             avail = "n/a" if r.availability is None else f"{r.availability:.2%}"
             print(
-                f"{r.ip:18s} {r.role:7s} {r.state:11s} {last:19s} "
-                f"{_dur(r.current_downtime):>10s} {r.outage_count:8d} "
-                f"{avail:>7s}"
+                f"{'local':12s} {r.ip:18s} {r.role:7s} {r.state:11s} "
+                f"{last:19s} {_dur(r.current_downtime):>10s} "
+                f"{r.outage_count:8d} {avail:>7s}"
             )
+        for d in relayed:
+            last = (
+                f"{datetime.fromtimestamp(d['last_seen']):%Y-%m-%d %H:%M:%S}"
+                if d.get("last_seen", 0) > 0 else "never"
+            )
+            av = d.get("availability")
+            print(
+                f"{d['sensor'][:12]:12s} {d['ip']:18s} "
+                f"{d.get('role', 'camera'):7s} {d['state']:11s} "
+                f"{last:19s} "
+                f"{_dur(d.get('current_downtime') or 0.0):>10s} "
+                f"{int(d.get('outage_count') or 0):8d} "
+                f"{('n/a' if av is None else f'{av:.2%}'):>7s}"
+            )
+        if any(d.get("stale") for d in relayed):
+            print("\nRows marked `unknown` come from a sensor that is not "
+                  "reporting, or that says its own capture is blind. That "
+                  "is a statement about the SENSOR, not the camera.")
         print(f"\n{_PASSIVE_NOTE}")
     finally:
         store.close()
@@ -311,7 +364,11 @@ def _ro_store(cfg) -> HoundStore:
         return HoundStore(path=cfg.store.path, readonly=True)
     except FileNotFoundError as e:
         sys.exit(str(e))
-    except sqlite3.Error as e:
+    except (OSError, sqlite3.Error) as e:
+        # OSError as well as sqlite3.Error: an unreadable parent
+        # directory raises PermissionError, which is neither of the
+        # two originally caught, so it still reached the operator as a
+        # traceback.
         sys.exit(f"cannot read store {cfg.store.path}: {e}")
 
 
@@ -416,8 +473,18 @@ def _export_body(args, cfg, store, window, now) -> int:
         # OPNsense dashboard reads, so leaving it ungated was the half
         # of the inconsistency that actually reached an operator.
         is_collector = cfg.relay.is_collector
+        # Blind sensors' rows are stale for the same reason a
+        # non-reporting sensor's are: a figure from a sensor that
+        # cannot see is not a current figure.
+        # `mon_alive` is deliberately NOT consulted. The column defaults to
+        # 0 and `monitor` is optional in a batch, so a sensor that has never
+        # sent one is indistinguishable from one reporting its capture is
+        # down — and treating 0 as "down" marked healthy sensors blind.
+        # `mon_blind` is only ever set by a sensor that actually said so.
+        blind = [x.sensor_id for x in sensors if x.mon_blind]
         remote_up = (
-            store.remote_uptime_report(now, cfg.relay.sensor_timeout_seconds)
+            store.remote_uptime_report(now, cfg.relay.sensor_timeout_seconds,
+                                       blind_sensors=blind)
             if is_collector else []
         )
         remote_alerts = (store.list_remote_alerts(limit=args.limit)
@@ -519,9 +586,6 @@ def cmd_sensors(args: argparse.Namespace) -> int:
             elif r.mon_blind:
                 state = "BLIND"
                 blind_any = True
-            elif not r.mon_alive:
-                state = "CAPTURE DOWN"
-                blind_any = True
             else:
                 state = "reporting"
             print(f"{r.sensor_id:16s} {state:14s} {_dur(age) + ' ago':12s} "
@@ -531,7 +595,7 @@ def cmd_sensors(args: argparse.Namespace) -> int:
               "down — it means this collector cannot see that segment. Its "
               "camera rows read 'unknown' rather than their last state.")
         if blind_any:
-            print("BLIND / CAPTURE DOWN: the link is fine but that sensor "
+            print("BLIND: the link is fine but that sensor "
                   "reports its own capture is not seeing traffic. Its "
                   "camera states and availability are STALE, not current.")
     finally:

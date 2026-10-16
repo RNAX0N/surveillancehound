@@ -111,6 +111,16 @@ class _Handler(BaseHTTPRequestHandler):
             if url.path == "/api/help":
                 return self._api_help()
             _json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except FileNotFoundError as e:
+            # The store does not exist yet — the daemon has not run.
+            # That is a state, not a fault: 503, one line, no
+            # traceback. The dashboard polls every 5s by default and
+            # each poll makes several API calls, so logging this as an
+            # exception was roughly six tracebacks every five seconds
+            # for as long as a browser tab stayed open.
+            log.debug("web: store not present yet: %s", e)
+            _json(self, HTTPStatus.SERVICE_UNAVAILABLE,
+                  {"error": str(e), "status": "no-store"})
         except Exception as e:  # noqa: BLE001
             log.exception("web: request failed")
             _json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
@@ -210,17 +220,29 @@ class _Handler(BaseHTTPRequestHandler):
             # Gated like /api/alerts and /api/flows: a non-collector
             # has no relay tables worth querying, and the inconsistency
             # invited the next reader to pick the wrong pattern.
+            all_sensors = (store.list_remote_sensors()
+                           if self.cfg.relay.is_collector else [])
+            # A sensor that is still reporting but says its own capture
+            # is blind must not have its camera rows rendered as
+            # current. Same rule the local monitor line applies to
+            # itself.
+            # `mon_alive` is deliberately NOT consulted. The column defaults to
+            # 0 and `monitor` is optional in a batch, so a sensor that has never
+            # sent one is indistinguishable from one reporting its capture is
+            # down — and treating 0 as "down" marked healthy sensors blind.
+            # `mon_blind` is only ever set by a sensor that actually said so.
+            blind = [x.sensor_id for x in all_sensors if x.mon_blind]
             remote_cameras = (
                 store.remote_uptime_report(
-                    now, self.cfg.relay.sensor_timeout_seconds)
+                    now, self.cfg.relay.sensor_timeout_seconds,
+                    blind_sensors=blind)
                 if self.cfg.relay.is_collector else []
             )
             sensors = [
                 dict(x.__dict__,
                      reporting=(now - x.last_seen)
                      <= self.cfg.relay.sensor_timeout_seconds)
-                for x in (store.list_remote_sensors()
-                          if self.cfg.relay.is_collector else [])
+                for x in all_sensors
             ]
         finally:
             store.close()
@@ -1108,8 +1130,6 @@ function renderUptime(u) {
       cls = "bad"; label = "NOT REPORTING";
     } else if (sx.mon_blind) {
       cls = "bad"; label = "capture stalled — figures stale";
-    } else if (sx.mon_alive === false) {
-      cls = "bad"; label = "reporting, capture not running";
     } else {
       cls = "ok"; label = "reporting";
     }

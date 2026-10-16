@@ -157,13 +157,31 @@ $(document).ready(function() {
             if (sensors.length) {
                 var parts = [];
                 $.each(sensors, function (i, x) {
+                    // TWO independent questions, and this read only one.
+                    // `reporting` is about the LINK — are its batches
+                    // arriving. `mon_blind` is what the sensor says about
+                    // its OWN capture. A sensor whose capture is dead but
+                    // whose link is fine rendered a green "reporting"
+                    // beside camera rows it could no longer see, at
+                    // 100% availability. This is the collector's primary
+                    // UI (the stdlib dashboard is CSP-blocked here), so
+                    // fixing it only there fixed it nowhere an operator
+                    // looks.
+                    var state;
+                    if (!x.reporting) {
+                        state = "<span class='text-danger'>" +
+                            "{{ lang._('NOT reporting') }}</span> (" +
+                            fmtAgo(x.last_seen) + " {{ lang._('ago') }})";
+                    } else if (x.mon_blind) {
+                        state = "<span class='text-danger'>" +
+                            "{{ lang._('capture stalled — camera rows " +
+                            "below are stale') }}</span>";
+                    } else {
+                        state = "<span class='text-success'>" +
+                            "{{ lang._('reporting') }}</span>";
+                    }
                     parts.push('<strong>' + esc(x.sensor_id) + '</strong>: ' +
-                        (x.reporting
-                            ? "<span class='text-success'>" +
-                              "{{ lang._('reporting') }}</span>"
-                            : "<span class='text-danger'>" +
-                              "{{ lang._('NOT reporting') }}</span> (" +
-                              fmtAgo(x.last_seen) + " {{ lang._('ago') }})"));
+                               state);
                 });
                 txt += "<br/><small>{{ lang._('Relay sensors') }} — " +
                        parts.join(' &nbsp; ') + "</small>";

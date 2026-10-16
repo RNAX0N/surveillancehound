@@ -314,19 +314,32 @@ keep      = 5
 # max_body_bytes and max_records_per_batch together is the operator
 # knob: both bound how much one batch can cost.
 #
-# max_records_per_batch = 5000     # PER KIND, and there are five kinds.
+# max_records_per_batch = 1000     # PER KIND, and there are five kinds.
 #                                  # This bounds how long one batch holds
 #                                  # the store lock — which the packet
 #                                  # loop waits behind, so it is a capture
 #                                  # setting as much as a relay one.
+#
+# SET THESE TWO ON BOTH ENDS, TOGETHER. An agent sizes its batches from
+# its OWN config, because it cannot see this one. A collector configured
+# lower than its agent refuses the batch, and 400/413 are permanent for
+# a batch as sent — so before the agent learned to re-split on
+# rejection, a collector lowered to 500 while the agent stayed at the
+# default destroyed 1000 of 1200 alerts with `flush()` reporting
+# success. It now adopts the limit the rejection reports and splits,
+# which costs a cycle instead of the data; configuring both ends costs
+# nothing at all.
 # min_free_disk_mb      = 256.0    # refuse ingest below this; 0 disables
 #
 # NOTE on NAT: the ingest limits key on SOURCE ADDRESS, so agents behind
-# one NAT share a connection cap and a batch budget. That is fine at the
-# default 30s cadence, but after a long outage several agents flushing
-# their spools at once can starve each other into 429s. Give them
-# distinct addresses, or stagger batch_seconds, if you run more than a
-# couple behind one NAT.
+# one NAT share a connection cap and a batch budget — and it bites
+# sooner than "more than a couple". One agent REPLAYING a spool costs 48
+# of the default 60 units per minute (two per batch, one batch every
+# 2.5s), so TWO agents recovering behind one address are at 96 against
+# 60 and throttle each other. Nothing is lost — a 429 ends the cycle
+# with the batch still spooled — but recovery stretches out and
+# `hound sensors` may show both stale meanwhile. Give them distinct
+# addresses.
 #
 # A trimmed or refused batch is not lost data in the usual case: the agent
 # spools what it could not deliver and resends it. These limits exist so a

@@ -51,6 +51,14 @@ _HANDSHAKE_TIMEOUT = 5.0
 _REJECT_COOLDOWN = 30.0
 # Total wall-clock for draining an unread body before closing. A
 # deadline, not a socket timeout: the latter resets on every byte.
+# Filesystem bytes that must be free regardless of how much space is
+# reusable inside the store. The WAL needs real space for every write;
+# see `_disk_ok`.
+_ABSOLUTE_DISK_FLOOR = 32 * 1024 * 1024
+# How often a sensor that keeps resetting its instance id earns
+# another WARNING. The first always does; see the branch in
+# `_handle_batch`.
+_INSTANCE_RESET_EVERY = 100
 _DRAIN_LIMIT = 65536      # default lingering-close absorption
 # Ceiling for the one refusal that MUST be understood exactly.
 #
@@ -87,18 +95,28 @@ _DRAIN_MAX = 8 * 1024 * 1024
 # Two things were wrong with reading it that way.
 #
 # It is not the drain. Holding the flood fixed and varying ONLY the
-# drain policy, three runs each: drain off (64 KiB floor) 29.2%,
-# unbounded 30.3% (474 MB absorbed), rate-limited to 4 MB/s 28.9%
-# (105 MB). Within noise of each other. A shared token bucket for
-# drain bytes was written, measured and deleted — it bought nothing,
-# and it gave a flood a way to starve an honest agent's 413 of its
-# drain at exactly the wrong moment. `_DRAIN_BUDGET_S` is the bound
-# that matters.
+# drain policy: shipped 8 MiB vs effectively unbounded came out
+# identical in two independent runs (29.2% vs 30.3% here; 85% vs 85%
+# on a second machine). A shared token bucket for drain bytes was
+# written, measured and deleted — it bought nothing, and it gave a
+# flood a way to starve an honest agent's 413 of its drain at exactly
+# the wrong moment. `_DRAIN_BUDGET_S` is the bound that matters.
+#
+# One caveat on that run, found by an independent reviewer who could
+# not reproduce it: "drain off" is NOT reliably equal to the other
+# two. Here it measured 29.2%, within noise of the rest; there it
+# measured 42% against 85% — markedly WORSE than draining, because
+# clamping the drain makes the collector RST early and the client
+# reconnects immediately, buying more RSA handshakes per second. So
+# the conclusion holds and is stronger than first stated (the
+# handshake is the cost, not the drain) but do not restate the
+# specific "all three within noise" triple as a general result.
 #
 # And that run had `max_batches_per_minute = 10000`, which disables
 # the metering in `process_request`. At the SHIPPED default of 60 the
 # same flood from the same 8 addresses retains 80.4% of baseline
-# (3.42M pkt/s, 53,017 connections refused at accept). The ~70% loss
+# (3.42M pkt/s, 53,017 connections refused at accept); the
+# independent run measured 100% at the shipped default. The ~70% loss
 # is what an UNMETERED collector costs — which is what the metering
 # was added for. It is not what this drain costs, and not what an
 # operator running defaults sees.
@@ -231,6 +249,13 @@ class IngestServer:
         # because that is all a store close can damage.
         self._inflight = 0
         self._inflight_lock = threading.Lock()
+        # Per-sensor count of instance-id resets, for log throttling.
+        # Bounded by the configured sensor list — a batch cannot reach
+        # here without a valid key for a configured sensor_id — so this
+        # is not an unbounded-growth vector the way a source-address
+        # key would be.
+        self._instance_resets: dict[str, int] = {}
+        self._reset_lock = threading.Lock()
         # Capture outranks relayed work; see relay.CaptureGate.
         self.gate = gate or relay.CaptureGate()
         self.started = False
@@ -325,20 +350,37 @@ class IngestServer:
             st = os.statvfs(self.store.path.parent)
         except (OSError, AttributeError):
             return True
-        free = st.f_bavail * st.f_frsize
-        # Pages already free INSIDE the store count. SQLite reuses them
-        # without growing the file, and retention frees pages without
-        # necessarily shrinking it — measured, deleting 40,000 relayed
-        # flows left the file its full size with 1,140 pages free.
-        # Gating on the filesystem alone meant a sensor that had once
-        # inflated the store to this floor kept the collector refusing
-        # every sensor's batches permanently, with retention running
-        # and unable to lift it.
-        try:
-            free += self.store.reusable_bytes()
-        except Exception:               # noqa: BLE001 - a guard, not a feature
-            pass
-        return free >= (limit * 1024 * 1024)
+        fs_free = st.f_bavail * st.f_frsize
+        want = limit * 1024 * 1024
+        # A HARD filesystem floor, independent of the freelist credit
+        # below. Free pages inside the store are reusable for ROW data,
+        # but the store is WAL: every write still appends to `-wal`,
+        # which is real filesystem space (~4 MB steady at the default
+        # autocheckpoint). Counting only the credit let the guard pass
+        # with literally zero bytes free — measured True at 0 MB, 1 MB
+        # and 255 MB against a 256 MB floor on a store with a 351 MB
+        # freelist. Below the WAL's working set the next write raises
+        # SQLITE_FULL, the handler answers 500 with a traceback, and
+        # the agent retries a 500 forever. That is the "a full
+        # filesystem is the one failure that can damage the store"
+        # case this guard exists for, reached through the guard.
+        if fs_free < min(want, _ABSOLUTE_DISK_FLOOR):
+            return False
+        # Within that, pages already free inside the store count toward
+        # the configured floor: SQLite reuses them without growing the
+        # file, and retention frees pages without shrinking it (the
+        # daemon deliberately does not VACUUM — see store.prune_remote).
+        # Without this credit, one sensor that had inflated the store
+        # to the floor kept the collector refusing every sensor
+        # permanently, with retention running and unable to lift it.
+        reusable = 0
+        if fs_free < want:
+            try:
+                with self.gate.deferred():
+                    reusable = self.store.reusable_bytes()
+            except Exception:           # noqa: BLE001 - a guard, not a feature
+                reusable = 0
+        return (fs_free + reusable) >= want
 
     def in_flight(self) -> int:
         with self._inflight_lock:
@@ -483,12 +525,32 @@ class IngestServer:
                     "last_seq": known.last_seq,
                 }
         elif known is not None:
-            log.warning(
-                "relay: sensor %r presented a new instance id (%r -> %r); "
-                "accepting and resetting its sequence. If two agents share "
-                "this sensor_id, give them separate ids.",
-                sensor_id, known.instance_id, instance_id,
-            )
+            # Throttled per sensor. A VALID key holder chooses how
+            # often this fires: 40 batches with a rotating instance_id
+            # produced 39 WARNING lines, at 60 requests/minute per
+            # source address and no limit on addresses. This module
+            # already reasons about exactly that for the 401 ("a peer
+            # chooses how often this fires ... a line per rejected
+            # batch is a log flood with a remote throttle") and the
+            # reasoning was not carried here. The FIRST reset is worth
+            # a warning — it is how a wiped agent volume looks — and
+            # the hundredth is not.
+            with self._reset_lock:
+                self._instance_resets[sensor_id] = n = (
+                    self._instance_resets.get(sensor_id, 0) + 1)
+            if n == 1 or n % _INSTANCE_RESET_EVERY == 0:
+                log.warning(
+                    "relay: sensor %r presented a new instance id "
+                    "(%r -> %r); accepting and resetting its sequence. "
+                    "If two agents share this sensor_id, give them "
+                    "separate ids. (%d reset(s) from this sensor)",
+                    sensor_id, known.instance_id, instance_id, n,
+                )
+            else:
+                log.debug(
+                    "relay: sensor %r reset its instance id again "
+                    "(%r -> %r, %d total)",
+                    sensor_id, known.instance_id, instance_id, n)
 
         try:
             records = validate.validate_records(
@@ -496,7 +558,21 @@ class IngestServer:
             )
         except validate.ValidationError as e:
             log.warning("relay: rejected batch from %s: %s", sensor_id, e)
-            return HTTPStatus.BAD_REQUEST, {"error": str(e)}
+            # Advertise the limits. The agent sizes batches from its OWN
+            # config because it cannot see this one, so a collector
+            # configured lower refused every batch — and 400 is terminal
+            # on the agent side, so the batch was DISCARDED after its
+            # watermark had advanced. Permanent silent loss, reachable by
+            # following the documented "lower the cap" remedy on one end
+            # only. Telling it the real numbers lets it re-split and
+            # resend instead of destroying what it saw.
+            return HTTPStatus.BAD_REQUEST, {
+                "error": str(e),
+                "limits": {
+                    "max_records_per_batch": self.cfg.max_records_per_batch,
+                    "max_body_bytes": self.cfg.max_body_bytes,
+                },
+            }
 
         # Last gate before writing. A full filesystem is the one failure
         # that can damage the store rather than merely lose a batch, and
@@ -1195,6 +1271,19 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                     {"error": "chunked encoding not supported"})
                 return
 
+            # Duplicated, not just misspelled. `headers.get` returns
+            # the FIRST of a repeated header, so two different lengths
+            # parsed here as whichever came first — the same
+            # smuggling differential the strict spelling check below
+            # addresses, through a different door. No proxy is the
+            # documented topology; neither of these matters until
+            # someone puts one in front, and then both do.
+            lengths = self.headers.get_all("Content-Length") or []
+            if len(lengths) > 1:
+                self._reply_and_end(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "duplicate Content-Length"})
+                return
             raw_len = self.headers.get("Content-Length")
             if raw_len is None:
                 self._reply_and_end(HTTPStatus.LENGTH_REQUIRED,
@@ -1226,7 +1315,15 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                 # got us here.
                 self._reply_and_end(
                     HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                    {"error": f"body over {server.cfg.max_body_bytes} bytes"},
+                    {"error": f"body over {server.cfg.max_body_bytes} bytes",
+                     # Same reason as the 400 above: let the agent
+                     # re-split to a size this collector will take
+                     # rather than discard the batch.
+                     "limits": {
+                         "max_records_per_batch":
+                             server.cfg.max_records_per_batch,
+                         "max_body_bytes": server.cfg.max_body_bytes,
+                     }},
                     drain_limit=max(_DRAIN_MAX,
                                     2 * server.cfg.max_body_bytes))
                 return

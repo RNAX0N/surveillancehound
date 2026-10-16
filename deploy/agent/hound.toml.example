@@ -86,6 +86,13 @@ tls_fingerprint = ["sha256:CHANGE-ME"]
 
 batch_seconds = 30.0
 
+# If you change [relay] max_records_per_batch or max_body_bytes on the
+# COLLECTOR, set the same values here. This agent sizes its batches from
+# its own config — it cannot see the collector's — so a collector
+# configured lower refuses them. It recovers (it adopts the limit from
+# the rejection and splits the batch) but the first batch after every
+# restart is refused until both ends agree.
+
 # If the collector is unreachable, observations spool to disk and replay
 # when it returns. Both caps apply; whichever is hit first starts
 # dropping the oldest.

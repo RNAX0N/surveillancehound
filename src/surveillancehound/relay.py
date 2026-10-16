@@ -478,6 +478,23 @@ class Spool:
             live = self._enforce_caps(self._read(), self._now_hint)
             self._write([e for e in live if e["seq"] > seq])
 
+    def replace(self, seq: int, parts: list[tuple[int, bytes]],
+                now: float) -> None:
+        """Swap one batch for smaller ones. NOT a drop.
+
+        Deliberately does not touch `dropped_stale`: nothing is being
+        discarded, so counting it would make `hound relay` report data
+        loss that did not happen — the opposite of the reporting sin
+        this spool exists to avoid.
+        """
+        with self._lock:
+            self._now_hint = max(self._now_hint, now)
+            live = [e for e in self._read() if e["seq"] != seq]
+            for new_seq, body in parts:
+                live.append({"seq": int(new_seq), "at": float(now),
+                             "body": body.decode("utf-8")})
+            self._write(self._enforce_caps(live, now))
+
     def drop(self, seq: int, reason: str) -> None:
         """Discard one batch the collector will never accept."""
         with self._lock:
@@ -737,10 +754,40 @@ class RelayClient:
         self._link_logged_at = 0.0
         self._link_warned = False
         self._link_flaps = 0
+        # Limits learned from a collector rejection. See `_learn_limits`.
+        self._learned_records = 0
+        self._learned_body = 0
+        # Where the open-outage re-send sweep is up to. See
+        # `_rotate_open`.
+        self._open_cursor = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     # ----- collection -----
+
+    def _rotate_open(self, open_ids) -> list[int]:
+        """Rotate the open-outage carry-forward list.
+
+        Secondary to the fix in `outages_changed_since`, which sorts
+        closes ahead of still-open repeats — that is what stops a
+        recovery being crowded out. This only matters when more
+        CLOSES are owed at once than fit in one batch, which needs a
+        mass recovery on a large fleet.
+
+        Still worth having: the store can only bind as many ids as fit
+        in a batch, so a fixed slice would leave the surplus
+        permanently unexamined. Rotating gives each a turn within
+        ceil(n / limit) cycles. The cursor is in RAM only — the SET is
+        persisted in the watermark, and a restart that begins the
+        sweep from the top again costs nothing.
+        """
+        ids = sorted(int(i) for i in open_ids)
+        if not ids:
+            return []
+        n = len(ids)
+        off = self._open_cursor % n
+        self._open_cursor = (off + max(1, self._per_kind())) % n
+        return ids[off:] + ids[:off]
 
     def _per_kind(self) -> int:
         """Records per kind this agent will send.
@@ -751,8 +798,13 @@ class RelayClient:
         so the two must be configured together.
         """
         cap = getattr(self.cfg, "max_records_per_batch", 0) or 0
-        return min(cap, _MAX_RECORDS_PER_KIND) if cap > 0 \
+        own = min(cap, _MAX_RECORDS_PER_KIND) if cap > 0 \
             else _MAX_RECORDS_PER_KIND
+        # A collector that refused a batch tells us its real cap in the
+        # rejection. Honour the lower of the two from then on, so the
+        # mismatch costs one rejected batch rather than every batch.
+        learned = self._learned_records
+        return max(1, min(own, learned)) if learned else own
 
     def collect(self, per_kind: int | None = None) -> tuple:
         """Everything new since the last successful push.
@@ -773,7 +825,8 @@ class RelayClient:
         flows = self.store.flows_since(wm.flow_id, limit=per_kind)
         alerts = self.store.alerts_since(wm.alert_id, limit=per_kind)
         outages = self.store.outages_changed_since(
-            wm.outage_id, open_ids=wm.open_outage_ids, limit=per_kind)
+            wm.outage_id, open_ids=self._rotate_open(wm.open_outage_ids),
+            limit=per_kind)
         devices = self.store.devices_changed_since(
             wm.reported_at, limit=per_kind)
         if len(devices) >= per_kind:
@@ -898,6 +951,13 @@ class RelayClient:
         cap = getattr(self.cfg, "max_body_bytes", 0) or 0
         if cap <= 0:
             cap = _DEFAULT_BODY_LIMIT
+        if self._learned_body:
+            # The floor is NOT applied to a cap the collector actually
+            # enforces. The floor exists so a misconfigured LOCAL cap
+            # cannot stop the agent relaying anything at all; raising a
+            # learned cap back up to it would mean knowingly building
+            # bodies we have been told will be refused.
+            return max(1, int(min(cap, self._learned_body) * _BODY_MARGIN))
         return max(_MIN_BODY_LIMIT, int(cap * _BODY_MARGIN))
 
     def enqueue(self) -> int:
@@ -942,6 +1002,95 @@ class RelayClient:
             self.state.watermark = new_wm
             self.state.save()
             return seq
+
+    def _learn_limits(self, payload: dict) -> bool:
+        """Adopt the limits a collector reported. True if either moved."""
+        lim = payload.get("limits")
+        if not isinstance(lim, dict):
+            return False
+        moved = False
+        recs = lim.get("max_records_per_batch")
+        if isinstance(recs, int) and not isinstance(recs, bool) and recs > 0:
+            if self._learned_records != recs:
+                self._learned_records = recs
+                moved = True
+        body = lim.get("max_body_bytes")
+        if isinstance(body, int) and not isinstance(body, bool) and body > 0:
+            if self._learned_body != body:
+                self._learned_body = body
+                moved = True
+        if moved:
+            log.warning(
+                "relay: collector enforces max_records_per_batch=%s "
+                "max_body_bytes=%s, lower than this agent was using. "
+                "Adopting them. Set the same values in the agent's "
+                "[relay] section so the first batch after a restart is "
+                "not rejected too.",
+                self._learned_records or "unchanged",
+                self._learned_body or "unchanged")
+        return moved
+
+    def _resplit(self, seq: int, body: bytes, payload: dict,
+                 status: int) -> bool:
+        """Halve a rejected batch and re-spool it. True if re-spooled.
+
+        400 and 413 are permanent for the batch AS SENT — the body will
+        be exactly as large and hold exactly as many records next time
+        — so the old code dropped it. But the watermark advanced at
+        enqueue, so dropping meant the observations were gone: measured,
+        a collector lowered to 500 records while the agent stayed at the
+        default destroyed 1000 of 1200 alerts, with `flush()` returning
+        True and the spool reporting empty.
+
+        Permanent for the batch as sent is not the same as permanent
+        for its CONTENTS. Splitting it makes the mismatch cost a cycle
+        instead of a day of observations, and each half is strictly
+        smaller so the recursion terminates at one record per batch.
+        A single record that is still refused is genuinely undeliverable
+        and falls through to the drop.
+        """
+        self._learn_limits(payload)
+        try:
+            doc = json.loads(body)
+            records = doc["records"]
+            if not isinstance(records, dict):
+                return False
+        except (ValueError, KeyError, TypeError):
+            return False
+        total = sum(len(v) for v in records.values()
+                    if isinstance(v, list))
+        if total < 2:
+            return False          # nothing left to split
+        halves: list[dict] = [{}, {}]
+        for kind, items in records.items():
+            if not isinstance(items, list):
+                # Scalars like `monitor` ride with the first half; they
+                # are a snapshot, not a list, and duplicating them
+                # would double-count.
+                halves[0][kind] = items
+                continue
+            mid = (len(items) + 1) // 2
+            halves[0][kind] = items[:mid]
+            halves[1][kind] = items[mid:]
+        parts = []
+        with self._lock:
+            for half in halves:
+                if not any(isinstance(v, list) and v for v in half.values()):
+                    continue
+                new_seq = self.state.next_seq
+                self.state.next_seq = new_seq + 1
+                parts.append((new_seq, build_batch(
+                    self.cfg.sensor_id, self.state.instance_id, new_seq,
+                    half, self.now())))
+            self.state.save()
+        if not parts:
+            return False
+        self.spool.replace(seq, parts, self.now())
+        log.warning(
+            "relay: collector refused batch seq=%s with %s; split into "
+            "%d smaller batch(es) and requeued rather than discarding "
+            "%d record(s).", seq, status, len(parts), total)
+        return True
 
     def _note_link(self, ok: bool, detail: str = "") -> None:
         """Say out loud that the agent is spooling, and say it once.
@@ -1095,6 +1244,11 @@ class RelayClient:
                     if self.state.next_seq <= last:
                         self.state.next_seq = last + 1
                         self.state.save()
+            elif status in (400, 413) and self._resplit(seq, body, payload,
+                                                        status):
+                # Re-spooled smaller rather than discarded. Keep going;
+                # the replacements are at the tail of the spool.
+                continue
             elif status in (400, 401, 413):
                 # 413 belongs here, not in the retry branch. It is
                 # permanent — the body is too large and will be exactly
