@@ -1085,12 +1085,19 @@ class RelayClient:
         THREE THINGS GUARD AGAINST AN IMMORTAL BATCH, and the first
         version of this had none of them.
 
-        1. It only runs for a rejection that SIZE could explain.
-           `limits` is in the body only for the per-kind 400 and the
-           413; a 400 for clock skew, a bad instance id, a header
-           mismatch or an implausible sequence carries none, and no
-           amount of splitting will ever help those. Splitting them
-           anyway re-posted the same batch forever.
+        1. It only runs for a rejection the collector answered with
+           `limits` — the 413 and every `validate_records` 400. A 400
+           for clock skew, a bad instance id, a header mismatch or an
+           implausible sequence carries none, and no amount of
+           splitting will ever help those; splitting them anyway
+           re-posted the same batch forever.
+
+           Note that a `validate_records` 400 is not only the
+           per-kind cap: a single malformed record lands here too.
+           Splitting is still the right response — it terminates in
+           about log2(N) rounds and SALVAGES the good records,
+           dropping only the single one that is actually bad, where
+           the old behaviour discarded the whole batch.
         2. It requires PROGRESS. Halving each kind at
            `(len+1)//2` moves nothing when every kind already holds a
            single record: the first half takes them all, the second is

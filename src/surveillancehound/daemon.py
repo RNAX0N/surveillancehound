@@ -185,7 +185,11 @@ class Hound:
 
     def __init__(self, cfg: HoundCfg) -> None:
         self.cfg = cfg
-        self.store = HoundStore(path=cfg.store.path)
+        # exclusive=True: claims the writer lock for this process's
+        # life. It makes "one process, one writer" checkable from
+        # another process, which is what `hound prune
+        # --offline-compact` needs before it swaps the database file.
+        self.store = HoundStore(path=cfg.store.path, exclusive=True)
         self.devices = DeviceClassifier(network=cfg.network)
         self.flows = FlowAggregator()
         self.classifier = FlowClassifier(
@@ -238,6 +242,9 @@ class Hound:
         # replay drives the clock from packet timestamps; live uses wall clock
         self._replay = bool(cfg.capture.pcap_file)
         self._clock_ts = 0.0
+        # Last packet time as the tick sees it, so the heartbeat does
+        # not depend on the uptime tracker existing.
+        self._last_tick_packet_at = 0.0
         self.uptime: UptimeTracker | None = None
         if cfg.uptime.enabled:
             self.uptime = UptimeTracker(
@@ -472,6 +479,7 @@ class Hound:
             with self._loop_lock:
                 self.stats.packets_seen += 1
                 self._packets_since_tick += 1
+                self._last_tick_packet_at = pkt.ts
                 self._on_packet(pkt)
                 if not self._replay:
                     continue  # the watchdog thread owns ticking when live
@@ -537,6 +545,22 @@ class Hound:
         #    not just camera traffic — it is what drives the dead-man's-switch
         saw = self._packets_since_tick > 0
         self._packets_since_tick = 0
+        # Heartbeat EVERY tick, whether or not uptime is enabled.
+        #
+        # It used to be written only from `UptimeTracker.tick`, so with
+        # `[uptime] enabled = false` it was never written at all — and
+        # `monitor_heartbeat` is the row readers use to tell "watching"
+        # from "blind". Consequences, both measured: `hound uptime`
+        # printed `monitor: NOT RUNNING` and `/api/status` reported
+        # `running: false` for a daemon that was running and
+        # ingesting; and `hound prune --offline-compact` read "no
+        # heartbeat" as "no daemon" and swapped the database file
+        # under it.
+        #
+        # The lock in `store._take_writer_lock` is what actually
+        # guards that swap now, but a liveness row that exists only
+        # under one optional feature is wrong on its own terms.
+        self.store.set_heartbeat(self._last_tick_packet_at or 0.0, now)
         if self.uptime is not None:
             for tr in self.uptime.tick(self.store, now, saw_packets=saw):
                 self._on_transition(tr, now)

@@ -34,6 +34,11 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+
+try:
+    import fcntl
+except ImportError:                      # pragma: no cover - not on Linux/BSD
+    fcntl = None
 import threading
 import time
 from dataclasses import dataclass
@@ -42,9 +47,11 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# A heartbeat newer than this means the daemon is running. Used only
-# to refuse the offline compaction, which swaps the database file and
-# would otherwise leave a live daemon writing to an unlinked inode.
+# A heartbeat newer than this means the daemon is running. A SECOND
+# opinion only — see `_writer_lock_path`. The heartbeat is written
+# from `UptimeTracker.tick`, so with `[uptime] enabled = false` it is
+# never written at all and "no heartbeat" cannot be read as "no
+# daemon".
 _DAEMON_ALIVE_S = 120.0
 
 
@@ -489,6 +496,16 @@ CREATE TABLE IF NOT EXISTS remote_notifications (
     ok              INTEGER NOT NULL,
     error           TEXT NOT NULL DEFAULT ''
 );
+-- remote_notifications is the sixth relay table and was missed when
+-- the other five were indexed, while being in both `_QUOTA_TABLES`
+-- and `prune_remote` on `attempted_at`. Measured at 250k rows:
+-- quota COUNT 12.0ms, quota TRIM 18.2ms, prune 8.7ms; with these
+-- indices 7.6 / 1.7 / 0.7ms. The first two are inside the ingest
+-- transaction, under the lock the capture tick contends for.
+CREATE INDEX IF NOT EXISTS idx_rnotif_sensor_att
+    ON remote_notifications (sensor_id, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_rnotif_att
+    ON remote_notifications (attempted_at);
 """
 
 
@@ -552,7 +569,8 @@ class HoundStore:
     serializes both reads and writes — simple, correct, plenty fast for this
     workload (camera traffic is hundreds of packets/sec, not millions)."""
 
-    def __init__(self, path: Path, readonly: bool = False) -> None:
+    def __init__(self, path: Path, readonly: bool = False,
+                 exclusive: bool = False) -> None:
         """`readonly=True` for diagnostics and the dashboard.
 
         A reader has no business creating the store, creating its parent
@@ -570,6 +588,7 @@ class HoundStore:
         """
         self.path = Path(path)
         self.readonly = bool(readonly)
+        self._writer_fh = None
         if self.readonly:
             if not self.path.is_file():
                 raise FileNotFoundError(
@@ -590,6 +609,11 @@ class HoundStore:
             self._lock = threading.RLock()
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The daemon passes exclusive=True. CLI subcommands and the
+        # dashboard do not: they are short-lived and must not lock the
+        # daemon out of its own store.
+        if exclusive:
+            self._take_writer_lock()
         self._connect()
         with self._conn:
             self._drop_prerelease_relay_tables()
@@ -656,6 +680,17 @@ class HoundStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+            # Release the writer lock too. Closing only the sqlite
+            # connection left the lock fd open, so `hound prune
+            # --offline-compact` kept refusing after the daemon had
+            # stopped — the guard would have become a permanent
+            # refusal rather than a check.
+            fh, self._writer_fh = self._writer_fh, None
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
 
     # ----- devices -----
 
@@ -1532,12 +1567,34 @@ class HoundStore:
                 "SELECT DISTINCT sensor_id FROM remote_uptime").fetchall()]
             if not sensors:
                 return []
+            # `max(1, ...)` means the true ceiling is
+            # max(limit, len(sensors)) — safe only because a sensor_id
+            # must match a configured [[relay.sensor]], so the sensor
+            # count is bounded by the operator's config and not by
+            # anything a peer can mint. `list_remote_outages` has the
+            # same floor for the same reason.
             share = max(1, int(limit) // len(sensors))
             rows = []
+            truncated = 0
             for sid in sensors:
                 rows.extend(self._conn.execute(
                     "SELECT * FROM remote_uptime WHERE sensor_id = ? "
                     "ORDER BY ip LIMIT ?", (sid, share)).fetchall())
+                total = self._conn.execute(
+                    "SELECT COUNT(*) c FROM remote_uptime "
+                    "WHERE sensor_id = ?", (sid,)).fetchone()["c"]
+                if total > share:
+                    truncated += total - share
+            if truncated:
+                # Say so. A silently short list is the project's
+                # cardinal sin: the operator cannot tell "this camera
+                # is fine" from "this camera is not on the page".
+                log.warning(
+                    "store: %d relayed camera row(s) omitted from this "
+                    "view (limit %d across %d sensor(s), lowest "
+                    "addresses first). Raise the limit or reduce "
+                    "[relay] max_rows_per_sensor.",
+                    truncated, limit, len(sensors))
         out = []
         for r in rows:
             d = dict(r)
@@ -1780,18 +1837,31 @@ class HoundStore:
     def _compact_offline(self, before: int) -> int:
         """`VACUUM INTO` + swap. ONLY safe with the daemon stopped.
 
-        Needs room for the live data rather than twice the file, which
-        is why it exists; see `vacuum()` for why it is not the default.
+        Needs room for the live data rather than roughly the whole
+        file, which is why it exists at all; see `vacuum()` for why it
+        is not the default. Measured: a plain VACUUM of a 631 MB store
+        with 85 MB live peaked at 552 MB of extra space, because in WAL
+        mode it rewrites every page through the WAL. So on the full
+        disk this command is the documented recovery for, the plain
+        form cannot run and this one can.
+
+        THE GUARD IS THE WRITER LOCK, not the heartbeat. The heartbeat
+        version of this check did not exist when `[uptime] enabled =
+        false`, because `set_heartbeat` is only called from
+        `UptimeTracker.tick` and the tracker is only built when uptime
+        is on. With uptime off, `heartbeat()` returns (0.0, 0.0), the
+        check was skipped, and the file was swapped under a live
+        daemon: measured 46,444 of 287,586 rows (16%) written to an
+        unlinked inode in one run, 89% in another — the fraction is
+        just how much of the run falls after the swap, and all of it
+        does. It was also open for the first few seconds of any
+        daemon's life, before its first tick.
+
+        `flock` is a positive test and needs no config: the daemon
+        holds it for its whole life and the kernel releases it when
+        the process dies, so a crash does not wedge this command.
         """
-        last_packet, updated = self.heartbeat()
-        if updated and (time.time() - updated) < _DAEMON_ALIVE_S:
-            raise RuntimeError(
-                f"the daemon wrote its heartbeat "
-                f"{time.time() - updated:.0f}s ago, so it is running. "
-                f"Compacting swaps the database file underneath it and "
-                f"everything it writes afterwards goes to a file "
-                f"nothing will ever read. Stop the service first."
-            )
+        self._require_no_writer()
         live = self._live_bytes()
         free = self._fs_free()
         if live and free is not None and free < live * 1.15:
@@ -1806,8 +1876,23 @@ class HoundStore:
             st = self.path.stat()
         except OSError:
             mode, st = 0o600, None
-        with self._lock:
+        # Clear any leftover BEFORE the free-space check above would
+        # have counted it against the space it is checking.
+        tmp.unlink(missing_ok=True)
+        try:
+            return self._compact_into(tmp, mode, st)
+        except Exception:
+            # Never leave a partial rebuild behind: it is dead weight
+            # on the disk this command exists to free.
             tmp.unlink(missing_ok=True)
+            try:
+                self._conn.execute("SELECT 1")
+            except sqlite3.Error:
+                self._connect()
+            raise
+
+    def _compact_into(self, tmp: Path, mode: int, st) -> int:
+        with self._lock:
             self._conn.execute("VACUUM INTO ?", (str(tmp),))
             # Mode and owner come from the pruning process's umask
             # otherwise: measured 0600 -> 0644, and on OPNsense a root
@@ -1829,6 +1914,70 @@ class HoundStore:
             os.replace(tmp, self.path)
             self._connect()
         return self.path.stat().st_size
+
+    def _writer_lock_path(self) -> Path:
+        return Path(str(self.path) + ".writer")
+
+    def _take_writer_lock(self) -> None:
+        """Claim this store as THE writer. Raises if another holds it.
+
+        The project's invariant is already one writer per store
+        ("One process, one writer" — see this class's docstring). This
+        makes it checkable from another process, which is what the
+        offline compaction needs: it swaps the database file, and
+        `os.replace` is invisible to a daemon holding the old inode.
+
+        A no-op where `fcntl` is unavailable; the platforms this
+        deploys on (Linux, FreeBSD) have it.
+        """
+        if fcntl is None:
+            return
+        fh = open(self._writer_lock_path(), "a+b")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            raise RuntimeError(
+                f"another process already has {self.path} open as a "
+                f"writer. Only one daemon may write a store; check for "
+                f"a running `hound run`."
+            ) from None
+        self._writer_fh = fh
+
+    def _require_no_writer(self) -> None:
+        """Refuse unless we can prove no daemon holds this store."""
+        if fcntl is not None:
+            try:
+                fh = open(self._writer_lock_path(), "a+b")
+            except OSError as e:
+                raise RuntimeError(
+                    f"cannot open the writer lock beside {self.path}: "
+                    f"{e}"
+                ) from None
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise RuntimeError(
+                    "the daemon holds this store open. Compacting "
+                    "swaps the database file underneath it, and "
+                    "everything it writes afterwards goes to a file "
+                    "nothing will ever read. Stop the service, then "
+                    "re-run."
+                ) from None
+            finally:
+                fh.close()
+        # Second opinion, for a daemon too old to take the lock. Not
+        # load-bearing: with `[uptime] enabled = false` the heartbeat
+        # is never written, so this cannot be the only check.
+        _, updated = self.heartbeat()
+        if updated and (time.time() - updated) < _DAEMON_ALIVE_S:
+            raise RuntimeError(
+                f"the daemon wrote its heartbeat "
+                f"{time.time() - updated:.0f}s ago, so it is running. "
+                f"Stop the service, then re-run. (The heartbeat is "
+                f"written every few seconds; allow up to "
+                f"{_DAEMON_ALIVE_S:.0f}s after stopping.)"
+            )
 
     def _live_bytes(self) -> int:
         """Bytes of pages actually in use. 0 if it cannot be read."""

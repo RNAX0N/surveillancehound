@@ -866,6 +866,171 @@ def _check_resplit_always_makes_progress(tmp: Path) -> None:
           "the indivisible and the unexplained, and keeps the batch age")
 
 
+def _check_heartbeat_does_not_depend_on_uptime(tmp: Path) -> None:
+    """`monitor_heartbeat` is the row readers use to tell watching
+    from blind, and it must exist for every running daemon.
+
+    It was written only from `UptimeTracker.tick`, and the tracker is
+    built only when `[uptime] enabled`. With uptime off — a checkbox
+    in the shipped OPNsense GUI, and a reasonable setting on a
+    collector whose cameras all sit behind an NVR — the row was never
+    written at all. Two consequences, both measured: `hound uptime`
+    and `/api/status` reported a running, ingesting daemon as NOT
+    RUNNING; and `--offline-compact` read "no heartbeat" as "no
+    daemon" and swapped the database file underneath it.
+
+    CLAUDE.md describes this row as one "the daemon rewrites each
+    tick". That is now true unconditionally.
+    """
+    import time as _t
+    from surveillancehound import daemon as daemon_mod
+    from surveillancehound.config import load_from_dict
+
+    cfg = load_from_dict({
+        "capture": {"interface": "test0"},
+        "network": {"camera_ips": ["10.9.0.5"]},
+        "store": {"path": str(tmp / "hb.sqlite")},
+        # The whole point: liveness tracking OFF.
+        "uptime": {"enabled": False},
+    })
+    assert cfg.uptime.enabled is False
+    hound = daemon_mod.Hound(cfg)
+    try:
+        assert hound.uptime is None, (
+            "setup: the tracker should not exist with uptime off")
+        assert hound.store.heartbeat() == (0.0, 0.0), "setup"
+        now = _t.time()
+        hound._tick(now)
+        last_packet, updated = hound.store.heartbeat()
+        assert updated >= now, (
+            f"the daemon ticked and wrote no heartbeat "
+            f"(updated={updated}). With uptime disabled every "
+            f"liveness surface then reports a healthy daemon as not "
+            f"running, and the compaction guard cannot tell it is "
+            f"there")
+    finally:
+        hound.store.close()
+    print("  heartbeat: written every tick even with [uptime] "
+          "enabled = false")
+
+
+def _check_writer_lock_guards_the_swap(tmp: Path) -> None:
+    """The compaction guard must not depend on an optional feature.
+
+    `--offline-compact` is the only code that still swaps the store
+    file, and `os.replace` is invisible to another process holding
+    the old inode. Its guard was a heartbeat check — and
+    `set_heartbeat` is called from `UptimeTracker.tick` ONLY, which
+    the daemon builds only when `[uptime] enabled`. With uptime off
+    the heartbeat is never written, `heartbeat()` returns (0.0, 0.0),
+    the guard was skipped, and the file was swapped under a live
+    daemon: measured 46,444 of 287,586 rows written to an unlinked
+    inode. The same hole was open for the first seconds of ANY
+    daemon's life, before its first tick.
+
+    `flock` is positive and config-independent: the daemon holds it
+    for its whole life and the kernel releases it on death, so a
+    crash does not wedge the recovery command.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    import threading as _th
+    import time as _t
+    from surveillancehound.store import HoundStore
+
+    # The daemon must open its store exclusive=True. Asserting only
+    # that the lock mechanism works leaves the wiring untested, and
+    # the wiring is the whole guard.
+    import inspect as _inspect
+    from surveillancehound import daemon as _d
+    _src = _inspect.getsource(_d.Hound.__init__)
+    _src = "\n".join(line.split("#", 1)[0] for line in _src.splitlines())
+    assert "exclusive=True" in _src, (
+        "daemon.Hound does not open its store with exclusive=True, so "
+        "nothing holds the writer lock and `--offline-compact` cannot "
+        "tell a running daemon from a stopped one")
+
+    path = tmp / "lock.sqlite"
+    daemon_store = HoundStore(path=path, exclusive=True)
+    for b in range(2):
+        daemon_store.ingest_remote_batch(
+            "frigate", "inst-aaaa1111", b + 1,
+            V.validate_records({"alerts": [
+                {"remote_id": b * 2000 + i + 1, "ts": T0 + i,
+                 "device_ip": "10.0.0.1", "kind": "new_device",
+                 "severity": "low", "summary": "s" * 256, "detail": "",
+                 "dedup_key": f"lk{b}-{i}"} for i in range(2000)]},
+                10**6), T0 + b)
+    # Exactly the reviewer's configuration: no heartbeat has EVER
+    # been written, because uptime is off.
+    assert daemon_store.heartbeat() == (0.0, 0.0), daemon_store.heartbeat()
+    inode_before = path.stat().st_ino
+
+    stop = _th.Event()
+    wrote = {"n": 0}
+
+    def daemonish():
+        n = 0
+        while not stop.is_set():
+            n += 1
+            daemon_store.upsert_device(f"10.1.{n % 250}.{n % 251}",
+                                       "camera", T0, 1, 1)
+        wrote["n"] = n
+
+    worker = _th.Thread(target=daemonish, daemon=True)
+    worker.start()
+    cfg_path = tmp / "lock.toml"
+    cfg_path.write_text(
+        "[capture]\npcap_file = '/nonexistent.pcap'\n"
+        "[network]\ncamera_ips = []\n"
+        "[uptime]\nenabled = false\n"
+        f"[store]\npath = {str(path)!r}\n")
+    out = _sp.run([_sys.executable, "-m", "surveillancehound.cli", "prune",
+                   str(cfg_path), "--relay-days", "0.00001",
+                   "--offline-compact"],
+                  capture_output=True, text=True,
+                  env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    _t.sleep(0.2)
+    stop.set()
+    worker.join(timeout=10)
+
+    assert out.returncode != 0, (
+        "offline compaction ran against a live daemon that had never "
+        "written a heartbeat. With [uptime] disabled that is every "
+        "daemon, so the guard did not exist at all")
+    assert "holds this store open" in (out.stdout + out.stderr), \
+        (out.stdout + out.stderr)[-300:]
+    assert path.stat().st_ino == inode_before, "the store was swapped"
+    live = daemon_store._conn.execute(
+        "SELECT COUNT(*) c FROM devices").fetchone()["c"]
+    daemon_store._conn.execute("PRAGMA wal_checkpoint(FULL)")
+    truth = HoundStore(path=path, readonly=True)
+    on_disk = truth._conn.execute(
+        "SELECT COUNT(*) c FROM devices").fetchone()["c"]
+    truth.close()
+    assert on_disk == live, (
+        f"{live - on_disk} of {live} writes went to an unlinked inode")
+
+    # With the daemon gone, the same command must WORK — the guard
+    # has to be a lock, not a refusal.
+    daemon_store.close()
+    size_before = path.stat().st_size
+    out = _sp.run([_sys.executable, "-m", "surveillancehound.cli", "prune",
+                   str(cfg_path), "--relay-days", "0.00001",
+                   "--offline-compact"],
+                  capture_output=True, text=True,
+                  env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    assert out.returncode == 0, (out.stdout + out.stderr)[-300:]
+    assert path.stat().st_size < size_before // 2, (
+        f"with the daemon stopped the compaction must actually run: "
+        f"{size_before:,} -> {path.stat().st_size:,}")
+    assert not (tmp / "lock.sqlite.vacuum.tmp").exists(), \
+        "the rebuild left its temp file behind"
+    print(f"  writer lock: refused with no heartbeat at all "
+          f"({wrote['n']} concurrent writes intact), then compacted "
+          f"{size_before:,} -> {path.stat().st_size:,} once stopped")
+
+
 def _check_prune_does_not_outrun_a_live_daemon(tmp: Path) -> None:
     """Pruning must never swap the file under a running daemon.
 
@@ -1138,6 +1303,12 @@ def _check_relayed_outage_fair_share(tmp: Path) -> None:
              "down_since": T0 + i, "up_at": None,
              "last_seen_before": T0 + i - 1, "cause": "silence"}
             for i in range(5)]}, 1000), T0)
+    # Two hostile batches that the two candidate orderings CHOOSE
+    # BETWEEN. Ordering by `ingested_at` (ours) takes the second;
+    # ordering by `down_since` (theirs) takes the first, because it is
+    # dated in 2096. Without this the SQL order is unobservable: the
+    # Python re-sort below reorders whatever came back, so only the
+    # SELECTION reveals which column the query used.
     store.ingest_remote_batch(
         "hostile", "inst-bbbb2222", 1,
         V.validate_records({"outages": [
@@ -1145,8 +1316,26 @@ def _check_relayed_outage_fair_share(tmp: Path) -> None:
              "down_since": 4_000_000_000.0, "up_at": None,
              "last_seen_before": 3_999_999_999.0, "cause": "silence"}
             for i in range(600)]}, 1000), T0 + 1)
+    store.ingest_remote_batch(
+        "hostile", "inst-bbbb2222", 2,
+        V.validate_records({"outages": [
+            {"remote_id": 10_000 + i, "camera_ip": f"10.8.{i // 256}.{i % 256}",
+             "down_since": T0 + i, "up_at": None,
+             "last_seen_before": T0 + i - 1, "cause": "silence"}
+            for i in range(600)]}, 1000), T0 + 2)
 
     rows = store.list_remote_outages(since=T0 - 1, limit=500)
+    recent = [r for r in rows
+              if r["sensor_id"] == "hostile" and r["remote_id"] >= 10_000]
+    future = [r for r in rows
+              if r["sensor_id"] == "hostile" and r["remote_id"] < 10_000]
+    assert len(recent) > len(future), (
+        f"of the hostile sensor's share, {len(future)} rows came from "
+        f"the batch dated 2096 and {len(recent)} from the one we "
+        f"received most recently. The query must order on "
+        f"`ingested_at` — our clock — or a sensor picks which of its "
+        f"own rows an operator is allowed to see by choosing "
+        f"`down_since`")
     by = {}
     for r in rows:
         by[r["sensor_id"]] = by.get(r["sensor_id"], 0) + 1
@@ -1245,7 +1434,8 @@ def _check_ingest_store_writes_go_through_the_gate(tmp: Path) -> None:
     # write left the collector's packet loop freezing for seconds ...
     # Every relayed store access belongs here" — and a test that
     # watched only the write let the gate be removed from the read.
-    for name in ("ingest_remote_batch", "get_remote_sensor"):
+    for name in ("ingest_remote_batch", "get_remote_sensor",
+                 "reusable_bytes"):
         def make(real):
             def watched(*a, **kw):
                 state["writes"] += 1
@@ -1276,6 +1466,21 @@ def _check_ingest_store_writes_go_through_the_gate(tmp: Path) -> None:
         f"write(s) ran OUTSIDE the capture gate. That write holds the "
         f"store lock the packet loop waits behind, so an ungated one "
         f"lets a remote peer stall local capture")
+
+    # The disk guard reads the store too, but only when free space is
+    # under the configured floor — so a normal batch never exercises
+    # it. Drive that path explicitly.
+    tight = IngestServer(_collector_cfg(0, min_free_disk_mb=1 << 30),
+                         store, now=lambda: T0, gate=gate)
+    before = state["writes"]
+    tight._disk_ok()
+    assert state["writes"] > before, (
+        "the disk guard did not read the store; this assertion no "
+        "longer covers anything")
+    assert state["ungated"] == 0, (
+        f"the disk guard's store read ran outside the capture gate. "
+        f"It is on the ingest path and takes the same lock as a "
+        f"write")
     store.close()
     print("  capture gate: the relayed store write runs inside it, not "
           "merely near it")
@@ -1356,6 +1561,17 @@ def _check_uptime_report_is_bounded(tmp: Path) -> None:
                  "monitored_seconds": 60.0, "availability": 1.0}
                 for i in range(n)]}, 10**6), wall)
 
+    # The DEFAULT limit, because that is what all three production
+    # callers use — `hound uptime`, `hound export` and /api/uptime
+    # pass none. A test that supplies its own limit leaves the
+    # default free to be raised back to unbounded.
+    import inspect as _inspect
+    default_limit = _inspect.signature(
+        store.remote_uptime_report).parameters["limit"].default
+    assert default_limit <= 20_000, (
+        f"the default limit is {default_limit}. Every production "
+        f"caller uses it, and the OPNsense dashboard runs one of them "
+        f"through configd every 10 seconds on a 1-vCPU box")
     rows = store.remote_uptime_report(wall, 600.0, limit=500)
     assert len(rows) <= 500, (
         f"remote_uptime_report returned {len(rows)} rows for a limit of "
@@ -1488,8 +1704,14 @@ def _check_relayed_alerts_count_in_the_tile(tmp: Path) -> None:
         store.insert_alert(AlertRow(
             id=None, ts=now - i, device_ip="10.0.0.1", kind="new_device",
             severity="low", summary="x", detail="", dedup_key=f"loc{i}"))
+    # Sensor-supplied `ts` BACKDATED outside the window, ingested_at
+    # inside it. The counter is specified to use our clock so a
+    # backdated alert cannot hide from the tally — with both columns
+    # inside the window the two are interchangeable and that property
+    # goes unasserted.
     recs = V.validate_records({"alerts": [
-        {"remote_id": i + 1, "ts": now - i, "device_ip": "192.168.10.11",
+        {"remote_id": i + 1, "ts": now - 400_000.0,
+         "device_ip": "192.168.10.11",
          "kind": "new_device", "severity": "low", "summary": "x",
          "detail": "", "dedup_key": f"rem{i}"} for i in range(11)]}, 1000)
     store.ingest_remote_batch("frigate", "inst-aaaa1111", 1, recs, now)
@@ -1512,8 +1734,11 @@ def _check_relayed_alerts_count_in_the_tile(tmp: Path) -> None:
     assert got == 18, (
         f"alerts_24h is {got}; 7 local + 11 relayed alerts are inside "
         f"the window and the tile sits above a table that lists both. "
-        f"--limit 3 is set deliberately: the count must come from a "
-        f"COUNT, not from the page fetched for the table")
+        f"Two things are deliberate here: --limit 3, so the count must "
+        f"come from a COUNT and not the page fetched for the table; "
+        f"and the relayed alerts carry a `ts` five days old, so a "
+        f"counter reading the sensor's clock instead of `ingested_at` "
+        f"misses all eleven")
     print("  alerts_24h: 7 local + 11 relayed counted at --limit 3")
 
 
@@ -5366,6 +5591,8 @@ def main() -> int:
         _check_clock_skew_does_not_destroy_data(Path(td))
         _check_prune_relay_days_returns_bytes(Path(td))
         _check_prune_does_not_outrun_a_live_daemon(Path(td))
+        _check_writer_lock_guards_the_swap(Path(td))
+        _check_heartbeat_does_not_depend_on_uptime(Path(td))
         _check_relayed_alerts_count_in_the_tile(Path(td))
         _check_shutdown_flushes_the_relay(Path(td))
         _check_instance_reset_log_is_throttled(Path(td))

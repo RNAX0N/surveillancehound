@@ -296,6 +296,12 @@ def cmd_uptime(args: argparse.Namespace) -> int:
                     f"{datetime.fromtimestamp(down):%Y-%m-%d %H:%M:%S} "
                     f"{until:19s} {_dur(dur):>10s}  {cause}"
                 )
+            if relayed:
+                print("\nRelayed rows are ordered by when this "
+                      "collector RECEIVED them, local rows by when "
+                      "they started. `down_since` on a relayed row is "
+                      "the sensor's own clock and is not used for "
+                      "ordering.")
             print(f"\n{_PASSIVE_NOTE}")
             return 0
 
@@ -803,11 +809,14 @@ def cmd_prune(args: argparse.Namespace) -> int:
             kwargs["outages_older_than"] = now - args.outages_days * 86400.0
         if args.sessions_days is not None:
             kwargs["sessions_older_than"] = now - args.sessions_days * 86400.0
-        if args.relay_days is None and not kwargs:
+        if (args.relay_days is None and not kwargs
+                and not args.offline_compact):
             sys.exit(
                 "no cutoff given. specify one or more of --flows-days, "
                 "--alerts-days, --notifications-days, --outages-days, "
-                "--sessions-days, --relay-days",
+                "--sessions-days, --relay-days — or --offline-compact "
+                "on its own to rebuild the store without deleting "
+                "anything.",
             )
         # RELAYED ROWS FIRST, then one reclaim covering everything.
         #
@@ -824,11 +833,23 @@ def cmd_prune(args: argparse.Namespace) -> int:
                 store.prune_remote(now - args.relay_days * 86400.0))
         if kwargs:
             deleted.update(store.prune(**kwargs))
-        if args.relay_days is not None and any(deleted.values()):
+        # NOT gated on this run having deleted something. Reclaiming
+        # is the point of the flag, and the rows are usually already
+        # gone by the time an operator gets here: the first attempt
+        # deletes them and then refuses the swap because the daemon is
+        # up, so the re-run after stopping it found nothing to delete
+        # and silently skipped the compaction it was run for.
+        if args.relay_days is not None or args.offline_compact:
             try:
                 before, after = store.vacuum(offline=args.offline_compact)
             except RuntimeError as e:
                 sys.exit(f"error: {e}")
+            except sqlite3.Error as e:
+                # Not just RuntimeError: an I/O error mid-rebuild came
+                # out as a traceback, which is the wrong output for a
+                # command an operator runs on a failing disk.
+                sys.exit(f"error: could not rebuild the store: {e}. "
+                         f"The rows were still deleted.")
             if after < before:
                 print(f"reclaimed {(before - after) / 1e6:,.1f} MB "
                       f"({before:,} -> {after:,} bytes)")
@@ -1054,10 +1075,14 @@ def build_parser() -> argparse.ArgumentParser:
                           "filesystem")
     p_p.add_argument("--offline-compact", action="store_true",
                      help="STOP THE DAEMON FIRST. Rebuilds the store into "
-                          "a new file and swaps it in, which needs far less "
-                          "free disk than the default in-place rebuild but "
-                          "is only safe with nothing else writing. Refuses "
-                          "if the heartbeat shows the daemon running.")
+                          "a new file and swaps it in, which needs room "
+                          "for the live data rather than roughly the whole "
+                          "file — so it works on the full disk the "
+                          "in-place rebuild cannot. Only safe with nothing "
+                          "else writing, and it refuses while the daemon "
+                          "holds the store open. Valid on its own, with no "
+                          "cutoff, to reclaim space after an earlier prune "
+                          "already deleted the rows.")
     p_p.set_defaults(func=cmd_prune)
 
     p_w = sub.add_parser("web", help="serve the local dashboard")
