@@ -1072,6 +1072,7 @@ class HoundStore:
         """
         counts: dict[str, int] = {}
         with self._lock, self._conn:
+            _before_devices = self._conn.total_changes
             for d in records.get("devices", []):
                 self._conn.execute(
                     """INSERT INTO remote_devices
@@ -1088,7 +1089,7 @@ class HoundStore:
                     (sensor_id, d["ip"], d["role"], d["first_seen"],
                      d["last_seen"], d["packet_count"], d["byte_count"], now),
                 )
-            counts["devices"] = len(records.get("devices", []))
+            counts["devices"] = self._conn.total_changes - _before_devices
 
             _before_flows = self._conn.total_changes
             for f in records.get("flows", []):
@@ -1128,6 +1129,7 @@ class HoundStore:
                 )
             counts["alerts"] = self._conn.total_changes - _before_alerts
 
+            _before_outages = self._conn.total_changes
             for o in records.get("outages", []):
                 # upsert, so a recovery closes the open row instead of
                 # inserting a second one
@@ -1145,8 +1147,9 @@ class HoundStore:
                      o["down_since"], o["up_at"], o["last_seen_before"],
                      o["cause"], now),
                 )
-            counts["outages"] = len(records.get("outages", []))
+            counts["outages"] = self._conn.total_changes - _before_outages
 
+            _before_uptime = self._conn.total_changes
             for u in records.get("uptime", []):
                 self._conn.execute(
                     """INSERT INTO remote_uptime
@@ -1172,7 +1175,7 @@ class HoundStore:
                      u["outage_count"], u["downtime_seconds"],
                      u["monitored_seconds"], u["availability"], now),
                 )
-            counts["uptime"] = len(records.get("uptime", []))
+            counts["uptime"] = self._conn.total_changes - _before_uptime
 
             mon = records.get("monitor") or {}
             total = sum(counts.values())
@@ -1209,7 +1212,12 @@ class HoundStore:
                 "this sensor is legitimately this busy.",
                 sensor_id, max_rows_per_sensor, trimmed,
             )
-        counts["total"] = total
+        # The ack must describe what SURVIVED the transaction, not what
+        # entered it. Reporting 1000 accepted while the quota trimmed
+        # 950 in the same transaction is the collector telling the agent
+        # it holds records it has already discarded.
+        counts["total"] = max(0, total - trimmed)
+        counts["submitted"] = total
         counts["trimmed"] = trimmed
         return counts
 

@@ -868,7 +868,7 @@ def _check_resource_bounds(tmp: Path) -> None:
     for i in range(25):
         recs = V.validate_records(
             {"alerts": [{
-                "remote_id": i, "ts": T + i, "device_ip": "10.0.0.5",
+                "remote_id": i + 1, "ts": T + i, "device_ip": "10.0.0.5",
                 "kind": "new_device", "severity": "low",
                 "summary": f"a{i}", "detail": "", "dedup_key": f"k{i}",
             }]}, 100)
@@ -891,7 +891,7 @@ def _check_resource_bounds(tmp: Path) -> None:
     store.ingest_remote_batch("quiet", "i2", 1, quiet, T, max_rows_per_sensor=cap)
     for i in range(25, 60):
         recs = V.validate_records(
-            {"alerts": [{"remote_id": i, "ts": T + i, "device_ip": "10.0.0.5",
+            {"alerts": [{"remote_id": i + 1, "ts": T + i, "device_ip": "10.0.0.5",
                          "kind": "new_device", "severity": "low",
                          "summary": f"a{i}", "detail": "", "dedup_key": f"k{i}"}]},
             100)
@@ -1640,6 +1640,16 @@ def _check_relayed_api_surface(tmp: Path) -> None:
         '[capture]\ninterface = "test0"\n'
         '[network]\ncamera_ips = ["10.9.0.5"]\n'
         f'[store]\npath = "{db}"\n'
+        # Collector mode: `hound export` withholds relayed rows
+        # otherwise, matching the API.
+        '[relay]\nmode = "collector"\nlisten_host = "127.0.0.1"\n'
+        'listen_port = 18443\n'
+        f'cert_file = "{FIXTURES / "ingest-test.crt"}"\n'
+        f'key_file = "{FIXTURES / "ingest-test.key"}"\n'
+        '[[relay.sensor]]\nid = "live-one"\n'
+        'key = "shared-secret-abcdef"\n'
+        '[[relay.sensor]]\nid = "dead-one"\n'
+        'key = "shared-secret-abcdef"\n'
     )
     with redirect_stdout(buf):
         rc = cli_mod.cmd_export(argparse.Namespace(config=str(toml), limit=100, window=86400.0))
@@ -1945,8 +1955,62 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
     assert srv._per_source.get("10.0.0.9", 0) == 0, (
         f"per-source count leaked on spawn failure: {srv._per_source}"
     )
+    # Round-robin service: one sensor's backlog must not sit in front
+    # of another sensor's page. Dropping was fixed earlier; DELAY is
+    # the same silencing at a few seconds per channel.
+    from surveillancehound.daemon import _FairAlertQueue
+    fq = _FairAlertQueue(1000)
+    for i in range(500):
+        fq.put_nowait(("noisy", {"i": i}, "inst"))
+    fq.put_nowait(("quiet", {"i": "critical"}, "inst"))
+    served = [fq.get_nowait()[0] for _ in range(6)]
+    assert "quiet" in served[:3], (
+        f"the quiet sensor waited behind a 500-deep flood: {served}"
+    )
+    # The sentinel is not an alert and must not be counted as backlog.
+    fq2 = _FairAlertQueue(10)
+    fq2.put_nowait(None)
+    assert fq2.qsize() == 0, "the shutdown sentinel inflated the queue size"
+    assert fq2.get_nowait() is None
+
+    # The per-sensor budget must be CHECKED at admission but only SPENT
+    # on a successful enqueue, or alerts rejected by a later gate burn
+    # an allowance they never used.
+    from surveillancehound import daemon as dmod
+    from surveillancehound.config import load_from_dict as _lfd
+    cfg2 = _lfd({
+        "capture": {"interface": "test0"},
+        "network": {"camera_ips": ["10.9.0.5"]},
+        "store": {"path": str(tmp / "budget.sqlite")},
+        "relay": {
+            "mode": "collector", "listen_host": "127.0.0.1", "listen_port": 0,
+            "cert_file": str(FIXTURES / "ingest-test.crt"),
+            "key_file": str(FIXTURES / "ingest-test.key"),
+            "max_notifications_per_minute": 10,
+            "sensor": [{"id": "s0", "key": "shared-secret-abcdef"}],
+        },
+    })
+    h2 = dmod.Hound(cfg2)
+    try:
+        h2._relay_queue_share = lambda: 0          # force share rejection
+        mk = lambda i: {"remote_id": i, "ts": T0, "device_ip": "10.0.0.5",
+                        "kind": "new_device", "severity": "low",
+                        "summary": "n", "detail": "", "dedup_key": f"d{i}"}
+        h2._on_relayed_alerts("s0", [mk(i + 1) for i in range(10)], "inst")
+        spent = len(h2._relay_notify_times.get("s0", []))
+        assert spent == 0, (
+            f"{spent} budget token(s) spent on alerts that were never "
+            f"queued; a burst of rejected noise would then refuse the "
+            f"next genuine alert against an empty queue"
+        )
+        h2._relay_queue_share = lambda: 500
+        h2._on_relayed_alerts("s0", [dict(mk(99), severity="critical")], "inst")
+        assert h2._relay_alertq.qsize() == 1
+    finally:
+        h2.store.close()
+
     print("  shutdown: prompt with a full queue; slots released on spawn "
-          "failure")
+          "failure; round-robin service; budget spent only on enqueue")
 
 
 def _check_instance_reset(tmp: Path) -> None:

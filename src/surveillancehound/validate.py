@@ -196,7 +196,7 @@ def validate_device(raw: Any) -> dict:
 def validate_flow(raw: Any) -> dict:
     r = _require(raw, "flow")
     return {
-        "remote_id": clean_int(r.get("remote_id", 0), "flow.remote_id"),
+        "remote_id": clean_remote_id(r.get("remote_id"), "flow.remote_id"),
         "src_ip": clean_ip(r.get("src_ip"), "flow.src_ip"),
         "src_port": clean_port(r.get("src_port"), "flow.src_port"),
         "dst_ip": clean_ip(r.get("dst_ip"), "flow.dst_ip"),
@@ -217,7 +217,7 @@ def validate_flow(raw: Any) -> dict:
 def validate_alert(raw: Any) -> dict:
     r = _require(raw, "alert")
     return {
-        "remote_id": clean_int(r.get("remote_id", 0), "alert.remote_id"),
+        "remote_id": clean_remote_id(r.get("remote_id"), "alert.remote_id"),
         "ts": clean_ts(r.get("ts"), "alert.ts"),
         # capture_stalled legitimately carries no device
         "device_ip": clean_ip(r.get("device_ip", ""), "alert.device_ip", True),
@@ -233,7 +233,7 @@ def validate_outage(raw: Any) -> dict:
     r = _require(raw, "outage")
     up_at = r.get("up_at")
     return {
-        "remote_id": clean_int(r.get("remote_id", 0), "outage.remote_id"),
+        "remote_id": clean_remote_id(r.get("remote_id"), "outage.remote_id"),
         "camera_ip": clean_ip(r.get("camera_ip"), "outage.camera_ip"),
         "down_since": clean_ts(r.get("down_since"), "outage.down_since"),
         "up_at": None if up_at is None else clean_ts(up_at, "outage.up_at"),
@@ -298,6 +298,24 @@ _INSTANCE_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
 )
 MAX_INSTANCE_LEN = 64
+
+
+def clean_remote_id(value: Any, field: str) -> int:
+    """The sensor's own row id for a record. Required, and >= 1.
+
+    Defaulting it to 0 meant an agent that omitted the field had every
+    record collide on id 0: the collector stores one row per (sensor,
+    instance, remote_id), so exactly ONE flow, ONE alert and ONE outage
+    were ever kept for that sensor, while the agent advanced its
+    watermark on the 200 and never resent. Silent, permanent, and
+    indistinguishable from a quiet segment.
+    """
+    if value is None:
+        raise ValidationError(
+            f"{field} is required: without it every record collides on a "
+            f"single id and all but the first are silently discarded"
+        )
+    return clean_int(value, field, lo=1)
 
 
 def clean_instance_id(value: Any, field: str = "instance_id") -> str:

@@ -102,6 +102,76 @@ class RunStats:
     stopped_at: float | None = None
 
 
+class _FairAlertQueue:
+    """Bounded alert queue that serves sensors round-robin.
+
+    A single FIFO closed the "one sensor drops another's alerts" hole
+    but not the "one sensor DELAYS another's alerts" one: a legitimate
+    sensor's critical page sat behind the flooder's backlog, and at a
+    few seconds per channel that is tens of minutes. Silencing by delay
+    is still silencing.
+
+    Round-robin means a quiet sensor's alert waits at most one item per
+    OTHER sensor, regardless of how much backlog the noisy one has.
+    """
+
+    def __init__(self, maxsize: int):
+        self.maxsize = maxsize
+        self._queues: dict[str, deque] = {}
+        self._order: deque[str] = deque()
+        self._sentinel = False
+        self._n = 0
+        self._cv = threading.Condition()
+
+    def qsize(self) -> int:
+        with self._cv:
+            return self._n
+
+    def put_nowait(self, item) -> None:
+        with self._cv:
+            if item is None:            # shutdown sentinel, always admitted
+                self._sentinel = True
+                self._cv.notify()
+                return
+            if self._n >= self.maxsize:
+                raise queue.Full
+            sensor = item[0]
+            q = self._queues.get(sensor)
+            if q is None:
+                q = self._queues[sensor] = deque()
+                self._order.append(sensor)
+            q.append(item)
+            self._n += 1
+            self._cv.notify()
+
+    def _pop_locked(self):
+        if self._sentinel:
+            self._sentinel = False
+            return None
+        for _ in range(len(self._order)):
+            sensor = self._order[0]
+            self._order.rotate(-1)
+            q = self._queues.get(sensor)
+            if q:
+                self._n -= 1
+                return q.popleft()
+        raise queue.Empty
+
+    def get_nowait(self):
+        with self._cv:
+            if not self._n and not self._sentinel:
+                raise queue.Empty
+            return self._pop_locked()
+
+    def get(self, timeout: float | None = None):
+        with self._cv:
+            if not self._n and not self._sentinel:
+                self._cv.wait(timeout)
+            if not self._n and not self._sentinel:
+                raise queue.Empty
+            return self._pop_locked()
+
+
 class Hound:
     """Owns the daemon's lifecycle. One instance per process."""
 
@@ -190,9 +260,10 @@ class Hound:
         self._relay_inflight: dict[str, int] = {}
         self._relay_inflight_lock = threading.Lock()
         self._relay_budget_warned: dict[str, bool] = {}
+        self._relay_budget_lock = threading.Lock()
         # Bounded hand-off from the ingest threads to one dispatch worker.
-        self._relay_alertq: queue.Queue | None = (
-            queue.Queue(maxsize=_RELAY_ALERT_QUEUE)
+        self._relay_alertq: _FairAlertQueue | None = (
+            _FairAlertQueue(_RELAY_ALERT_QUEUE)
             if cfg.relay.is_collector else None
         )
         self._relay_worker: threading.Thread | None = None
@@ -313,11 +384,17 @@ class Hound:
                 handle.close()
                 self.store.close()
             self.stats.stopped_at = time.time()
+            # relayed_dispatched is reported separately and ALWAYS, not
+            # folded into `alerts`: separating the counter and then not
+            # printing it meant a collector that paged 500 relayed
+            # alerts reported alerts=0.
             log.info(
                 "hound stopped: packets=%s flows_flushed=%s alerts=%s "
-                "uptime_transitions=%s",
+                "relayed_dispatched=%s uptime_transitions=%s",
                 self.stats.packets_seen, self.stats.flows_flushed,
-                self.stats.alerts_emitted, self.stats.uptime_transitions,
+                self.stats.alerts_emitted,
+                self.stats.relayed_alerts_dispatched,
+                self.stats.uptime_transitions,
             )
 
     # ----- internals -----
@@ -679,7 +756,15 @@ class Hound:
                 ("k", sensor_id, raw["dedup_key"]))
             if seen is not None and (now - seen) < window:
                 continue
-            if not self._relay_notify_budget(sensor_id, now):
+            # Budget is CHECKED here but only SPENT once the item is
+            # actually queued. Spending it first meant alerts rejected
+            # by the later gates — never queued, never dispatched,
+            # never paged — still burned the sensor's allowance, so a
+            # burst of share-dropped noise could exhaust the budget and
+            # the next genuine critical was refused against an empty
+            # queue. That is the same defect as budget-dropped alerts
+            # poisoning the dedup map, moved one gate downstream.
+            if not self._relay_notify_budget(sensor_id, now, spend=False):
                 self.stats.relayed_dropped_budget += 1
                 continue
             with self._relay_inflight_lock:
@@ -692,8 +777,14 @@ class Hound:
                 q.put_nowait((sensor_id, raw, instance_id))
             except queue.Full:
                 with self._relay_inflight_lock:
-                    self._relay_inflight[sensor_id] -= 1
+                    n = self._relay_inflight.get(sensor_id, 1) - 1
+                    if n > 0:
+                        self._relay_inflight[sensor_id] = n
+                    else:
+                        self._relay_inflight.pop(sensor_id, None)
                 self.stats.relayed_dropped_queue += 1
+                continue
+            self._relay_notify_budget(sensor_id, now, spend=True)
 
         if over_batch:
             self.stats.relayed_dropped_batch += over_batch
@@ -773,6 +864,7 @@ class Hound:
         # the shutdown report honest — and these stay suppressed for the
         # dedup window after a restart, because dedup measures receipt,
         # so an operator needs to know they were skipped.
+        # qsize() excludes the sentinel, so this is real work dropped.
         abandoned = self._relay_alertq.qsize()
         if abandoned:
             self.stats.relayed_dropped_queue += abandoned
@@ -886,7 +978,8 @@ class Hound:
         # observed things another host did.
         self.stats.relayed_alerts_dispatched += 1
 
-    def _relay_notify_budget(self, sensor_id: str, now: float) -> bool:
+    def _relay_notify_budget(self, sensor_id: str, now: float,
+                             *, spend: bool = True) -> bool:
         """Per-sensor cap on NOTIFICATIONS, not on storage.
 
         Dedup bounds repeats of one alert; this bounds distinct ones. A
@@ -901,6 +994,12 @@ class Hound:
         cap = self.cfg.relay.max_notifications_per_minute
         if cap <= 0:
             return True
+        # Called from up to max_workers ingest threads concurrently.
+        with self._relay_budget_lock:
+            return self._budget_locked(sensor_id, now, cap, spend)
+
+    def _budget_locked(self, sensor_id: str, now: float, cap: int,
+                       spend: bool) -> bool:
         q = self._relay_notify_times.setdefault(sensor_id, deque())
         while q and (now - q[0]) > 60.0:
             q.popleft()
@@ -916,7 +1015,8 @@ class Hound:
                 )
             return False
         self._relay_budget_warned[sensor_id] = False
-        q.append(now)
+        if spend:
+            q.append(now)
         return True
 
     def _emit(self, alert: Alert) -> int:

@@ -336,9 +336,18 @@ def cmd_export(args: argparse.Namespace) -> int:
         report = store.uptime_report(window, now)
         alerts = store.list_alerts(limit=args.limit)
         flows = store.recent_flows(limit=args.limit)
-        sensors = store.list_remote_sensors()
-        remote_up = store.remote_uptime_report(
-            now, cfg.relay.sensor_timeout_seconds)
+        sensors = (store.list_remote_sensors()
+                   if cfg.relay.is_collector else [])
+        # Gated like the API. `hound export` is the ONLY source the
+        # OPNsense dashboard reads, so leaving it ungated was the half
+        # of the inconsistency that actually reached an operator.
+        is_collector = cfg.relay.is_collector
+        remote_up = (
+            store.remote_uptime_report(now, cfg.relay.sensor_timeout_seconds)
+            if is_collector else []
+        )
+        remote_alerts = (store.list_remote_alerts(limit=args.limit)
+                         if is_collector else [])
         doc = {
             "now": now,
             "window_seconds": window,
@@ -354,11 +363,20 @@ def cmd_export(args: argparse.Namespace) -> int:
                 "devices": len(devices),
                 "cameras": sum(1 for d in devices if d.role == "camera"),
                 "nvrs": sum(1 for d in devices if d.role == "nvr"),
-                "alerts_24h": sum(1 for a in alerts if a.ts >= now - 86400),
+                # Counts local AND relayed, because the table below this
+                # tile renders both — a count that disagrees with the
+                # list under it is worse than no count. Relayed rows are
+                # aged on ingested_at, our clock, so a backdated alert
+                # cannot hide from the tally or inflate it.
+                "alerts_24h": (
+                    sum(1 for a in alerts if a.ts >= now - 86400)
+                    + sum(1 for a in remote_alerts
+                          if float(a.get("ingested_at", 0.0)) >= now - 86400)
+                ),
             },
             "uptime": [dict(r.__dict__, sensor="local") for r in report],
             "remote_uptime": remote_up,
-            "remote_alerts": store.list_remote_alerts(limit=args.limit),
+            "remote_alerts": remote_alerts,
             "sensors": [
                 dict(x.__dict__,
                      reporting=(now - x.last_seen) <= cfg.relay.sensor_timeout_seconds)
@@ -370,7 +388,8 @@ def cmd_export(args: argparse.Namespace) -> int:
             # The OPNsense dashboard renders THIS document and cannot
             # reach /api/flows, so omitting relayed flows here made them
             # invisible on the collector's own platform.
-            "remote_flows": store.list_remote_flows(limit=args.limit),
+            "remote_flows": (store.list_remote_flows(limit=args.limit)
+                             if is_collector else []),
         }
     finally:
         store.close()
@@ -445,8 +464,17 @@ def cmd_relay(args: argparse.Namespace) -> int:
                   readonly=True)
     st = spool.stats(time.time())
     print(f"relay: agent {r.sensor_id!r} -> {r.url}")
-    print(f"  instance      {state.instance_id}")
-    print(f"  next sequence {state.next_seq}")
+    if state.instance_id:
+        print(f"  instance      {state.instance_id}")
+        print(f"  next sequence {state.next_seq}")
+    else:
+        # readonly load mints nothing, so an absent id means the agent
+        # has never run OR its state file is unreadable. Printing a
+        # blank instance and "next sequence 1" as fact would be stating
+        # something this command cannot actually see.
+        print("  instance      unknown — no readable state file at "
+              f"{base / 'state.json'}")
+        print("  next sequence unknown (the agent mints state on first run)")
     if state.last_push_ts:
         print(f"  last push     {_dur(time.time() - state.last_push_ts)} ago")
     else:
