@@ -495,6 +495,9 @@ def _networks(section: dict, key: str) -> list[str]:
 # reach the ingest port and the ability to author alerts on the collector.
 # A short one is brute-forceable offline against a single captured batch.
 _MIN_KEY_LEN = 16
+# Must match relay._MAX_RECORDS_PER_KIND. Kept here as a plain constant
+# rather than imported, because config must not depend on relay.
+_AGENT_RECORDS_PER_KIND = 5000
 
 
 def _require_strong_key(key: str, where: str) -> None:
@@ -645,6 +648,19 @@ def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
                 "with an id and a key"
             )
         seen = set()
+        # The agent builds batches of up to 5000 records per kind and
+        # treats a 400 as terminal, so a collector cap below that
+        # rejects and DROPS every batch forever, with no backpressure
+        # and nothing in the agent's log to distinguish it from a quiet
+        # segment. Refuse the config instead of shipping the silence.
+        if 0 < cfg.max_records_per_batch < _AGENT_RECORDS_PER_KIND:
+            raise ValueError(
+                f"config: [relay].max_records_per_batch is "
+                f"{cfg.max_records_per_batch}, below the "
+                f"{_AGENT_RECORDS_PER_KIND} records per kind an agent "
+                f"sends. Every batch would be rejected and discarded. "
+                f"Use {_AGENT_RECORDS_PER_KIND} or more."
+            )
         for sensor in cfg.sensors:
             if not sensor.id or not sensor.key:
                 raise ValueError(

@@ -262,7 +262,21 @@ def _check_relay_config() -> None:
     rejects({**coll, "sensor": [{"id": "a", "key": "short"}]},
             "a brute-forceable sensor key")
     rejects({"mode": "sideways"}, "an unknown relay mode")
-    print("  config: 14 relay guards hold; mode defaults to off")
+    # These live in two modules (config must not import relay) and are
+    # only correct while they agree: a collector cap below the agent's
+    # per-kind batch size rejects and DROPS every batch forever.
+    from surveillancehound.config import _AGENT_RECORDS_PER_KIND
+    from surveillancehound.relay import _MAX_RECORDS_PER_KIND
+    assert _AGENT_RECORDS_PER_KIND == _MAX_RECORDS_PER_KIND, (
+        f"config says the agent sends {_AGENT_RECORDS_PER_KIND} records "
+        f"per kind, relay sends {_MAX_RECORDS_PER_KIND}. If relay's is "
+        f"larger, the collector floor no longer protects anything."
+    )
+    rejects({"mode": "collector", "listen_host": "88.255.5.1",
+             "max_records_per_batch": 1000,
+             "sensor": [{"id": "a", "key": "shared-secret-abcdef"}]},
+            "a collector cap below what an agent sends")
+    print("  config: 15 relay guards hold; mode defaults to off")
 
 
 def _check_key_never_printed() -> None:
@@ -1492,6 +1506,48 @@ def _check_sensor_offline_alerts(tmp: Path) -> None:
         hound.store.close()
 
 
+def _check_parse_amplification_bounded() -> None:
+    """A dense body must be refused BEFORE json.loads allocates.
+
+    Authenticating before parsing closed the unauthenticated case, but
+    the threat model's premise is a key-holder: an 8 MB body of
+    `[],[],[]...` costs ~209 MB resident, and concurrent ones took the
+    collector to 1.3 GB — an OOM of the process that is also capturing
+    packets. The record cap cannot help; it is applied after the
+    allocation it would need to prevent.
+    """
+    import json as _json
+
+    hostile = b"[" + b"[]," * 700000 + b"[]]"
+    try:
+        V.check_container_budget(hostile)
+        raise AssertionError(
+            f"a {len(hostile) // 1000} kB body of empty containers was "
+            f"accepted for parsing"
+        )
+    except V.ValidationError:
+        pass
+
+    # A FULL legitimate batch must still pass, or the bound is useless.
+    rec = {
+        "remote_id": 1, "src_ip": "10.0.0.1", "src_port": 1,
+        "dst_ip": "10.0.0.2", "dst_port": 2, "proto": "tcp",
+        "first_seen": T0, "last_seen": T0, "packets": 1, "bytes": 1,
+        "bytes_to_camera": 0, "bytes_from_camera": 0,
+        "tcp_flags_seen": "", "classification": "lan_normal",
+    }
+    full = _json.dumps({"records": {
+        k: [dict(rec, remote_id=i + 1) for i in range(5000)]
+        for k in ("flows", "alerts", "devices", "outages", "uptime")
+    }}).encode()
+    V.check_container_budget(full)
+
+    # Brackets inside a string are data, not structure.
+    V.check_container_budget(_json.dumps({"summary": "[{" * 100000}).encode())
+    print(f"  parse budget: dense bodies refused before allocation; a full "
+          f"{len(full) // 100000 / 10:.1f} MB batch still accepted")
+
+
 def _check_relayed_api_surface(tmp: Path) -> None:
     """Relayed rows must reach /api/uptime and `hound export` correctly.
 
@@ -1928,6 +1984,7 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
             self._slots = __import__("threading").BoundedSemaphore(4)
             self._per_source = {}
             self._src_lock = __import__("threading").Lock()
+            self._active = 0
             self.rejected_overload = 0
 
         def shutdown_request(self, request):
@@ -1954,6 +2011,11 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
         socketserver.ThreadingMixIn.process_request = orig
     assert srv._per_source.get("10.0.0.9", 0) == 0, (
         f"per-source count leaked on spawn failure: {srv._per_source}"
+    )
+    assert srv.active_handlers() == 0, (
+        f"in-flight handler count leaked on spawn failure "
+        f"({srv.active_handlers()}); stop() waits on this, so a leak "
+        f"makes every shutdown take the full 10s timeout"
     )
     # Round-robin service: one sensor's backlog must not sit in front
     # of another sensor's page. Dropping was fixed earlier; DELAY is
@@ -2295,14 +2357,37 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
         ]
 
         waits: list[float] = []
+        pkt_waits: list[float] = []
         stop = threading.Event()
+        from surveillancehound.relay import CaptureGate
+        gate = CaptureGate()
+
+        # Measure the REAL thing: a tick holding `_loop_lock` and
+        # doing store work, which is exactly what the packet loop
+        # queues behind. A synthetic set_heartbeat loop reported ~0.3s
+        # while an instrumented tick was blocked 3.3s in the same run —
+        # the test was 10x off the quantity it claimed to bound.
+        loop_lock = threading.RLock()
 
         def tick() -> None:
             while not stop.is_set():
                 t0 = _t.time()
-                store.set_heartbeat(_t.time(), _t.time())
+                with loop_lock:                      # as the watchdog does
+                    with gate.capture_priority():
+                        store.set_heartbeat(_t.time(), _t.time())
+                        store.recent_flows(limit=50)
+                        store.list_remote_sensors()
                 waits.append(_t.time() - t0)
                 _t.sleep(0.02)
+
+        def packet_loop() -> None:
+            """What actually goes blind: per-packet _loop_lock."""
+            while not stop.is_set():
+                t0 = _t.time()
+                with loop_lock:
+                    pass
+                pkt_waits.append(_t.time() - t0)
+                _t.sleep(0.001)
 
         # Go through the REAL IngestServer.handle_batch, so the
         # serialisation under test is the production one. Wrapping a
@@ -2320,7 +2405,7 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
             ).RelaySensorCfg(id=f"s{i}", key="shared-secret-abcdef")
                 for i in range(8)],
         )
-        server = IngestServer(icfg, store, now=_t.time)
+        server = IngestServer(icfg, store, now=_t.time, gate=gate)
 
         peak_concurrent = [0]
         live = [0]
@@ -2353,6 +2438,8 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
 
         t = threading.Thread(target=tick, daemon=True)
         t.start()
+        pl = threading.Thread(target=packet_loop, daemon=True)
+        pl.start()
         ws = [threading.Thread(target=write, args=(i,)) for i in range(8)]
         for w in ws:
             w.start()
@@ -2374,16 +2461,67 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
             f"seconds of blind capture"
         )
 
+        worst_pkt = max(pkt_waits) if pkt_waits else 0.0
+        assert worst_pkt < 1.0, (
+            f"the packet loop froze for {worst_pkt:.2f}s waiting on "
+            f"_loop_lock behind relayed ingest. tcpdump's pipe fills in "
+            f"milliseconds, so this is the collector going blind on its "
+            f"own segment because a remote host sent data"
+        )
+
         worst = max(waits)
-        assert worst < 5.0, (
+        assert worst < 2.0, (
             f"a tick waited {worst:.1f}s on the store lock behind relayed "
             f"ingest. The packet loop is behind that wait, and tcpdump's "
             f"pipe fills in milliseconds — this is the collector going "
             f"blind because a remote host sent data"
         )
+        # The gate itself, asserted directly. The timing loop above
+        # exercises the one-writer slot; at this fixture's load the
+        # slot alone keeps contention low, so removing the gate does
+        # NOT move those numbers. The gate earns its place at the load
+        # a reviewer measured (32 posters, 3-4s freezes), which is too
+        # slow and too machine-dependent to assert on here — so its
+        # contract is tested on its own rather than claimed to be
+        # covered by a timing threshold that cannot see it.
+        g = CaptureGate()
+        entered = threading.Event()
+        released = threading.Event()
+
+        def relayed_side() -> None:
+            with g.deferred(timeout=5.0):
+                entered.set()
+
+        with g.capture_priority():
+            th = threading.Thread(target=relayed_side, daemon=True)
+            th.start()
+            held = entered.wait(0.4)
+            assert not held, (
+                "relayed store access proceeded while capture held "
+                "priority; the tick holds _loop_lock for its whole "
+                "duration, so this is the packet loop waiting"
+            )
+            released.set()
+        assert entered.wait(5.0), (
+            "relayed access never resumed after capture released "
+            "priority — the gate must defer relayed work, not starve it"
+        )
+        th.join(timeout=5.0)
+
+        # A wedged tick must degrade to "relay is slow", never "relay
+        # is dead": the wait is bounded.
+        g2 = CaptureGate()
+        with g2.capture_priority():
+            t0 = _t.time()
+            with g2.deferred(timeout=0.2):
+                pass
+            assert _t.time() - t0 < 2.0, "deferred() did not time out"
+
+        print(f"  capture gate: relayed access defers to the tick and "
+              f"resumes, with a bounded wait")
         print(f"  capture coupling: {peak_concurrent[0]} concurrent store "
-              f"writer(s); worst tick wait {worst:.2f}s, median "
-              f"{statistics.median(waits):.3f}s")
+              f"user(s); worst packet-loop freeze {worst_pkt:.3f}s, worst "
+              f"tick {worst:.2f}s, median {statistics.median(waits):.3f}s")
     finally:
         store.close()
 
@@ -2397,6 +2535,7 @@ def main() -> int:
     _check_notification_hardening()
     _check_dashboard_numeric_escaping()
     _check_relay_config()
+    _check_parse_amplification_bounded()
     _check_capture_exclusion()
     _check_key_never_printed()
     print("=== quarantine ===")

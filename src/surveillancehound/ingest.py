@@ -93,7 +93,7 @@ class IngestServer:
     """HTTPS listener accepting exactly one route."""
 
     def __init__(self, cfg: RelayCfg, store: HoundStore, on_alerts=None,
-                 now=time.time):
+                 now=time.time, gate=None):
         self.cfg = cfg
         self.store = store
         self.on_alerts = on_alerts
@@ -101,7 +101,11 @@ class IngestServer:
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._limiter = _RateLimiter(cfg.max_batches_per_minute)
+        # One relayed store user at a time. Named for what it guards:
+        # access to HoundStore, not just writes.
         self._write_slot = threading.Semaphore(1)
+        # Capture outranks relayed work; see relay.CaptureGate.
+        self.gate = gate or relay.CaptureGate()
         self.started = False
 
     # ----- lifecycle -----
@@ -145,9 +149,28 @@ class IngestServer:
         return True
 
     def stop(self) -> None:
-        """Stop before the store closes, or in-flight writes hit a dead handle."""
+        """Stop before the store closes, or in-flight writes hit a dead
+        handle.
+
+        `daemon_threads = True` means `server_close()` joins nothing, so
+        this used to return while a handler was mid-write: the store
+        then closed under it and it raised ProgrammingError with a full
+        traceback — a remote host choosing when the daemon logs a crash.
+        Waiting is bounded, because a wedged handler must not be able to
+        hold shutdown open either.
+        """
         if self._httpd is not None:
             self._httpd.shutdown()
+            deadline = time.time() + 10.0
+            while (self._httpd.active_handlers() > 0
+                   and time.time() < deadline):
+                time.sleep(0.02)
+            left = self._httpd.active_handlers()
+            if left:
+                log.warning(
+                    "relay: %d ingest handler(s) still running after 10s; "
+                    "closing the store anyway. They will fail their "
+                    "current batch and the agent will resend it.", left)
             self._httpd.server_close()
             self._httpd = None
         if self._thread is not None:
@@ -204,6 +227,8 @@ class IngestServer:
             return HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"}
 
         try:
+            # Before json.loads allocates: see validate.MAX_CONTAINERS.
+            validate.check_container_budget(body)
             doc = validate.loads_strict(body)
         except validate.ValidationError as e:
             return HTTPStatus.BAD_REQUEST, {"error": str(e)}
@@ -251,7 +276,14 @@ class IngestServer:
             return HTTPStatus.BAD_REQUEST, {
                 "error": f"seq must be an integer in [1, {_MAX_SEQ}]"}
 
-        known = self.store.get_remote_sensor(sensor_id)
+        # Under the slot: this is a store read, and 32 threads doing it
+        # concurrently contend with the watchdog tick for
+        # HoundStore._lock exactly as a write does. Serialising only
+        # the write left the collector's packet loop freezing for
+        # seconds — a 5x improvement that was still remote-triggered
+        # blindness. Every relayed store access belongs here.
+        with self.gate.deferred(), self._write_slot:
+            known = self.store.get_remote_sensor(sensor_id)
         if known is not None and known.instance_id == instance_id:
             if seq <= known.last_seq:
                 # Tell the agent where we are so it can fast-forward instead
@@ -312,7 +344,7 @@ class IngestServer:
         # to prevent by avoiding `_loop_lock`. Avoiding that lock was
         # necessary and not sufficient; the store lock is the other
         # half of the same path.
-        with self._write_slot:
+        with self.gate.deferred(), self._write_slot:
             counts = self.store.ingest_remote_batch(
                 sensor_id, instance_id, seq, records, now,
                 skew=skew, body_bytes=len(body),
@@ -373,6 +405,7 @@ class _Server(ThreadingHTTPServer):
         super().__init__(*a, **kw)
         self._slots = threading.BoundedSemaphore(self.max_workers)
         self._per_source: dict[str, int] = {}
+        self._active = 0
         self._src_lock = threading.Lock()
         self.rejected_overload = 0
 
@@ -409,6 +442,7 @@ class _Server(ThreadingHTTPServer):
             return
         with self._src_lock:
             self._per_source[source] = self._per_source.get(source, 0) + 1
+            self._active += 1
         try:
             super().process_request(request, client_address)
         except BaseException:
@@ -422,7 +456,13 @@ class _Server(ThreadingHTTPServer):
             self._release(source)
             raise
 
+    def active_handlers(self) -> int:
+        with self._src_lock:
+            return self._active
+
     def _release(self, source: str) -> None:
+        with self._src_lock:
+            self._active -= 1
         self._slots.release()
         with self._src_lock:
             n = self._per_source.get(source, 1) - 1

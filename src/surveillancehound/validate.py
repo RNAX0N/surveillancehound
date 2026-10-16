@@ -77,6 +77,47 @@ class ValidationError(ValueError):
     """A relayed record was not acceptable. Rejects the whole batch."""
 
 
+# A full legitimate batch is five kinds x max_records_per_batch flat
+# objects, each ~12 scalar fields and no nested containers — on the
+# order of 25,000 containers. A body made of `[],[],[]...` packs about
+# 2.7 MILLION into the same bytes and costs ~209 MB resident once
+# parsed, which is the amplification that let a key-holder drive the
+# collector to 1.3 GB and OOM the process that is also capturing
+# packets. Counting delimiters is an O(n) scan over bytes we already
+# hold, and it happens BEFORE json.loads allocates anything.
+MAX_CONTAINERS = 150_000
+
+
+def check_container_budget(body: bytes,
+                           limit: int = MAX_CONTAINERS) -> None:
+    """Reject pathologically container-dense bodies before parsing.
+
+    Counts outside of strings so a payload of literal brackets in a
+    summary field cannot trip it.
+    """
+    n = 0
+    in_str = False
+    escaped = False
+    for ch in body:
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == 0x5C:        # backslash
+                escaped = True
+            elif ch == 0x22:        # closing quote
+                in_str = False
+            continue
+        if ch == 0x22:
+            in_str = True
+        elif ch in (0x5B, 0x7B):    # [ or {
+            n += 1
+            if n > limit:
+                raise ValidationError(
+                    f"body contains more than {limit} JSON containers; "
+                    f"a full batch needs a small fraction of that"
+                )
+
+
 def loads_strict(body: bytes) -> Any:
     """json.loads that refuses NaN and Infinity.
 

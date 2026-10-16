@@ -237,14 +237,17 @@ class Hound:
             )
         self.relay = None
         self.ingest = None
+        self._gate = None
         if cfg.relay.is_agent:
             from surveillancehound.relay import RelayClient
             self.relay = RelayClient(cfg.relay, self.store, now=time.time)
         elif cfg.relay.is_collector:
             from surveillancehound.ingest import IngestServer
+            from surveillancehound.relay import CaptureGate
+            self._gate = CaptureGate()
             self.ingest = IngestServer(
                 cfg.relay, self.store, on_alerts=self._on_relayed_alerts,
-                now=time.time,
+                now=time.time, gate=self._gate,
             )
         # Relayed rows arrive from hosts we do not control, so their volume
         # is not ours to bound at write time. Retention is what keeps a
@@ -503,6 +506,17 @@ class Hound:
                 self.uptime.touch(ip, pkt.ts or now)
 
     def _tick(self, now: float) -> None:
+        """One housekeeping pass. Runs under `_loop_lock`, which the
+        packet loop needs per packet — so anything slow in here is
+        measured in blind capture, and relayed work is held off for
+        the duration (see relay.CaptureGate)."""
+        if self._gate is not None:
+            with self._gate.capture_priority():
+                self._tick_inner(now)
+        else:
+            self._tick_inner(now)
+
+    def _tick_inner(self, now: float) -> None:
         # 1) evict idle flows and process them — sort by last_ts so the
         #    baseliner sees flows in time order across the eviction batch
         evicted = sorted(

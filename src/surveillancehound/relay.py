@@ -35,6 +35,7 @@ import os
 import secrets
 import ssl
 import threading
+from contextlib import contextmanager
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -115,6 +116,57 @@ class SpoolStats:
     dropped_size: int = 0
     dropped_age: int = 0
     dropped_stale: int = 0
+
+
+class CaptureGate:
+    """Lets packet capture preempt relayed store access.
+
+    Serialising relayed writes bounded how many threads hold the store
+    lock at once, but not how long the capture tick waits for it:
+    `HoundStore._lock` is an unfair RLock, so with a queue of ingest
+    threads the tick loses the race over and over. Measured, that was
+    still 3-4 second freezes of the packet loop — remote-triggered
+    blindness, just less of it.
+
+    This makes the ordering explicit rather than leaving it to luck.
+    The tick raises a flag; relayed store access waits for it to drop
+    before starting a new operation. The tick therefore waits for at
+    most ONE in-flight operation instead of an arbitrary run of them.
+
+    Relayed work is strictly less important than seeing packets. If
+    the two contend, capture wins — that is the whole premise of the
+    daemon.
+    """
+
+    def __init__(self) -> None:
+        self._open = threading.Event()
+        self._open.set()
+        self._lock = threading.Lock()
+        self._holders = 0
+
+    @contextmanager
+    def capture_priority(self):
+        """Held by the tick around its store work."""
+        with self._lock:
+            self._holders += 1
+            self._open.clear()
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._holders -= 1
+                if self._holders == 0:
+                    self._open.set()
+
+    @contextmanager
+    def deferred(self, timeout: float = 10.0):
+        """Held by relayed paths around theirs.
+
+        The timeout is a safety valve: a wedged tick must degrade to
+        "relay is slow", never to "relay is dead".
+        """
+        self._open.wait(timeout)
+        yield
 
 
 class Spool:
@@ -570,14 +622,22 @@ class RelayClient:
         # batch rejected 400 and dropped — permanent, silent, total
         # loss with no backpressure signal. Truncating degrades to
         # "some cameras reported" instead.
-        uptime = self.store.uptime_report(
+        all_uptime = self.store.uptime_report(
             self.cfg_report_window(), self.now(),
-        )[:_MAX_RECORDS_PER_KIND]
-        if len(uptime) == _MAX_RECORDS_PER_KIND:
+        )
+        uptime = all_uptime[:_MAX_RECORDS_PER_KIND]
+        if len(all_uptime) > _MAX_RECORDS_PER_KIND:
+            # `uptime_report` is ORDER BY ip, so a plain prefix hides
+            # the SAME high-sorted cameras on every cycle — they would
+            # be permanently invisible on the collector, which gets no
+            # signal at all because this warning is agent-side. Say how
+            # many are missing rather than implying a clean truncation.
             log.warning(
-                "relay: more than %d cameras to report; truncating the "
-                "uptime snapshot. Raise the collector's "
-                "[relay] max_records_per_batch.", _MAX_RECORDS_PER_KIND)
+                "relay: %d cameras to report but only %d fit in a batch; "
+                "%d are NOT being relayed and will not appear on the "
+                "collector. Raise [relay] max_records_per_batch on both "
+                "ends.", len(all_uptime), _MAX_RECORDS_PER_KIND,
+                len(all_uptime) - _MAX_RECORDS_PER_KIND)
         return {
             "devices": [
                 {"ip": d["ip"], "role": d["role"], "first_seen": d["first_seen"],

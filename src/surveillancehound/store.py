@@ -1207,11 +1207,13 @@ class HoundStore:
                        last_seq = excluded.last_seq,
                        clock_skew = excluded.clock_skew,
                        batches = remote_sensors.batches + 1,
-                       -- SUBMITTED, deliberately: this is a measure of
-                       -- what the sensor sent us, which is what an
-                       -- operator wants when judging a noisy sensor.
-                       -- The ack reports survivors instead, because the
-                       -- agent is asking what we kept.
+                       -- Rows WRITTEN, the same quantity the ack
+                       -- reports. The comment here used to claim this
+                       -- was a submitted count; it never was. Worth
+                       -- knowing when reading `hound sensors`: a sensor
+                       -- resending the same remote_ids shows batches
+                       -- climbing while records stays flat, which is
+                       -- the honest reading of "it sent nothing new".
                        records = remote_sensors.records + excluded.records,
                        bytes = remote_sensors.bytes + excluded.bytes,
                        mon_alive = excluded.mon_alive,
