@@ -306,6 +306,11 @@ keep      = 5
 #                                    # shown. Dedup bounds repeats of one
 #                                    # alert; this bounds distinct ones.
 # max_rows_per_sensor   = 250000   # per table, oldest trimmed first; 0 = no cap
+# max_records_per_batch = 5000     # PER KIND, and there are five kinds.
+#                                  # This bounds how long one batch holds
+#                                  # the store lock — which the packet
+#                                  # loop waits behind, so it is a capture
+#                                  # setting as much as a relay one.
 # min_free_disk_mb      = 256.0    # refuse ingest below this; 0 disables
 #
 # NOTE on NAT: the ingest limits key on SOURCE ADDRESS, so agents behind

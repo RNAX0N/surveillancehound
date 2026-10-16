@@ -261,6 +261,13 @@ class Hound:
         self._relay_inflight_lock = threading.Lock()
         self._relay_budget_warned: dict[str, bool] = {}
         self._relay_budget_lock = threading.Lock()
+        # Guards the drop counters and `_relay_last_dispatch`. Both are
+        # read by up to max_workers ingest threads and written by the
+        # dispatch worker; `+=` on an int is not atomic, so the counters
+        # undercounted under exactly the flood they exist to describe,
+        # and the map's bulk prune iterates while ingest reads it —
+        # safe only by accident under the GIL.
+        self._relay_stats_lock = threading.Lock()
         # Bounded hand-off from the ingest threads to one dispatch worker.
         self._relay_alertq: _FairAlertQueue | None = (
             _FairAlertQueue(_RELAY_ALERT_QUEUE)
@@ -762,7 +769,8 @@ class Hound:
             dk = raw["dedup_key"]
             if dk in batch_seen:
                 continue
-            seen = self._relay_last_dispatch.get(("k", sensor_id, dk))
+            with self._relay_stats_lock:
+                seen = self._relay_last_dispatch.get(("k", sensor_id, dk))
             if seen is not None and (now - seen) < window:
                 continue
             batch_seen.add(dk)
@@ -781,14 +789,18 @@ class Hound:
             # one mutex, and for a monitor the safe direction to err is
             # paging slightly too much, never suppressing.
             if not self._relay_notify_budget(sensor_id, now, spend=False):
-                self.stats.relayed_dropped_budget += 1
+                with self._relay_stats_lock:
+                    self.stats.relayed_dropped_budget += 1
                 continue
             with self._relay_inflight_lock:
-                if self._relay_inflight.get(sensor_id, 0) >= share:
+                held = self._relay_inflight.get(sensor_id, 0)
+                over_share = held >= share
+                if not over_share:
+                    self._relay_inflight[sensor_id] = held + 1
+            if over_share:
+                with self._relay_stats_lock:
                     self.stats.relayed_dropped_share += 1
-                    continue
-                self._relay_inflight[sensor_id] = (
-                    self._relay_inflight.get(sensor_id, 0) + 1)
+                continue
             try:
                 q.put_nowait((sensor_id, raw, instance_id))
             except queue.Full:
@@ -798,12 +810,14 @@ class Hound:
                         self._relay_inflight[sensor_id] = n
                     else:
                         self._relay_inflight.pop(sensor_id, None)
-                self.stats.relayed_dropped_queue += 1
+                with self._relay_stats_lock:
+                    self.stats.relayed_dropped_queue += 1
                 continue
             self._relay_notify_budget(sensor_id, now, spend=True)
 
         if over_batch:
-            self.stats.relayed_dropped_batch += over_batch
+            with self._relay_stats_lock:
+                self.stats.relayed_dropped_batch += over_batch
             log.warning(
                 "relay: sensor %r sent %d alerts in one batch; dispatching "
                 "at most %d and dropping %d. They remain in remote_alerts "
@@ -945,10 +959,11 @@ class Hound:
         # what keeps the record and the page agreeing.
         dkey = ("k", sensor_id, raw["dedup_key"])
         rkey = ("r", sensor_id, instance_id, raw["remote_id"])
-        for k in (dkey, rkey):
-            seen = self._relay_last_dispatch.get(k)
-            if seen is not None and (now - seen) < window:
-                return
+        with self._relay_stats_lock:
+            for k in (dkey, rkey):
+                seen = self._relay_last_dispatch.get(k)
+                if seen is not None and (now - seen) < window:
+                    return
         sent = self._relay_last_dispatch.get(dkey)
         # 2) What we RECEIVED before this process started, so a restart
         #    does not re-notify the backlog. Measured on ingested_at —
@@ -962,8 +977,14 @@ class Hound:
             if last is not None and (now - last) < window:
                 return
 
-        self._relay_last_dispatch[dkey] = now
-        self._relay_last_dispatch[rkey] = now
+        with self._relay_stats_lock:
+            self._relay_last_dispatch[dkey] = now
+            self._relay_last_dispatch[rkey] = now
+            self._prune_dedup_locked()
+        self._dispatch_now(sensor_id, raw, key, instance_id)
+
+
+    def _prune_dedup_locked(self) -> None:
         if len(self._relay_last_dispatch) > _RELAY_DEDUP_MAX:
             # Bounded: the keyspace is sensor-controlled via dedup_key.
             # Dropping the oldest can at worst re-notify something, never
@@ -972,6 +993,9 @@ class Hound:
                             key=self._relay_last_dispatch.get,
                             )[:_RELAY_DEDUP_MAX // 2]:
                 del self._relay_last_dispatch[k]
+
+    def _dispatch_now(self, sensor_id: str, raw: dict, key: str,
+                      instance_id: str) -> None:
         alert = Alert(
             ts=raw["ts"], device_ip=raw["device_ip"], kind=raw["kind"],
             severity=raw["severity"], summary=raw["summary"],
@@ -985,7 +1009,18 @@ class Hound:
         # goes looking for, and recording only successes made the
         # ok/error columns unable to ever say anything else.
         def _audit(channel: str, ok: bool, err: str,
-                   _sid=sensor_id, _rid=remote_id or 0) -> None:
+                   _sid=sensor_id, _rid=remote_id) -> None:
+            if _rid is None:
+                # The alert was trimmed by the quota in the same
+                # transaction that stored it. An audit row citing id 0
+                # points at nothing, on exactly the flood path where an
+                # operator would be reading it; say so in the log and
+                # write no row rather than a false one.
+                log.warning(
+                    "relay: dispatched a relayed alert from %r whose "
+                    "stored row was already trimmed by the quota; no "
+                    "audit row written", _sid)
+                return
             self.store.record_remote_notification(_sid, _rid, channel, ok, err)
 
         self.dispatcher.dispatch(alert, None, on_attempt=_audit)

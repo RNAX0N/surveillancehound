@@ -1233,12 +1233,15 @@ class HoundStore:
                 "this sensor is legitimately this busy.",
                 sensor_id, max_rows_per_sensor, trimmed,
             )
-        # The ack must describe what SURVIVED the transaction, not what
-        # entered it. Reporting 1000 accepted while the quota trimmed
-        # 950 in the same transaction is the collector telling the agent
-        # it holds records it has already discarded.
-        counts["total"] = max(0, total - trimmed)
-        counts["submitted"] = total
+        # `total` is already the sum of per-kind CHANGE counts, i.e.
+        # rows this batch actually wrote. Subtracting `trimmed` was
+        # wrong in both directions: the trim removes rows from EARLIER
+        # batches, so a sensor sitting at its quota was told
+        # `accepted=0` while everything it sent was stored, and there
+        # is no arithmetic relationship between the two numbers at all.
+        # They are reported side by side instead, each meaning one
+        # thing: what this batch wrote, and what housekeeping removed.
+        counts["total"] = total
         counts["trimmed"] = trimmed
         return counts
 

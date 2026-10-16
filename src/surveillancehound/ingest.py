@@ -101,6 +101,7 @@ class IngestServer:
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._limiter = _RateLimiter(cfg.max_batches_per_minute)
+        self._write_slot = threading.Semaphore(1)
         self.started = False
 
     # ----- lifecycle -----
@@ -297,11 +298,26 @@ class IngestServer:
                 "retry_after": 300,
             }
 
-        counts = self.store.ingest_remote_batch(
-            sensor_id, instance_id, seq, records, now,
-            skew=skew, body_bytes=len(body),
-            max_rows_per_sensor=self.cfg.max_rows_per_sensor,
-        )
+        # ONE relayed writer at a time.
+        #
+        # SQLite is single-writer anyway, so concurrency here buys no
+        # throughput — only contention. And the contention is not local
+        # to the relay: the watchdog tick writes the store while holding
+        # `_loop_lock`, and the packet loop takes `_loop_lock` per
+        # packet, so N ingest threads queued on the store lock stall
+        # PACKET CAPTURE for the sum of their holds. Measured at 32
+        # workers that was tens of seconds, long enough for tcpdump's
+        # pipe to fill — the collector going actually blind on its own
+        # segment, which is the failure this module's docstring claims
+        # to prevent by avoiding `_loop_lock`. Avoiding that lock was
+        # necessary and not sufficient; the store lock is the other
+        # half of the same path.
+        with self._write_slot:
+            counts = self.store.ingest_remote_batch(
+                sensor_id, instance_id, seq, records, now,
+                skew=skew, body_bytes=len(body),
+                max_rows_per_sensor=self.cfg.max_rows_per_sensor,
+            )
 
         if self.on_alerts and records.get("alerts"):
             try:

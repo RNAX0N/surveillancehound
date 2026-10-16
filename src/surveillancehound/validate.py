@@ -287,6 +287,8 @@ _KINDS = {
 # Kinds whose records carry the sensor's own row id. The collector keys
 # storage on (sensor_id, remote_id), so these must be unique per batch.
 _ID_KINDS = ("flows", "alerts", "outages")
+# Snapshot kinds, keyed on the address rather than a row id.
+_IP_KINDS = ("devices", "uptime")
 
 
 # The agent's identity for one run. It is now part of the primary key of
@@ -326,6 +328,17 @@ def clean_instance_id(value: Any, field: str = "instance_id") -> str:
     interpolated into log lines, and the agent only ever generates
     `secrets.token_hex(8)`. Nothing legitimate needs anything else.
     """
+    # REJECT rather than strip. `clean_str` removes control characters,
+    # so "x\ny" would arrive as "xy" — two agents whose ids differ only
+    # by a control character would collapse onto one instance key,
+    # which is the exact collision this validator exists to prevent.
+    if not isinstance(value, str):
+        raise ValidationError(
+            f"{field}: expected a string, got {type(value).__name__}")
+    if any(ch < " " or ch == "\x7f" for ch in value):
+        raise ValidationError(
+            f"{field}: contains control characters; expected an opaque "
+            f"token")
     v = clean_str(value, field, MAX_INSTANCE_LEN)
     if not v:
         raise ValidationError(
@@ -373,16 +386,26 @@ def validate_records(raw: Any, max_per_kind: int) -> dict:
         # remote_id produced 200 notifications from one stored row. A
         # well-formed agent never emits a duplicate, so refuse the batch
         # rather than silently keeping whichever copy happens to win.
-        if kind in _ID_KINDS:
-            seen: set[int] = set()
+        # Duplicate identities inside one batch. `devices` and `uptime`
+        # are snapshots keyed on (sensor, ip) rather than on remote_id,
+        # and they collapse exactly the same way: 20000 records for one
+        # ip stored 2 rows while the ack said 40000, and bought the
+        # sender 40000 upserts' worth of store-lock time for two rows
+        # of data. Same check, different key.
+        dup_key = (
+            "remote_id" if kind in _ID_KINDS
+            else "ip" if kind in _IP_KINDS else None
+        )
+        if dup_key is not None:
+            seen: set = set()
             for item in out[kind]:
-                rid = item["remote_id"]
-                if rid in seen:
+                ident = item[dup_key]
+                if ident in seen:
                     raise ValidationError(
-                        f"records.{kind}: duplicate remote_id {rid} in one "
-                        f"batch; each record needs its own id"
+                        f"records.{kind}: duplicate {dup_key} {ident!r} in "
+                        f"one batch; each record needs its own identity"
                     )
-                seen.add(rid)
+                seen.add(ident)
 
     monitor = r.get("monitor")
     out["monitor"] = validate_monitor(monitor) if monitor is not None else None

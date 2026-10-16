@@ -2248,6 +2248,81 @@ def _check_outage_close_is_relayed(tmp: Path) -> None:
         collector.close()
 
 
+def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
+    """Relayed ingest must not freeze the collector's packet loop.
+
+    `ingest.py`'s docstring argues this is prevented by never taking
+    `_loop_lock`. That is necessary and NOT sufficient: the watchdog
+    tick writes the store while holding `_loop_lock`, and the packet
+    loop takes `_loop_lock` per packet — so ingest threads queued on
+    the STORE lock stall capture just as effectively. Measured at 32
+    concurrent writers it was tens of seconds, long enough for
+    tcpdump's pipe to fill: the collector going actually blind on its
+    own segment, with no alert, at a remote host's choosing.
+    """
+    import statistics
+    import threading
+    import time as _t
+
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "stall.sqlite")
+    try:
+        now = _t.time()
+        cap = 5000
+        batches = [
+            V.validate_records({"flows": [{
+                "remote_id": b * cap + i + 1, "src_ip": "10.0.0.1",
+                "src_port": 1, "dst_ip": "10.0.0.2", "dst_port": 2,
+                "proto": "tcp", "first_seen": now, "last_seen": now,
+                "packets": 1, "bytes": 1, "bytes_to_camera": 0,
+                "bytes_from_camera": 0, "tcp_flags_seen": "",
+                "classification": "lan_normal",
+            } for i in range(cap)]}, cap)
+            for b in range(8)
+        ]
+
+        waits: list[float] = []
+        stop = threading.Event()
+
+        def tick() -> None:
+            while not stop.is_set():
+                t0 = _t.time()
+                store.set_heartbeat(_t.time(), _t.time())
+                waits.append(_t.time() - t0)
+                _t.sleep(0.02)
+
+        # One writer at a time, as the listener enforces.
+        slot = threading.Semaphore(1)
+
+        def write(i: int) -> None:
+            with slot:
+                store.ingest_remote_batch(
+                    f"s{i}", "inst-aaaa1111", 1, batches[i], _t.time())
+
+        t = threading.Thread(target=tick, daemon=True)
+        t.start()
+        ws = [threading.Thread(target=write, args=(i,)) for i in range(8)]
+        for w in ws:
+            w.start()
+        for w in ws:
+            w.join()
+        stop.set()
+        _t.sleep(0.1)
+
+        worst = max(waits)
+        assert worst < 5.0, (
+            f"a tick waited {worst:.1f}s on the store lock behind relayed "
+            f"ingest. The packet loop is behind that wait, and tcpdump's "
+            f"pipe fills in milliseconds — this is the collector going "
+            f"blind because a remote host sent data"
+        )
+        print(f"  capture coupling: worst tick wait {worst:.2f}s, median "
+              f"{statistics.median(waits):.3f}s under 8 concurrent batches")
+    finally:
+        store.close()
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -2268,6 +2343,7 @@ def main() -> int:
         _check_instance_reset(Path(td))
         _check_prerelease_schema_upgrade(Path(td))
         _check_outage_close_is_relayed(Path(td))
+        _check_ingest_does_not_stall_capture(Path(td))
         _check_relayed_dispatch_is_quarantined(Path(td))
         _check_sensor_offline_alerts(Path(td))
         _check_relayed_api_surface(Path(td))

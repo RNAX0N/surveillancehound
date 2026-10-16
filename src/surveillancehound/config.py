@@ -202,7 +202,12 @@ class RelayCfg:
     key_file: str = ""
     sensor_timeout_seconds: float = 180.0
     max_body_bytes: int = 8 * 1024 * 1024
-    max_records_per_batch: int = 20000
+    # Per KIND, and there are five kinds — so this bounds one batch at
+    # 5x this many row operations inside a single store transaction,
+    # which is time the collector's packet loop can be waiting. Lowered
+    # from 20000 (100k rows, ~0.4s of store lock) because a bigger
+    # batch buys an agent nothing it cannot get from two batches.
+    max_records_per_batch: int = 5000
     max_batches_per_minute: int = 60
     clock_skew_seconds: float = 300.0
     remote_retention_days: float = 30.0
@@ -561,7 +566,7 @@ def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
         key_file=str(rl.get("key_file", "")).strip(),
         sensor_timeout_seconds=float(rl.get("sensor_timeout_seconds", 180.0)),
         max_body_bytes=int(rl.get("max_body_bytes", 8 * 1024 * 1024)),
-        max_records_per_batch=int(rl.get("max_records_per_batch", 20000)),
+        max_records_per_batch=int(rl.get("max_records_per_batch", 5000)),
         max_batches_per_minute=int(rl.get("max_batches_per_minute", 60)),
         clock_skew_seconds=float(rl.get("clock_skew_seconds", 300.0)),
         remote_retention_days=float(rl.get("remote_retention_days", 30.0)),
