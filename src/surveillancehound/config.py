@@ -521,6 +521,20 @@ _AGENT_RECORDS_PER_KIND = 1000
 
 
 def _require_strong_key(key: str, where: str) -> None:
+    # The example config ships `key = "CHANGE-ME-min-16-chars"`, which is
+    # 22 characters and therefore passed the length check. `config-check`
+    # is the command the agent README tells the operator to run before
+    # starting, and it was blessing a secret published in this repo —
+    # while the example file's own header promised it would fail. A
+    # placeholder is not a secret at any length.
+    if "CHANGE-ME" in key:
+        raise ValueError(
+            f"config: {where} is still the placeholder from the example "
+            f"file. That value is public, so anyone who can reach the "
+            f"ingest port can sign batches as this sensor. Generate a "
+            f'real one with: python3 -c "import secrets; '
+            f'print(secrets.token_urlsafe(32))"'
+        )
     if len(key) < _MIN_KEY_LEN:
         raise ValueError(
             f"config: {where} is {len(key)} characters; at least "
@@ -649,6 +663,19 @@ def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
             )
 
     if cfg.mode == "collector":
+        # An address, like every other address field here. The daemon
+        # does no DNS resolution, so a name would be quietly handed to
+        # getaddrinfo at bind time and could land on an interface the
+        # operator did not name.
+        if cfg.listen_host:
+            try:
+                ipaddress.ip_address(cfg.listen_host)
+            except ValueError:
+                raise ValueError(
+                    f"config: [relay].listen_host = {cfg.listen_host!r} is "
+                    f"not an IP address. The daemon does no DNS "
+                    f"resolution; name the address to bind."
+                ) from None
         if not cfg.listen_host:
             raise ValueError(
                 "config: [relay].listen_host is required in collector mode — "

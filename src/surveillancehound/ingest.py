@@ -52,6 +52,60 @@ _REJECT_COOLDOWN = 30.0
 # Total wall-clock for draining an unread body before closing. A
 # deadline, not a socket timeout: the latter resets on every byte.
 _DRAIN_LIMIT = 65536      # default lingering-close absorption
+# Ceiling for the one refusal that MUST be understood exactly.
+#
+# `max_body_bytes` is the wrong ceiling here and was the round-17 bug
+# surviving its own fix: the 413 fires if and only if the declared
+# length EXCEEDS that cap, so draining up to the cap always left
+# `length - cap` bytes unread and the reply's survival came down to
+# socket-buffer slack. Measured, delivery went from 30/30 on loopback
+# to 0/20 with a 8 KiB client send buffer.
+#
+# This has to cover a body an honest agent can build, and the agent
+# sizes batches from ITS OWN max_body_bytes — which it cannot know
+# differs from the collector's. The documented default on both ends
+# is 2 MiB, so 8 MiB covers a four-fold asymmetry, and the local cap
+# doubled covers an operator who raised both ends well past the
+# default and then lowered only this one. Beyond that a peer gets a
+# reset, which is correct: at those sizes it is not an honest agent,
+# and every other status on these paths is retryable anyway.
+#
+# The real bound on cost is `_DRAIN_BUDGET_S`, not this number. Read
+# and discard is cheap: measured absorbing 576 MB across a sustained
+# 413 flood cost no measurable local packet-parse throughput.
+_DRAIN_MAX = 8 * 1024 * 1024
+#
+# A note on what this costs, because it looks alarming and is not.
+#
+# The drain reads through the TLS layer, so every absorbed byte is
+# decrypted on the same CPU that parses packets off the wire. That
+# reads like a capture-starvation vector, and a first measurement
+# seemed to confirm it: collector pinned to one core, 8
+# unauthenticated addresses flooding the 413 path, local packet
+# parsing down to 29.9% of its 4.25M pkt/s unloaded baseline.
+#
+# Two things were wrong with reading it that way.
+#
+# It is not the drain. Holding the flood fixed and varying ONLY the
+# drain policy, three runs each: drain off (64 KiB floor) 29.2%,
+# unbounded 30.3% (474 MB absorbed), rate-limited to 4 MB/s 28.9%
+# (105 MB). Within noise of each other. A shared token bucket for
+# drain bytes was written, measured and deleted — it bought nothing,
+# and it gave a flood a way to starve an honest agent's 413 of its
+# drain at exactly the wrong moment. `_DRAIN_BUDGET_S` is the bound
+# that matters.
+#
+# And that run had `max_batches_per_minute = 10000`, which disables
+# the metering in `process_request`. At the SHIPPED default of 60 the
+# same flood from the same 8 addresses retains 80.4% of baseline
+# (3.42M pkt/s, 53,017 connections refused at accept). The ~70% loss
+# is what an UNMETERED collector costs — which is what the metering
+# was added for. It is not what this drain costs, and not what an
+# operator running defaults sees.
+#
+# Measure this the same way or not at all: vary one policy against a
+# fixed flood, state the metering setting, and never read an unloaded
+# baseline alone — the handshake cost swamps everything else.
 _DRAIN_BUDGET_S = 2.0
 # How often the listener summarises refused connections.
 _OVERLOAD_REPORT_S = 60.0
@@ -271,7 +325,20 @@ class IngestServer:
             st = os.statvfs(self.store.path.parent)
         except (OSError, AttributeError):
             return True
-        return (st.f_bavail * st.f_frsize) >= (limit * 1024 * 1024)
+        free = st.f_bavail * st.f_frsize
+        # Pages already free INSIDE the store count. SQLite reuses them
+        # without growing the file, and retention frees pages without
+        # necessarily shrinking it — measured, deleting 40,000 relayed
+        # flows left the file its full size with 1,140 pages free.
+        # Gating on the filesystem alone meant a sensor that had once
+        # inflated the store to this floor kept the collector refusing
+        # every sensor's batches permanently, with retention running
+        # and unable to lift it.
+        try:
+            free += self.store.reusable_bytes()
+        except Exception:               # noqa: BLE001 - a guard, not a feature
+            pass
+        return free >= (limit * 1024 * 1024)
 
     def in_flight(self) -> int:
         with self._inflight_lock:
@@ -898,14 +965,22 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             on that path is retryable, so a reset costs the peer
             nothing it did not already have coming.
             """
+            # Flag first so `_reply` can emit `Connection: close`;
+            # the drain still runs after the reply is on the wire.
+            self.close_connection = True
             self._reply(status, payload)
             self._drain_unread_body(limit=drain_limit)
-            self.close_connection = True
 
         def _reply(self, status, payload):
             raw = json.dumps(payload).encode()
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json")
+            if self.close_connection:
+                # Say so in the response rather than only in the
+                # socket. A reusing client otherwise sees a silent
+                # close where a signalled one would have told it to
+                # open a fresh connection.
+                self.send_header("Connection", "close")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
@@ -966,6 +1041,19 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                 while remaining > 0:
                     if time.monotonic() >= give_up_at:
                         return
+                    # Per-iteration timeout from the REMAINING budget.
+                    # Checking the deadline and then handing read1 the
+                    # full budget meant one more whole budget could
+                    # elapse inside the call: measured 3.84s against a
+                    # docstring promising 2s, for a peer sending one
+                    # byte every 1.9s.
+                    left = give_up_at - time.monotonic()
+                    if left <= 0:
+                        return
+                    try:
+                        self.connection.settimeout(left)
+                    except OSError:
+                        return
                     try:
                         # read1, not read: `read(n)` on a buffered
                         # reader loops internally until it HAS n
@@ -996,6 +1084,16 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             # meter whatever the stdlib rejected without
             # double-counting anything parse_request already saw.
             self._metered = False
+            # Reset per REQUEST, not per connection. The handler
+            # instance is reused for every request on a keep-alive
+            # socket, and only the refusal paths set
+            # `close_connection` — so after one request with a body,
+            # every later refusal on that socket took the
+            # "already consumed" early return in `_drain_unread_body`,
+            # drained nothing, and reset the client. The oversize-body
+            # 413 was delivered as the first request on a connection
+            # and lost as the second.
+            self._body_read = False
             super().handle_one_request()
 
         def _meter_once(self) -> bool:
@@ -1066,10 +1164,14 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             if not super().parse_request():
                 return False          # the stdlib already answered
             if over_budget:
-                self.close_connection = True
-                self._drain_unread_body()
-                self._reply(HTTPStatus.TOO_MANY_REQUESTS,
-                            {"error": "slow down"})
+                # Same ordering trap as the 413: this drained and THEN
+                # replied, so the reply went out immediately before the
+                # close and anything still unread reset it away. 429 is
+                # retryable, so losing it costs a cycle rather than
+                # data — but it is the signal that tells a replaying
+                # agent to back off instead of digging in.
+                self._reply_and_end(HTTPStatus.TOO_MANY_REQUESTS,
+                                    {"error": "slow down"})
                 return False
             return True
 
@@ -1098,6 +1200,17 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                 self._reply_and_end(HTTPStatus.LENGTH_REQUIRED,
                             {"error": "Content-Length required"})
                 return
+            # Strict: bare ASCII digits only. `int()` also accepts
+            # "_" separators, surrounding whitespace, a sign, and
+            # non-ASCII decimal digits (int("\u0665") == 5), so three
+            # spellings of one length parsed here and would not
+            # survive a proxy in front. No proxy is the documented
+            # topology; this keeps it from becoming a smuggling
+            # differential if one is ever added.
+            if not raw_len.isascii() or not raw_len.isdigit():
+                self._reply_and_end(HTTPStatus.BAD_REQUEST,
+                                    {"error": "bad Content-Length"})
+                return
             try:
                 length = int(raw_len)
             except ValueError:
@@ -1105,14 +1218,17 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                                     {"error": "bad Content-Length"})
                 return
             # Check the declared size before reading a single byte.
-            if length < 0 or length > server.cfg.max_body_bytes:
-                # Full-body drain: the agent treats 413 as terminal
-                # and a reset as retryable, so this is the one status
-                # that must not be lost to an RST.
+            if length > server.cfg.max_body_bytes:
+                # The agent treats 413 as terminal and a reset as
+                # retryable, so this is the one status that must not
+                # be lost to an RST. See `_DRAIN_MAX`: the ceiling has
+                # to EXCEED the cap, because exceeding the cap is what
+                # got us here.
                 self._reply_and_end(
                     HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                     {"error": f"body over {server.cfg.max_body_bytes} bytes"},
-                    drain_limit=max(_DRAIN_LIMIT, server.cfg.max_body_bytes))
+                    drain_limit=max(_DRAIN_MAX,
+                                    2 * server.cfg.max_body_bytes))
                 return
 
             # Read the body OUTSIDE the CPU slot.

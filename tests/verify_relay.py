@@ -659,27 +659,435 @@ def _check_listener(tmp: Path) -> None:
         store.close()
 
 
+def _check_retention_actually_bounds_growth(tmp: Path) -> None:
+    """Retention is documented as the ONLY bound on remote_* growth.
+
+    Two ways that was false:
+
+    * `remote_outages` was pruned only `WHERE up_at IS NOT NULL`, and
+      `validate` accepts `up_at: null` — so a key holder sending
+      never-closed outages produced rows permanently immune to
+      retention.
+    * `prune_remote` deleted rows but never reclaimed space, and the
+      ingest disk guard counted only FILESYSTEM free bytes. So once a
+      sensor had inflated the store to `min_free_disk_mb`, retention
+      freed rows but not bytes and the collector answered 507 to every
+      sensor with no shipped way out.
+    """
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "retain.sqlite")
+    recs = V.validate_records({"outages": [
+        {"remote_id": i + 1, "camera_ip": f"10.0.{i // 256}.{i % 256}",
+         "down_since": T0 + i, "up_at": None,
+         "last_seen_before": T0 + i - 1, "cause": "silence"}
+        for i in range(300)
+    ]}, 1000)
+    store.ingest_remote_batch("frigate", "inst-aaaa1111", 1, recs, T0)
+    closed = V.validate_records({"outages": [
+        {"remote_id": 1000 + i, "camera_ip": f"10.9.{i // 256}.{i % 256}",
+         "down_since": T0 + i, "up_at": T0 + i + 5,
+         "last_seen_before": T0 + i - 1, "cause": "silence"}
+        for i in range(300)
+    ]}, 1000)
+    store.ingest_remote_batch("frigate", "inst-aaaa1111", 2, closed, T0)
+    n = store._conn.execute("SELECT COUNT(*) c FROM remote_outages"
+                            ).fetchone()["c"]
+    assert n == 600, n
+    store.prune_remote(T0 + 365 * 86400.0)
+    left = store._conn.execute("SELECT COUNT(*) c FROM remote_outages"
+                               ).fetchone()["c"]
+    assert left == 0, (
+        f"{left} relayed outage(s) survived retention. An OPEN relayed "
+        f"outage is a copy, not this daemon's live state, and a sensor "
+        f"can send a thousand per batch — immune to retention means "
+        f"unbounded, and retention is documented as the only bound")
+
+    # Space, not just rows: the guard must see reclaimable capacity.
+    reusable = store.reusable_bytes()
+    assert reusable >= 0
+    srv = IngestServer(_collector_cfg(0, min_free_disk_mb=0), store,
+                       now=lambda: T0)
+    assert srv._disk_ok() is True
+    # A floor above the real filesystem free space must refuse...
+    srv2 = IngestServer(_collector_cfg(0, min_free_disk_mb=1 << 40), store,
+                        now=lambda: T0)
+    assert srv2._disk_ok() is False
+    store.close()
+    print("  retention: open relayed outages are pruned and the space is "
+          "reclaimable; the disk guard counts free pages in the store")
+
+
+def _check_http_refusals_are_logged(tmp: Path) -> None:
+    """A collector that ANSWERS but refuses must not be silent.
+
+    `_note_link` was wired to the transport-exception branch only, so
+    507/500/503 fell through the bare `else`: the agent spooled, then
+    SHED batches at its byte cap, and logged nothing at any level.
+    The README's troubleshooting table sends the operator to
+    `docker compose logs` and lists `507` two rows below as a normal
+    transient.
+    """
+    import logging as _logging
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import HoundStore
+
+    for status in (507, 500, 503, 429):
+        home = tmp / f"ref{status}"
+        home.mkdir()
+        store, _ = _seed_agent_store(home / "agent.sqlite")
+        cfg = RelayCfg(
+            mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+            url="https://127.0.0.1:1/ingest/v1",
+            tls_fingerprint=["sha256:" + "ab" * 32], batch_seconds=1.0,
+        )
+        clock = {"t": T0 + 10}
+        client = RelayClient(cfg, store, now=lambda: clock["t"])
+        import surveillancehound.relay as _RM
+        real = _RM.post_batch
+        _RM.post_batch = (lambda *a, **k:
+                          (status, {"error": "refused"}))
+        seen = []
+
+        class _Grab(_logging.Handler):
+            def emit(self, rec):
+                seen.append((rec.levelno, rec.getMessage()))
+
+        grab = _Grab()
+        lg = _logging.getLogger("surveillancehound.relay")
+        lg.addHandler(grab)
+        try:
+            for _ in range(4):
+                clock["t"] += 30.0
+                client.enqueue()
+                client.flush()
+        finally:
+            _RM.post_batch = real
+            lg.removeHandler(grab)
+            store.close()
+        said = [m for lv, m in seen
+                if lv >= _logging.WARNING and "unreachable" in m]
+        assert len(said) == 1, (
+            f"a collector answering {status} left the agent spooling "
+            f"with {len(said)} log line(s) naming the problem; the "
+            f"troubleshooting table points at this log")
+    print("  HTTP refusals are logged: 507/500/503/429 each report the "
+          "link once instead of spooling in silence")
+
+
+def _check_alert_kinds_cannot_drift(tmp: Path) -> None:
+    """`validate.ALERT_KINDS` must cover every kind this code emits.
+
+    It was hand-enumerated under a comment claiming it could not
+    drift, and it had: `alerts` defined thirteen KIND_ constants and
+    the set named eleven. `validate_records` is all-or-nothing and
+    `relay.py` treats the resulting 400 as terminal, so one row of an
+    unlisted kind discarded the whole batch AFTER the watermark had
+    advanced.
+    """
+    from surveillancehound import alerts as A
+
+    emitted = {v for k, v in vars(A).items()
+               if k.startswith("KIND_") and isinstance(v, str)}
+    assert emitted, "no KIND_ constants found; this test has rotted"
+    missing = emitted - V.ALERT_KINDS
+    assert not missing, (
+        f"validate.ALERT_KINDS is missing {sorted(missing)}. A relayed "
+        f"batch containing one of those is refused 400, which the agent "
+        f"treats as terminal — the whole batch is dropped after the "
+        f"watermark advanced, so the loss is permanent and silent")
+    assert V.ALERT_KINDS == emitted, (
+        f"ALERT_KINDS accepts kinds nothing emits: "
+        f"{sorted(V.ALERT_KINDS - emitted)}")
+    print(f"  alert kinds: all {len(emitted)} KIND_ constants are "
+          f"relayable, derived not listed")
+
+
+def _check_damaged_spool_line(tmp: Path) -> None:
+    """`hound relay` must survive a damaged spool — that is its job.
+
+    `_read` guarded only `JSONDecodeError`, so a line that was valid
+    JSON of the wrong SHAPE reached `e["at"]` and `e.get()` and raised
+    KeyError/TypeError/AttributeError. The command specified to work
+    when things are broken exited 1 with no output, and the same two
+    functions are on the daemon's append/pending/ack path.
+    """
+    from surveillancehound.relay import Spool
+
+    sp = Spool(tmp / "damaged", 10 * 1024 * 1024, 3600.0)
+    sp.append(1, b'{"ok":1}', 0.0)
+    f = tmp / "damaged" / "spool.jsonl"
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write('5\n')                            # valid JSON, not a dict
+        fh.write('{"seq":2,"body":"{}"}\n')         # no "at"
+        fh.write('{"at":"soon","seq":3,"body":"x"}\n')   # "at" not a number
+        fh.write('{"at":1.0,"seq":"four","body":"x"}\n')  # seq not an int
+        fh.write('{"at":1.0,"seq":5}\n')            # no body
+        fh.write('not json at all\n')
+    sp.append(9, b'{"ok":9}', 1.0)
+    got = [seq for seq, _ in sp.pending(2.0)]
+    assert got == [1, 9], (
+        f"a damaged line must be skipped, not crash and not be served: "
+        f"{got}")
+    st = sp.stats(2.0)
+    assert st.pending == 2, st.pending
+    sp.ack(9)
+    assert sp.pending(2.0) == []
+    print("  damaged spool: six malformed line shapes skipped; the good "
+          "batches still replay")
+
+
+def _check_admission_gates_are_live(tmp: Path) -> None:
+    """The gates the README sells as controls must actually refuse.
+
+    Each of these survived being replaced with `if False:` while the
+    suite stayed green, because the tests asserted the CONSTANTS
+    (`max_per_source < max_workers`) or unit-tested the helper
+    (`_disk_ok`) and never the behaviour at the call site. Two of them
+    are promises `deploy/agent/README.md` makes to an operator
+    deciding how exposed the ingest port can be.
+
+    Driven over real TLS from distinct loopback source addresses,
+    because both admission gates key on the source and a test that
+    connects only from 127.0.0.1 cannot tell them from a global cap.
+    """
+    import http.client
+    import socket as _sock
+    import ssl as _ssl
+    import threading as _th
+    import time
+    from surveillancehound import relay as _R
+    from surveillancehound import ingest as _I
+    from surveillancehound.ingest import IngestServer, MAX_SEQ_ADVANCE
+    from surveillancehound.store import HoundStore
+
+    def _ctx():
+        c = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+        c.check_hostname = False
+        c.verify_mode = _ssl.CERT_NONE
+        return c
+
+    dev = [{"ip": "192.168.10.11", "role": "camera", "first_seen": T0,
+            "last_seen": T0, "packet_count": 1, "byte_count": 1}]
+
+    def _body(seq=1, inst="inst-aaaa1111", sensor="frigate"):
+        return _R.build_batch(sensor, inst, seq,
+                              {"devices": list(dev), "flows": [],
+                               "alerts": [], "outages": [], "uptime": [],
+                               "monitor": None}, T0)
+
+    def _hdrs(body, sensor="frigate"):
+        return {_R.SENSOR_HEADER: sensor,
+                _R.SIG_HEADER: _R.sign("shared-secret-abcdef", body)}
+
+    # ---- C: a full filesystem is refused, and nothing is written ----
+    store = HoundStore(path=tmp / "diskfull.sqlite")
+    srv = IngestServer(_collector_cfg(0, min_free_disk_mb=1 << 40),
+                       store, now=lambda: T0)
+    body = _body()
+    status, payload = srv.handle_batch("10.0.0.9", body, _hdrs(body))
+    assert status == 507, (
+        f"a collector under its free-disk floor must answer 507 so the "
+        f"agent spools and retries; got {status}. A full filesystem is "
+        f"the one failure that can damage the store rather than lose a "
+        f"batch")
+    assert store.get_remote_sensor("frigate") is None, \
+        "the refused batch was written anyway"
+    store.close()
+
+    # ---- D: an implausible sequence advance is refused -------------
+    store = HoundStore(path=tmp / "seqjump.sqlite")
+    srv = IngestServer(_collector_cfg(0), store, now=lambda: T0)
+    body = _body(seq=1)
+    assert srv.handle_batch("10.0.0.9", body, _hdrs(body))[0] == 200
+    body = _body(seq=1 + MAX_SEQ_ADVANCE + 1)
+    status, _ = srv.handle_batch("10.0.0.9", body, _hdrs(body))
+    assert status == 400, (
+        f"a key holder jumping the sequence by more than "
+        f"{MAX_SEQ_ADVANCE} must be refused; got {status}. Accepting it "
+        f"moves last_seq out of reach and 409-locks the real agent for "
+        f"good")
+    assert store.get_remote_sensor("frigate").last_seq == 1, \
+        "the forged sequence was recorded"
+    store.close()
+
+    # ---- E: instance_id is validated AT THE CALL SITE --------------
+    store = HoundStore(path=tmp / "inst.sqlite")
+    srv = IngestServer(_collector_cfg(0), store, now=lambda: T0)
+    import json as _json
+    for label, inst in (("control characters", "inst\x00\x1b-evil"),
+                        ("5000 characters", "i" * 5000),
+                        ("not a string", 12345)):
+        doc = _json.loads(_body())
+        doc["instance_id"] = inst
+        raw = _json.dumps(doc).encode()
+        status, _ = srv.handle_batch("10.0.0.9", raw, _hdrs(raw))
+        assert status == 400, (
+            f"instance_id with {label} must be refused at the ingest "
+            f"call site, not just by the validator in isolation; got "
+            f"{status}")
+    store.close()
+
+    # ---- A and B: the two admission gates, over real sockets -------
+    saved = (_I._Server.max_workers, _I._Server.max_per_source,
+             _I._Server.trusted_reserve)
+    _I._Server.max_workers, _I._Server.max_per_source = 8, 2
+    hold = _th.Event()
+    opened: list = []
+
+    def occupy(port, src):
+        """Hold a worker: complete the handshake, then say nothing."""
+        try:
+            raw = _sock.socket()
+            raw.bind((src, 0))
+            raw.settimeout(15)
+            raw.connect(("127.0.0.1", port))
+            w = _ctx().wrap_socket(raw)
+            opened.append(w)
+            hold.wait(30)
+            w.close()
+        except OSError as exc:
+            opened.append(exc)
+
+    def post_from(port, src, seq):
+        """A real signed request from `src`. Status, or the OSError."""
+        body = _body(seq=seq)
+        try:
+            raw = _sock.socket()
+            raw.bind((src, 0))
+            raw.settimeout(15)
+            raw.connect(("127.0.0.1", port))
+            conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=15)
+            conn.sock = _ctx().wrap_socket(raw)
+            h = dict(_hdrs(body))
+            h["Content-Length"] = str(len(body))
+            conn.request("POST", "/ingest/v1", body=body, headers=h)
+            status = conn.getresponse().status
+            conn.close()
+            return status
+        except OSError as exc:
+            return exc
+
+    threads: list = []
+    try:
+        # B: the per-source connection cap.
+        _I._Server.trusted_reserve = 0
+        port = _free_port()
+        store = HoundStore(path=tmp / "persrc.sqlite")
+        srv = IngestServer(
+            _collector_cfg(port, max_batches_per_minute=10_000),
+            store, now=lambda: T0)
+        assert srv.start()
+        try:
+            for _ in range(_I._Server.max_per_source):
+                t = _th.Thread(target=occupy, args=(port, "127.0.0.2"),
+                               daemon=True)
+                t.start()
+                threads.append(t)
+                time.sleep(0.3)
+            held = srv._httpd.active_slots()
+            assert held == _I._Server.max_per_source, (
+                f"setup failed: {held} slots held, expected "
+                f"{_I._Server.max_per_source}")
+            over = post_from(port, "127.0.0.2", 1)
+            assert isinstance(over, OSError), (
+                f"a source at its connection cap must be refused, so one "
+                f"peer cannot occupy every worker; it got {over} instead")
+            other = post_from(port, "127.0.0.3", 1)
+            assert other == 200, (
+                f"the cap must be PER SOURCE — a different address was "
+                f"refused too ({other}), which is a global cap and lets "
+                f"any peer lock out every agent")
+        finally:
+            hold.set()
+            for t in threads:
+                t.join(timeout=10)
+            srv.stop()
+            store.close()
+
+        # A: the reserve held for sources that have completed a batch.
+        hold = _th.Event()
+        threads = []
+        _I._Server.trusted_reserve = 4
+        port = _free_port()
+        store = HoundStore(path=tmp / "reserve.sqlite")
+        srv = IngestServer(
+            _collector_cfg(port, max_batches_per_minute=10_000),
+            store, now=lambda: T0)
+        assert srv.start()
+        try:
+            # The reservation is earned by COMPLETING a batch.
+            assert post_from(port, "127.0.0.2", 1) == 200
+            for src in ("127.0.0.3", "127.0.0.4"):
+                for _ in range(2):
+                    t = _th.Thread(target=occupy, args=(port, src),
+                                   daemon=True)
+                    t.start()
+                    threads.append(t)
+                    time.sleep(0.3)
+            free = _I._Server.max_workers - srv._httpd.active_slots()
+            assert free <= _I._Server.trusted_reserve, (
+                f"setup failed: {free} slots free, needed "
+                f"<= {_I._Server.trusted_reserve}")
+            unproven = post_from(port, "127.0.0.9", 1)
+            assert isinstance(unproven, OSError), (
+                f"with only the reserve left, an address that has never "
+                f"completed a signed request must be refused; it got "
+                f"{unproven}. Without this a flood of fresh addresses "
+                f"starves a sensor that is already reporting")
+            proven = post_from(port, "127.0.0.2", 2)
+            assert proven == 200, (
+                f"the reserve is worthless if the proven source is "
+                f"refused too; got {proven}")
+        finally:
+            hold.set()
+            for t in threads:
+                t.join(timeout=10)
+            srv.stop()
+            store.close()
+    finally:
+        (_I._Server.max_workers, _I._Server.max_per_source,
+         _I._Server.trusted_reserve) = saved
+        hold.set()
+
+    print("  admission gates: 507 on low disk, 400 on a forged sequence "
+          "and a hostile instance id; per-source cap and proven-source "
+          "reserve both refuse over real TLS")
+
+
 def _check_refusals_reach_the_client(tmp: Path) -> None:
     """A refusal the agent must act on has to ARRIVE as a status.
 
-    Two regressions, both of which turned a clear rejection into
-    something the agent read as a transient network fault and retried
-    forever:
+    `relay.py` treats 413 as TERMINAL (retrying a body that will be
+    exactly as large next time wedges the spool) and a reset as
+    retryable. So a 413 lost to an RST is not cosmetic: the agent
+    retries forever, the backlog grows, and at `spool_max_age_seconds`
+    a day of observations is discarded while `flush()` reports success.
 
-    * An over-size POST was answered and then closed with megabytes of
-      body still unread, so the kernel sent RST and discarded the 413.
-      `relay.py` treats 413 as terminal and a reset as retryable, so
-      the head of the spool wedged and everything behind it aged out
-      silently while `flush()` reported success.
-    * A signature header with a byte >= 0x80 reached
-      `hmac.compare_digest`, which raises TypeError on non-ASCII str.
-      That surfaced as HTTP 500 with a logged traceback per request —
-      a retryable status and a log amplifier, from an unauthenticated
-      peer.
+    Three regressions, in the order they were found:
+
+    * The refusal replied and then closed with the body unread, so the
+      kernel reset the connection and discarded the reply.
+    * The fix bounded the drain at `max_body_bytes` — but the 413 fires
+      if and only if the declared length EXCEEDS that cap, so there was
+      always an undrained remainder and delivery came down to socket
+      buffer slack. On loopback it passed 30/30; with an 8 KiB client
+      send buffer it failed 0/20.
+    * `_body_read` was reset per connection rather than per request, so
+      on a keep-alive socket every refusal after the first body-bearing
+      request skipped the drain entirely, at any size.
+
+    THE SMALL CLIENT SEND BUFFER IS THE POINT. With default loopback
+    buffers the kernel swallows the whole oversize body and this test
+    passes with the drain deleted.
     """
     import http.client
     import logging as _logging
+    import socket as _sock
     import ssl as _ssl
+    from surveillancehound import relay as _R
     from surveillancehound.ingest import IngestServer
     from surveillancehound.store import HoundStore
 
@@ -687,27 +1095,35 @@ def _check_refusals_reach_the_client(tmp: Path) -> None:
     store = HoundStore(path=tmp / "refusal.sqlite")
     cap = 256 * 1024
     srv = IngestServer(_collector_cfg(port, max_body_bytes=cap,
-                                      max_batches_per_minute=100),
+                                      max_batches_per_minute=1000),
                        store, now=lambda: T0)
     assert srv.start()
 
-    def post(body, headers=None):
+    _DEAD = (ConnectionResetError, http.client.BadStatusLine,
+             http.client.RemoteDisconnected, _ssl.SSLError, OSError)
+
+    def _conn(sndbuf=8192):
+        raw = _sock.socket()
+        # Before connect, or it does not take.
+        raw.setsockopt(_sock.SOL_SOCKET, _sock.SO_SNDBUF, sndbuf)
+        raw.settimeout(30)
+        raw.connect(("127.0.0.1", port))
         ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = _ssl.CERT_NONE
-        c = http.client.HTTPSConnection("127.0.0.1", port, timeout=20,
-                                        context=ctx)
-        try:
-            h = {"Content-Length": str(len(body)),
-                 "Content-Type": "application/json"}
-            h.update(headers or {})
-            c.request("POST", "/ingest/v1", body=body, headers=h)
-            return c.getresponse().status
-        finally:
-            c.close()
+        c = http.client.HTTPSConnection("127.0.0.1", port, timeout=30)
+        c.sock = ctx.wrap_socket(raw)
+        return c
 
-    # Collect what the server logs, so a 500-with-traceback cannot
-    # pass as "well, it returned something".
+    def _post(c, body, headers=None):
+        h = {"Content-Length": str(len(body)),
+             "Content-Type": "application/json"}
+        h.update(headers or {})
+        c.request("POST", "/ingest/v1", body=body, headers=h)
+        r = c.getresponse()
+        r.read()
+        return r.status
+
     records = []
 
     class _Grab(_logging.Handler):
@@ -717,36 +1133,87 @@ def _check_refusals_reach_the_client(tmp: Path) -> None:
     grab = _Grab()
     _logging.getLogger("surveillancehound.ingest").addHandler(grab)
 
+    good = _R.build_batch("frigate", "inst-aaaa1111", 1,
+                          {"devices": [{"ip": "192.168.10.11",
+                                        "role": "camera", "first_seen": T0,
+                                        "last_seen": T0, "packet_count": 1,
+                                        "byte_count": 1}],
+                           "flows": [], "alerts": [], "outages": [],
+                           "uptime": [], "monitor": None}, T0)
+    good_h = {_R.SENSOR_HEADER: "frigate",
+              _R.SIG_HEADER: _R.sign("shared-secret-abcdef", good)}
+
     try:
-        # Larger than the drain limit AND larger than any socket
-        # buffer, so a close without lingering really does reset.
+        # 1. Over-size, first request, on a SMALL send buffer.
         over = b"{" + b"x" * (cap + 512 * 1024)
+        c = _conn()
         try:
-            status = post(over)
-        except (ConnectionResetError, http.client.BadStatusLine,
-                _ssl.SSLError, OSError) as exc:
+            status = _post(c, over)
+        except _DEAD as exc:
             raise AssertionError(
-                f"over-size POST was reset instead of answered: {exc!r} "
-                "— the agent reads a reset as retryable and wedges") from None
+                f"over-size POST was reset instead of answered: {exc!r}. "
+                f"The drain ceiling must EXCEED max_body_bytes, because "
+                f"exceeding it is what triggers the 413") from None
+        finally:
+            c.close()
         assert status == 413, f"over-size POST returned {status}, want 413"
 
-        # Non-ASCII signature: unauthorised, not a server error.
-        status = post(b'{"sensor_id":"a"}',
-                      {"X-Hound-Signature": "sha256=\xa9bad",
-                       "X-Hound-Sensor": "a"})
+        # 2. Over-size as the SECOND request on a keep-alive socket.
+        #    Modest size, well inside any ceiling — this one is about
+        #    the per-request flag, not the limit.
+        c = _conn()
+        try:
+            first = _post(c, good, good_h)
+            assert first == 200, f"setup: signed batch returned {first}"
+            try:
+                status = _post(c, b"{" + b"x" * (cap + 1024))
+            except _DEAD as exc:
+                raise AssertionError(
+                    f"the SECOND request on a keep-alive connection was "
+                    f"reset instead of answered: {exc!r}. The "
+                    f"body-consumed flag must reset per request, not per "
+                    f"connection") from None
+            assert status == 413, \
+                f"keep-alive over-size POST returned {status}, want 413"
+        finally:
+            c.close()
+
+        # 3. A negative Content-Length is malformed, not over-size.
+        c = _conn()
+        try:
+            c.putrequest("POST", "/ingest/v1", skip_host=True,
+                         skip_accept_encoding=True)
+            c.putheader("Content-Length", "-1")
+            c.endheaders()
+            status = c.getresponse().status
+        finally:
+            c.close()
+        assert status == 400, (
+            f"a negative Content-Length is malformed, not over-size; "
+            f"got {status}")
+
+        # 4. Non-ASCII signature: unauthorised, not a server error.
+        c = _conn()
+        try:
+            status = _post(c, b'{"sensor_id":"a"}',
+                           {"X-Hound-Signature": "sha256=\xa9bad",
+                            "X-Hound-Sensor": "a"})
+        finally:
+            c.close()
         assert status == 401, \
             f"non-ASCII signature returned {status}, want 401"
         bad = [r for r in records
                if r.levelno >= _logging.ERROR or r.exc_info]
         assert not bad, (
-            "non-ASCII signature logged "
-            f"{len(bad)} error/traceback record(s): "
-            f"{bad[0].getMessage()[:120]!r}")
+            f"a refused request logged {len(bad)} error/traceback "
+            f"record(s): {bad[0].getMessage()[:120]!r}")
     finally:
         _logging.getLogger("surveillancehound.ingest").removeHandler(grab)
         srv.stop()
         store.close()
-    print("  refusals reach the client: 413 is delivered, bad signature is 401")
+    print("  refusals reach the client: 413 delivered on an 8 KiB send "
+          "buffer and as a keep-alive follow-up; -1 length is 400; bad "
+          "signature is 401 with no traceback")
 
 
 def _check_listener_limits(tmp: Path) -> None:
@@ -995,6 +1462,17 @@ def _check_batch_fits_the_body_cap(tmp: Path) -> None:
     home = tmp / "bigbatch"
     home.mkdir()
     store = HoundStore(path=home / "agent.sqlite")
+    # Devices too, and more than fit once the batch is halved. A
+    # halving applies the reduced cap to EVERY kind, and the devices
+    # cursor is `reported_at` — a timestamp, not an id — so advancing
+    # it to `now` regardless left the tail behind the cursor and
+    # permanently unrelayed. Their `last_seen` does not move again,
+    # which is what a camera that has just gone silent looks like, so
+    # nothing brings them back. Measured 500 of 600 before the fix.
+    devices = 600
+    for i in range(devices):
+        store.upsert_device(f"10.{i // 256}.{i % 256}.5", "camera",
+                            T0 + i * 0.001, 1, 1)
     big = "s" * 1024
     total = 1200
     for i in range(total):
@@ -1011,8 +1489,13 @@ def _check_batch_fits_the_body_cap(tmp: Path) -> None:
     limit = cfg.max_body_bytes
     client = RelayClient(cfg, store, now=lambda: T0 + 10_000)
 
-    seen_ids, batches = set(), 0
-    while client.enqueue():
+    seen_ids, seen_devices, batches = set(), set(), 0
+    # Bounded, not "until empty": `uptime_report` recomputes every
+    # cycle, so once cameras exist there is always something to send
+    # and `enqueue()` never returns 0.
+    for _ in range(64):
+        if not client.enqueue():
+            break
         batches += 1
         pend = client.spool.pending(T0 + 10_000)
         seq, body = pend[-1]
@@ -1021,11 +1504,20 @@ def _check_batch_fits_the_body_cap(tmp: Path) -> None:
             f"collector cap — it would be refused 413 and, because the "
             f"agent treats 413 as terminal, silently discarded")
         import json as _json
+        for d in _json.loads(body)["records"].get("devices", []):
+            seen_devices.add(d["ip"])
         for a in _json.loads(body)["records"].get("alerts", []):
             rid = a["remote_id"]
             assert rid not in seen_ids, f"alert {rid} relayed twice"
             seen_ids.add(rid)
-        assert batches < 64, "split did not converge"
+        client.spool.ack(seq)
+        if len(seen_ids) >= total and len(seen_devices) >= devices:
+            break
+    else:
+        raise AssertionError(
+            f"64 cycles and still short: {len(seen_ids)}/{total} alerts, "
+            f"{len(seen_devices)}/{devices} devices — the split is not "
+            f"converging")
 
     assert batches > 1, (
         "1200 maximal alerts must not fit in one batch; the split never "
@@ -1033,9 +1525,15 @@ def _check_batch_fits_the_body_cap(tmp: Path) -> None:
     assert len(seen_ids) == total, (
         f"splitting lost records: {total} alerts stored, {len(seen_ids)} "
         f"relayed — the watermark must follow what was actually sent")
+    assert len(seen_devices) == devices, (
+        f"splitting lost devices: {devices} stored, {len(seen_devices)} "
+        f"relayed. The devices cursor is a timestamp, so a truncated "
+        f"list must resume from the newest last_seen actually sent — "
+        f"advancing it to now leaves the tail behind it forever, and "
+        f"a silent camera's last_seen never moves again to rescue it")
     store.close()
-    print(f"  body cap: {total} maximal alerts split into {batches} "
-          f"batches under the cap, nothing lost")
+    print(f"  body cap: {total} maximal alerts + {devices} devices split "
+          f"into {batches} batches under the cap, nothing lost")
 
 
 def _check_outage_is_logged(tmp: Path) -> None:
@@ -1105,6 +1603,26 @@ def _check_outage_is_logged(tmp: Path) -> None:
                  and "unreachable" in m]
         assert len(later) == 2, (
             f"a still-dead link must be re-reported hourly; got {len(later)}")
+
+        # A FLAPPING LINK MUST NOT DEFEAT THE RATE LIMIT.
+        #
+        # Clearing the limiter on success made every outage "the
+        # first", so a link failing on alternate cycles logged a
+        # warning AND a recovery every time — measured 39 + 38 in 40
+        # cycles, about 5,544 lines a day, roughly twice what the
+        # limit was added to prevent. Each warning also re-parses the
+        # whole spool, which is up to 64 MB.
+        seen.clear()
+        flap = RelayClient(cfg, store, now=lambda: clock["t"])
+        for i in range(40):
+            clock["t"] += 30.0
+            flap._note_link(i % 2 == 0, "flap")
+        noisy = [m for lv, m in seen if lv >= _logging.WARNING]
+        chatty = [m for lv, m in seen if lv < _logging.WARNING]
+        assert len(noisy) + len(chatty) <= 2, (
+            f"a link failing every other cycle produced {len(noisy)} "
+            f"warning(s) and {len(chatty)} info(s) in 40 cycles; the "
+            f"rate limit must survive a recovery")
     finally:
         lg.removeHandler(grab)
         store.close()
@@ -1761,8 +2279,54 @@ def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
             f"reached storage, so the dashboard would under-report"
         )
         hound.cfg.relay.max_notifications_per_minute = 60
+
+        # A DUPLICATE MUST NOT SPEND THE SENSOR'S BUDGET.
+        #
+        # The dedup pre-check runs before the budget gate for a
+        # reason: an alert the dispatcher would suppress for free
+        # should not consume the allowance, or a sensor can silence
+        # its own real pages with a flood of repeats. Removing the
+        # pre-check left the suite green, because the downstream
+        # suppression still held and nothing asserted on the budget.
+        import queue as _q0
+        import time
+        while True:
+            try:
+                hound._relay_alertq.get_nowait()
+            except _q0.Empty:
+                break
+        hound._relay_inflight.clear()
+        hound.stats.relayed_dropped_budget = 0
+        hound.cfg.relay.max_notifications_per_minute = 3
+        hound._relay_notify_times.clear()
+        tnow = time.time()
+        with hound._relay_stats_lock:
+            hound._relay_last_dispatch[("k", "frigate", "old-news")] = tnow
+        flood = [dict(recs["alerts"][0], remote_id=3000 + i,
+                      dedup_key="old-news") for i in range(10)]
+        flood.append(dict(recs["alerts"][0], remote_id=3999,
+                          dedup_key="genuinely-new"))
+        hound._on_relayed_alerts("frigate", flood, "inst")
+        queued = []
+        while True:
+            try:
+                queued.append(hound._relay_alertq.get_nowait())
+            except _q0.Empty:
+                break
+        keys = [item[1]["dedup_key"] for item in queued]
+        assert keys == ["genuinely-new"], (
+            f"ten repeats of an alert already dispatched must be dropped "
+            f"before the budget gate, leaving the new one through; "
+            f"queued {keys}")
+        assert hound.stats.relayed_dropped_budget == 0, (
+            f"the duplicates spent {hound.stats.relayed_dropped_budget} "
+            f"of the sensor's allowance — a flood of repeats can "
+            f"therefore suppress its own genuine pages")
+        hound.cfg.relay.max_notifications_per_minute = 60
+        hound._relay_notify_times.clear()
         print("  relayed dispatch: reused remote_id pages once; per-sensor "
-              "notification budget caps paging but not storage")
+              "notification budget caps paging but not storage; repeats "
+              "are dropped before they can spend it")
 
         # The ingest thread must only ENQUEUE. Dispatching inline would let
         # one authenticated batch hold an ingest thread for as long as its
@@ -3236,6 +3800,10 @@ def main() -> int:
         _check_relayed_api_surface(Path(td))
         _check_replay_opens_no_listener(Path(td))
         _check_spool_counters(Path(td))
+        _check_retention_actually_bounds_growth(Path(td))
+        _check_http_refusals_are_logged(Path(td))
+        _check_alert_kinds_cannot_drift(Path(td))
+        _check_damaged_spool_line(Path(td))
         _check_agent_state(Path(td))
         _check_shutdown_and_slot_release(Path(td))
     print("=== listener ===")
@@ -3243,6 +3811,7 @@ def main() -> int:
         _check_listener(Path(td))
         _check_listener_limits(Path(td))
         _check_refusals_reach_the_client(Path(td))
+        _check_admission_gates_are_live(Path(td))
         _check_pinning(Path(td))
     print("=== end to end ===")
     with tempfile.TemporaryDirectory() as td:

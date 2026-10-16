@@ -77,12 +77,20 @@ what a 1-vCPU firewall VM is.
 
 **The metering reduces that; it does not close it.** The budget is
 keyed on the source address, so it only bites a source that comes
-back. Measured from a few addresses, capture loss falls from 62-97%
-to 2-6%. Measured from 20,000 rotating addresses — every connection a
-first offence, nothing ever in cooldown — **38% of packets are still
-lost.** Nothing alerts on it either: packets are still arriving, so
-`capture_stalled` cannot fire, and the loss shows up only as flows
-that were never recorded.
+back.
+
+Measured with the collector pinned to a single core — a 1-vCPU
+firewall VM is the case these plugins exist for — against a flood
+from 8 addresses: an unmetered collector keeps 30% of its local
+packet-parsing throughput; at the shipped default of 60 requests per
+minute per source it keeps **80%**, refusing 53,000 connections at
+accept to do it.
+
+That remaining 20% is the floor, not the worst case. From 20,000
+ROTATING addresses — every connection a first offence, nothing ever
+in cooldown — **38% of packets are lost.** Nothing alerts on it
+either: packets are still arriving, so `capture_stalled` cannot fire,
+and the loss shows up only as flows that were never recorded.
 
 A firewall rule is not defence in depth here. It is the control.
 
@@ -182,16 +190,27 @@ docker volume rm agent_hound-state
 ## What the agent does and does not do
 
 - It runs the **whole** pipeline locally: capture, flow aggregation,
-  device discovery, classification, uptime tracking, baselining.
+  device discovery, classification and uptime tracking — plus
+  baselining if you turn `[baseline]` on, which is off by default here
+  as it is everywhere else.
 - It dispatches **nothing**. Any `[[notify]]` block in its config is
   ignored. The collector is the only thing that notifies, so one camera
   outage does not page you once per sensor.
 - If the collector is unreachable, observations spool to disk and replay
   when it returns, bounded by both `spool_max_bytes` and
-  `spool_max_age_seconds` — whichever is hit first drops the oldest.
+  `spool_max_age_seconds` — whichever is hit first drops the oldest. It
+  says so in its own log when the link first drops and hourly after.
+- **One push window can arrive as several batches.** If a window's
+  records would exceed the collector's body limit, the agent halves how
+  many it sends and keeps the rest for the next batch rather than
+  building something that gets refused. Lossless, and logged.
 - Relayed records land in `remote_*` tables on the collector and can never
-  overwrite its own observations. That isolation is enforced by a SQLite
-  authorizer, not merely intended.
+  overwrite its own observations. No code on the ingest path writes any
+  of the collector's own tables — the isolation is structural, not a
+  validation rule that could be bypassed. The test suite proves it with
+  a SQLite authorizer that fails the build if an ingest-path write ever
+  touches a local table. That is a build-time gate, not a control
+  running in your collector.
 
 ## Updating
 
@@ -209,6 +228,6 @@ The named volume is untouched by a rebuild, so no re-alert storm.
 | `No such device exists` | `interface` names a container interface, or a host interface that does not exist. Check `ip -br link` **on the host**. |
 | Nothing relays, no error | Check `docker compose logs`: a spooling agent logs `collector unreachable ... spooling` when the link first drops and hourly after, with batch count and last error. `hound relay` on the agent config prints the same depth plus the drop totals. |
 | `certificate fingerprint mismatch` | The collector's cert was regenerated. Re-read it and update `tls_fingerprint`. Do not disable pinning. |
-| `401` from the collector | Key mismatch, or `sensor_id` has no `[[relay.sensor]]` entry on the collector. |
+| `401` from the collector | Key mismatch, or `sensor_id` has no `[[relay.sensor]]` entry on the collector. **Spooled batches are discarded, not held** — a rejection that retrying cannot fix would wedge the spool, so each one is dropped with a `dropping spooled batch` log line. Observations made while the key was wrong are gone. Fix it promptly. |
 | `507` from the collector | The collector is low on disk. The agent spools and retries; free space there. |
 | Byte counts look doubled | `interface = "any"` across VLANs. See above. |

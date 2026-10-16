@@ -14,6 +14,7 @@ exercise every /api/* path. This keeps the test stdlib-only.
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -232,6 +233,119 @@ def _check_export_cli(cfg_path: Path, missing_path: Path) -> None:
     assert out.returncode != 0, "hound alerts must exit non-zero without a config"
     print("  CLI: hound export emits a structured error (exit 0) for a "
           "missing config; other subcommands still exit non-zero")
+
+
+def _check_readers_do_not_write(td: Path) -> None:
+    """A diagnostic must not be able to destroy what it reports on.
+
+    `HoundStore.__init__` created the file, created its parent
+    directories, ran the schema AND ran the pre-release relay
+    migration. So `hound sensors` against a path that did not exist
+    left a database and a directory tree behind, and against a
+    pre-release database it dropped the relayed rows it had been asked
+    to display. It also failed outright on a read-only store
+    directory, which is a reasonable way to run a reader.
+    """
+    env = {"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"}
+    home = td / "ro"
+    home.mkdir()
+    store_path = home / "var" / "db" / "hound.sqlite"
+    cfg_path = home / "hound.toml"
+    cfg_path.write_text(
+        f"[capture]\npcap_file = '/nonexistent.pcap'\n"
+        f"[network]\ncamera_ips = ['192.168.10.11']\n"
+        f"[store]\npath = {str(store_path)!r}\n"
+    )
+    for cmd in ("sensors", "devices", "alerts", "flows", "uptime",
+                "baselines", "snapshots"):
+        out = subprocess.run(
+            [sys.executable, "-m", "surveillancehound.cli", cmd,
+             str(cfg_path)],
+            capture_output=True, text=True, env=env,
+        )
+        assert out.returncode != 0, (
+            f"hound {cmd} against a missing store exited 0; it should "
+            f"say the store is not there")
+        assert not store_path.exists(), (
+            f"hound {cmd} CREATED the store at {store_path}. A reader "
+            f"has no business creating the database, its directories, "
+            f"the schema, or running a migration")
+        assert not store_path.parent.exists(), (
+            f"hound {cmd} created {store_path.parent}")
+
+    # With a real store, every reader works and none of them writes.
+    from surveillancehound.store import DeviceRow, HoundStore
+    real = HoundStore(path=store_path)
+    real.upsert_device("192.168.10.11", "camera", 1.0, 1, 1)
+    real.close()
+    before = store_path.stat().st_mtime_ns, store_path.stat().st_size
+    for cmd in ("sensors", "devices", "alerts", "flows", "uptime",
+                "baselines", "snapshots", "export"):
+        out = subprocess.run(
+            [sys.executable, "-m", "surveillancehound.cli", cmd,
+             str(cfg_path)],
+            capture_output=True, text=True, env=env,
+        )
+        assert out.returncode == 0, (
+            f"hound {cmd} failed against a real store: "
+            f"{out.stderr[:200]}")
+    assert (store_path.stat().st_mtime_ns, store_path.stat().st_size) == before, \
+        "a read-only command modified the store file"
+
+    # The handle itself must refuse writes, not merely avoid them.
+    ro = HoundStore(path=store_path, readonly=True)
+    try:
+        ro.upsert_device("10.0.0.9", "camera", 2.0, 1, 1)
+        raise AssertionError(
+            "a readonly=True store accepted a write; the guard is "
+            "advisory rather than enforced")
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        ro.close()
+    print("  CLI: readers never create or modify the store, and a "
+          "read-only handle refuses writes at the driver")
+
+
+def _check_export_counts_are_counts(cfg_path: Path) -> None:
+    """`counts.alerts_24h` must be a count, not a count of one page.
+
+    It was derived from the rows already fetched for the table, so it
+    saturated at twice `--limit`: measured 200 of 600 at the default.
+    The OPNsense dashboard clamps the limit to 500, so the tile
+    labelled "Alerts (24h)" under-reported exactly during the flood
+    that makes it worth reading.
+    """
+    import time as _t
+    from surveillancehound.config import load as _load
+    from surveillancehound.store import AlertRow, HoundStore
+
+    cfg = _load(cfg_path)
+    store = HoundStore(path=cfg.store.path)
+    now = _t.time()
+    for i in range(600):
+        store.insert_alert(AlertRow(
+            id=None, ts=now - i, device_ip="192.168.10.11",
+            kind="new_device", severity="low", summary="x", detail="",
+            dedup_key=f"count-{i}"))
+    store.close()
+
+    env = {"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"}
+    seen = {}
+    for limit in ("10", "200", "5000"):
+        out = subprocess.run(
+            [sys.executable, "-m", "surveillancehound.cli", "export",
+             str(cfg_path), "--limit", limit],
+            capture_output=True, text=True, check=True, env=env,
+        )
+        seen[limit] = json.loads(out.stdout)["counts"]["alerts_24h"]
+    assert len(set(seen.values())) == 1, (
+        f"alerts_24h changes with --limit ({seen}); it is counting the "
+        f"page, not the window")
+    assert seen["10"] >= 600, (
+        f"alerts_24h is {seen['10']} with 600 alerts inside the window")
+    print(f"  CLI: alerts_24h is {seen['10']} at every --limit, not a "
+          f"count of the page")
 
 
 def _check_web(cfg: HoundCfg) -> None:
@@ -456,6 +570,8 @@ def main() -> int:
         _check_snapshots_cli(cfg_path)
         _check_uptime_cli(cfg_path)
         _check_export_cli(cfg_path, root / "does-not-exist.toml")
+        _check_readers_do_not_write(root)
+        _check_export_counts_are_counts(cfg_path)
         _check_web(cfg)
         _check_web_https(cfg, root)
         _check_web_cfg_validation()

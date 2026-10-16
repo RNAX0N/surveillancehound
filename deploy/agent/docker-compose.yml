@@ -41,7 +41,13 @@ services:
     # The daemon is the pid-1 process and handles SIGTERM by draining
     # in-RAM flows and flushing the relay spool. Give it room to finish
     # rather than losing the last window of observations.
-    stop_grace_period: 30s
+    # 90s, not 30s. Worst case the agent spends 15s joining the pusher
+    # thread, 20s on its final flush budget and up to 10s in one socket
+    # timeout inside it — about 45s. At 30s Docker SIGKILLed it
+    # mid-drain. Nothing observed is lost either way (the store write
+    # precedes the flush, and the rest stays spooled) but the monitor
+    # session never closed cleanly, which shows up as blind time.
+    stop_grace_period: 90s
 
     logging:
       driver: json-file

@@ -35,22 +35,27 @@ import json
 import math
 from typing import Any
 
-from surveillancehound.alerts import (
-    KIND_BEHAVIORAL_ANOMALY, KIND_BULK_INBOUND, KIND_CAMERA_NEVER_SEEN,
-    KIND_CAMERA_OFFLINE, KIND_CAMERA_RECOVERED, KIND_CAMERA_TO_CAMERA,
-    KIND_CAPTURE_STALLED, KIND_CONTROL_CHANNEL, KIND_NEW_DEVICE,
-    KIND_NEW_PEER, KIND_TELEMETRY_OFFNET,
-)
+from surveillancehound import alerts as _alerts
 from surveillancehound.notify import _SEVERITY_RANK
 
-# Imported rather than re-listed so they cannot drift apart from the code
-# that produces them.
-ALERT_KINDS = frozenset({
-    KIND_BULK_INBOUND, KIND_CONTROL_CHANNEL, KIND_TELEMETRY_OFFNET,
-    KIND_CAMERA_TO_CAMERA, KIND_NEW_DEVICE, KIND_NEW_PEER,
-    KIND_CAMERA_OFFLINE, KIND_CAMERA_RECOVERED, KIND_CAMERA_NEVER_SEEN,
-    KIND_CAPTURE_STALLED, KIND_BEHAVIORAL_ANOMALY,
-})
+# DERIVED from the module, not hand-listed.
+#
+# The comment here used to say "imported rather than re-listed so they
+# cannot drift apart" above an enumeration that had drifted: `alerts`
+# defined thirteen KIND_ constants and this set named eleven, missing
+# `sensor_offline` and `sensor_recovered`. `validate_records` is
+# all-or-nothing and `relay.py` treats the resulting 400 as terminal,
+# so one row of an unlisted kind discarded the whole batch AFTER the
+# watermark had advanced — permanent silent loss, and nothing would
+# have caught the next kind added either.
+#
+# Every alert this codebase can produce has a module-level KIND_
+# constant (it is in CLAUDE.md's conventions), so deriving them makes
+# the claim true instead of aspirational.
+ALERT_KINDS = frozenset(
+    v for k, v in vars(_alerts).items()
+    if k.startswith("KIND_") and isinstance(v, str)
+)
 SEVERITIES = frozenset(_SEVERITY_RANK)
 ROLES = frozenset({"camera", "nvr", "other"})
 STATES = frozenset({"up", "down", "never_seen", "unknown"})

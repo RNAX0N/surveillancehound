@@ -118,7 +118,12 @@ class _Handler(BaseHTTPRequestHandler):
     # --- handlers --------------------------------------------------------
 
     def _store(self) -> HoundStore:
-        return HoundStore(path=self.cfg.store.path)
+        # READ-ONLY, as this handler's own docstring claims the whole
+        # surface is. The constructor ran PRAGMAs, the schema and the
+        # pre-release relay migration, so an unauthenticated GET was
+        # driving DDL — and on a fresh path it created the store rather
+        # than reporting that there was nothing to show.
+        return HoundStore(path=self.cfg.store.path, readonly=True)
 
     def _serve_html(self) -> None:
         html = _render_dashboard(self.cfg)
@@ -1089,8 +1094,25 @@ function renderUptime(u) {
   }
   mon += `<span>window ${fmtDur(u.window_seconds)}</span>`;
   (u.sensors || []).forEach(sx => {
-    const cls = sx.reporting ? "ok" : "bad";
-    const label = sx.reporting ? "reporting" : "NOT REPORTING";
+    // A relay sensor has TWO independent health questions and the pill
+    // used to answer only one. `reporting` is about the LINK — are its
+    // batches arriving. `mon_blind` is what the sensor says about its
+    // OWN capture, and a sensor whose capture is dead while its link is
+    // fine was rendering "reporting" next to every camera "up" at 100%
+    // availability. That is the surface claiming liveness that the
+    // local `capture stalled` branch above exists to prevent, so it
+    // gets the same treatment: blind beats reporting, because if the
+    // sensor cannot see, its per-camera figures are stale.
+    let cls, label;
+    if (!sx.reporting) {
+      cls = "bad"; label = "NOT REPORTING";
+    } else if (sx.mon_blind) {
+      cls = "bad"; label = "capture stalled — figures stale";
+    } else if (sx.mon_alive === false) {
+      cls = "bad"; label = "reporting, capture not running";
+    } else {
+      cls = "ok"; label = "reporting";
+    }
     mon += `<span class="mon-state ${cls}">${escapeHTML(sx.sensor_id)}: ${label}</span>`;
   });
   $("monitor-line").innerHTML = mon;

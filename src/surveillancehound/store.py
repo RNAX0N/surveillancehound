@@ -520,8 +520,43 @@ class HoundStore:
     serializes both reads and writes — simple, correct, plenty fast for this
     workload (camera traffic is hundreds of packets/sec, not millions)."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, readonly: bool = False) -> None:
+        """`readonly=True` for diagnostics and the dashboard.
+
+        A reader has no business creating the store, creating its parent
+        directories, running the schema, or running a MIGRATION — and
+        this constructor did all four. So `hound sensors` against a
+        path that did not exist produced a 188 KB database and a tree
+        of directories, and against a pre-release database it silently
+        dropped the relayed rows it had been asked to display. A
+        diagnostic must not be able to destroy the thing it reports on.
+        It also failed outright on a read-only store directory, which
+        is a reasonable way to run a reader.
+
+        `AgentState.load(readonly=…)` and `Spool(readonly=…)` already
+        work this way; the store did not.
+        """
         self.path = Path(path)
+        self.readonly = bool(readonly)
+        if self.readonly:
+            if not self.path.is_file():
+                raise FileNotFoundError(
+                    f"store {self.path} does not exist. A read-only "
+                    f"command will not create it — start the daemon "
+                    f"first, or check [store].path."
+                )
+            # mode=ro refuses to create anything, including the schema.
+            self._conn = sqlite3.connect(
+                f"file:{self.path.as_posix()}?mode=ro",
+                uri=True, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            # No journal_mode here: it is a property of the database,
+            # the writer already set it, and setting it needs write
+            # access. busy_timeout is per connection and still wanted,
+            # since the daemon is writing while we read.
+            self._conn.execute("PRAGMA busy_timeout=30000")
+            self._lock = threading.RLock()
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -953,6 +988,36 @@ class HoundStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def count_alerts_since(self, since: float) -> int:
+        """How many local alerts since `since`. A COUNT, not a page.
+
+        `hound export` derived this by counting the rows it had already
+        fetched for the table, so the tile labelled "Alerts (24h)"
+        saturated at twice `--limit` — measured 200 of 600 at the
+        default, and the OPNsense dashboard clamps the limit to 500, so
+        the number an operator reads under-reports exactly when a flood
+        makes it matter.
+        """
+        with self._lock:
+            return int(self._conn.execute(
+                "SELECT COUNT(*) AS c FROM alerts WHERE ts >= ?",
+                (float(since),),
+            ).fetchone()["c"])
+
+    def count_remote_alerts_since(self, since: float) -> int:
+        """The same for relayed alerts, aged on OUR clock.
+
+        `ingested_at`, never the sensor-supplied `ts`: a backdated
+        alert must not be able to hide from the tally, and a
+        future-dated one must not inflate it.
+        """
+        with self._lock:
+            return int(self._conn.execute(
+                "SELECT COUNT(*) AS c FROM remote_alerts "
+                "WHERE ingested_at >= ?",
+                (float(since),),
+            ).fetchone()["c"])
+
     def outages_changed_since(self, after_id: int,
                               open_ids: "Sequence[int]" = (),
                               limit: int = 5000) -> list[dict]:
@@ -971,23 +1036,45 @@ class HoundStore:
         guaranteed exactly one more send. The upsert on the collector
         makes the repeat idempotent.
         """
-        ids = [int(i) for i in open_ids][:limit]
+        # Oldest ids first when the carry-forward list has to be
+        # truncated: those are the ones that have been waiting longest
+        # for a close to be observed.
+        ids = sorted(int(i) for i in open_ids)[:limit]
         extra = ""
         if ids:
             extra = " OR id IN (%s)" % ",".join("?" * len(ids))
         with self._lock:
             rows = self._conn.execute(
+                # NEW OUTAGES FIRST, then the re-sends.
+                #
+                # Plain `ORDER BY id LIMIT` made this a fixed prefix:
+                # with `limit` or more outages open at once, the
+                # lowest-id open rows filled every batch, the caller's
+                # cursor never moved past them, and a newly-opened
+                # outage was returned on no cycle at all — a camera
+                # going down was simply never relayed. Sorting the
+                # strictly-progressing term first means the cursor
+                # always advances, and the re-sends fill whatever is
+                # left and resume once it has.
                 """SELECT * FROM outages
                    WHERE id > ? OR up_at IS NULL""" + extra + """
-                   ORDER BY id LIMIT ?""",
-                (int(after_id), *ids, int(limit)),
+                   ORDER BY (id > ?) DESC, id LIMIT ?""",
+                (int(after_id), *ids, int(after_id), int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
 
     def devices_changed_since(self, since: float, limit: int = 5000) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM devices WHERE last_seen >= ? ORDER BY ip LIMIT ?",
+                # ORDER BY last_seen, not ip. The relay truncates this
+                # at its batch limit and resumes from the newest
+                # `last_seen` it actually sent, so the ordering has to
+                # match the cursor. Ordering by ip made the LIMIT a
+                # permanent prefix: the same high-sorted addresses were
+                # cut on every cycle and never relayed at all. `ip`
+                # breaks ties so the order is total.
+                "SELECT * FROM devices WHERE last_seen >= ? "
+                "ORDER BY last_seen, ip LIMIT ?",
                 (float(since), int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -1043,6 +1130,9 @@ class HoundStore:
         ("remote_outages", "ingested_at"),
         ("remote_devices", "ingested_at"),
         ("remote_uptime", "reported_at"),
+        # Was retention-only, so rows outlived the alerts they cite
+        # and no per-sensor cap applied to them at all.
+        ("remote_notifications", "attempted_at"),
     )
 
     def _enforce_sensor_quota(self, sensor_id: str, cap: int) -> int:
@@ -1394,9 +1484,26 @@ class HoundStore:
             deleted["remote_alerts"] = self._conn.execute(
                 "DELETE FROM remote_alerts WHERE ingested_at < ?", (older_than,)
             ).rowcount
+            # NOT gated on `up_at IS NOT NULL`, unlike the local
+            # `prune`. Locally an open outage is this daemon's own live
+            # state and deleting it would lose the down-state that a
+            # restart resumes from. A RELAYED open outage is not live
+            # state — it is a copy, and `validate` accepts
+            # `up_at: null`, so a key-holding sensor could send a
+            # thousand never-closed outages per batch and every one was
+            # permanently immune to retention. Retention is documented
+            # as the only bound on remote_* growth, so "immune to
+            # retention" meant unbounded.
+            #
+            # Safe because the agent re-sends it: `_advance` carries
+            # every still-open outage id forward in
+            # `open_outage_ids`, so `outages_changed_since` returns it
+            # on EVERY cycle. A genuinely-open outage pruned here
+            # reappears on the next batch from a live sensor; one that
+            # does not reappear had no sensor behind it.
             deleted["remote_outages"] = self._conn.execute(
-                """DELETE FROM remote_outages
-                   WHERE up_at IS NOT NULL AND ingested_at < ?""", (older_than,)
+                "DELETE FROM remote_outages WHERE ingested_at < ?",
+                (older_than,)
             ).rowcount
             deleted["remote_notifications"] = self._conn.execute(
                 "DELETE FROM remote_notifications WHERE attempted_at < ?",
@@ -1412,7 +1519,45 @@ class HoundStore:
             deleted["remote_uptime"] = self._conn.execute(
                 "DELETE FROM remote_uptime WHERE reported_at < ?", (older_than,)
             ).rowcount
+        # Reclaim, OUTSIDE the transaction above — SQLite refuses a
+        # VACUUM inside one and says so loudly.
+        #
+        # Without this, retention freed rows but never bytes: measured,
+        # 40,000 relayed flows grew the file to 2.85 MB, and deleting
+        # all 40,000 left it at 4.86 MB with 1,140 free pages and no
+        # shrink. `ingest._disk_ok()` gates on FILESYSTEM free space,
+        # so a sensor that had inflated the store to the
+        # `min_free_disk_mb` floor kept the collector answering 507 to
+        # every sensor forever, with retention unable to help and no
+        # shipped recovery path.
+        #
+        # `_vacuum_is_safe` can refuse (it needs headroom, and
+        # declines exactly when disk is tight). That is why
+        # `_disk_ok()` also counts the freelist: pages freed here are
+        # reusable whether or not the file shrinks.
+        if any(deleted.values()) and self._vacuum_is_safe():
+            with self._lock:
+                self._conn.execute("VACUUM")
         return deleted
+
+    def reusable_bytes(self) -> int:
+        """Free pages inside the store, in bytes.
+
+        SQLite reuses these without growing the file, so for "is there
+        room to write" they are as good as filesystem free space. The
+        ingest disk guard counts them because retention can free pages
+        without shrinking the file, and gating on the filesystem alone
+        made a one-off flood a permanent 507 for every sensor.
+        """
+        try:
+            with self._lock:
+                free = self._conn.execute(
+                    "PRAGMA freelist_count").fetchone()[0]
+                page = self._conn.execute(
+                    "PRAGMA page_size").fetchone()[0]
+            return int(free) * int(page)
+        except (sqlite3.Error, TypeError, IndexError):
+            return 0
 
     # ----- flows -----
 

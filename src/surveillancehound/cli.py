@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sqlite3
 import sys
 import time
 import tomllib
@@ -94,7 +95,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_alerts(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
-    store = HoundStore(path=cfg.store.path)
+    store = _ro_store(cfg)
     try:
         cutoff = time.time() - args.since if args.since else 0.0
         for a in store.list_alerts(limit=args.limit):
@@ -116,7 +117,7 @@ def cmd_alerts(args: argparse.Namespace) -> int:
 
 def cmd_flows(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
-    store = HoundStore(path=cfg.store.path)
+    store = _ro_store(cfg)
     try:
         rows = store.recent_flows(limit=args.limit, classification=args.cls)
         if not rows:
@@ -137,7 +138,7 @@ def cmd_flows(args: argparse.Namespace) -> int:
 
 def cmd_devices(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
-    store = HoundStore(path=cfg.store.path)
+    store = _ro_store(cfg)
     try:
         rows = store.list_devices()
         if not rows:
@@ -214,7 +215,7 @@ def cmd_uptime(args: argparse.Namespace) -> int:
         else cfg.uptime.report_window_seconds
     )
     now = time.time()
-    store = HoundStore(path=cfg.store.path)
+    store = _ro_store(cfg)
     try:
         session = store.current_monitor_session()
         if session is None:
@@ -283,6 +284,37 @@ def cmd_uptime(args: argparse.Namespace) -> int:
     return 0
 
 
+def _printable(text: str, limit: int = 300) -> str:
+    """Make remote-supplied text safe to print to a terminal.
+
+    Control characters are replaced rather than dropped so that an
+    attempt to inject them is visible instead of silent.
+    """
+    out = "".join(
+        ch if (ch.isprintable() or ch == " ") else f"\\x{ord(ch):02x}"
+        for ch in str(text)[:limit]
+    )
+    return out
+
+
+def _ro_store(cfg) -> HoundStore:
+    """Open the store for a command that only reads it.
+
+    Read-only is not a style choice here. The constructor used to
+    create the file, its parent directories, the schema AND run the
+    pre-release relay migration — so `hound sensors` against a missing
+    path left a 188 KB database behind, and against a pre-release
+    database it dropped the relayed rows it had been asked to show. A
+    diagnostic must not be able to destroy what it reports on.
+    """
+    try:
+        return HoundStore(path=cfg.store.path, readonly=True)
+    except FileNotFoundError as e:
+        sys.exit(str(e))
+    except sqlite3.Error as e:
+        sys.exit(f"cannot read store {cfg.store.path}: {e}")
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     """Dump the dashboard's data as one JSON document on stdout.
 
@@ -328,7 +360,49 @@ def cmd_export(args: argparse.Namespace) -> int:
         else cfg.uptime.report_window_seconds
     )
     now = time.time()
-    store = HoundStore(path=cfg.store.path)
+    # Read-only, and a store failure is reported IN the document like
+    # every other failure here. The in-document guard covered only a
+    # missing config file, so a store that was corrupt, a directory, or
+    # unreadable exited non-zero with empty stdout — and configd
+    # discards the output of a non-zero `script_output` action, which
+    # is precisely the "No response from the hound backend" this
+    # docstring claims to have fixed.
+    try:
+        store = HoundStore(path=cfg.store.path, readonly=True)
+    except (FileNotFoundError, OSError, sqlite3.Error) as e:
+        json.dump(
+            {
+                "status": "failed",
+                "message": f"cannot read the store at {cfg.store.path}: {e}",
+                "config_path": str(args.config),
+            },
+            sys.stdout,
+        )
+        sys.stdout.write("\n")
+        return 0
+    try:
+        return _export_body(args, cfg, store, window, now)
+    except (sqlite3.Error, OSError) as e:
+        # IN the document, exit 0. configd discards the output of a
+        # non-zero script_output action, so a traceback here reaches
+        # the operator as "No response from the hound backend" — the
+        # exact failure this command's in-document reporting exists to
+        # prevent, and it covered only a missing config file.
+        json.dump(
+            {
+                "status": "failed",
+                "message": f"cannot read the store at {cfg.store.path}: {e}",
+                "config_path": str(args.config),
+            },
+            sys.stdout,
+        )
+        sys.stdout.write("\n")
+        return 0
+    finally:
+        store.close()
+
+
+def _export_body(args, cfg, store, window, now) -> int:
     try:
         alive, blind, last_activity = _monitor_health(store, cfg, now)
         session = store.current_monitor_session()
@@ -368,10 +442,16 @@ def cmd_export(args: argparse.Namespace) -> int:
                 # list under it is worse than no count. Relayed rows are
                 # aged on ingested_at, our clock, so a backdated alert
                 # cannot hide from the tally or inflate it.
+                # A COUNT over the table, not over the page fetched
+                # for the list below. Counting the page made this
+                # saturate at 2x --limit: 200 of 600 at the default,
+                # and the OPNsense dashboard clamps limit to 500, so
+                # the "Alerts (24h)" tile under-reported precisely
+                # during the flood that makes it worth reading.
                 "alerts_24h": (
-                    sum(1 for a in alerts if a.ts >= now - 86400)
-                    + sum(1 for a in remote_alerts
-                          if float(a.get("ingested_at", 0.0)) >= now - 86400)
+                    store.count_alerts_since(now - 86400)
+                    + (store.count_remote_alerts_since(now - 86400)
+                       if is_collector else 0)
                 ),
             },
             "uptime": [dict(r.__dict__, sensor="local") for r in report],
@@ -392,7 +472,9 @@ def cmd_export(args: argparse.Namespace) -> int:
                              if is_collector else []),
         }
     finally:
-        store.close()
+        # The store is closed by cmd_export's own `finally`, which owns
+        # it on both the success and the in-document-failure path.
+        pass
     json.dump(doc, sys.stdout, default=str)
     sys.stdout.write("\n")
     return 0
@@ -402,7 +484,10 @@ def cmd_sensors(args: argparse.Namespace) -> int:
     """Relay sensors known to this collector."""
     cfg = _cfg(args.config)
     now = time.time()
-    store = HoundStore(path=cfg.store.path)
+    # Read-only for the listing; `--forget` deletes a sensor's relayed
+    # rows, so that path needs a writable store.
+    store = (HoundStore(path=cfg.store.path) if args.forget
+             else _ro_store(cfg))
     try:
         if args.forget:
             gone = store.forget_remote_sensor(args.forget)
@@ -421,15 +506,34 @@ def cmd_sensors(args: argparse.Namespace) -> int:
         timeout = cfg.relay.sensor_timeout_seconds
         print(f"{'sensor':16s} {'state':14s} {'last batch':12s} {'skew':>8s} "
               f"{'batches':>8s} {'records':>9s}")
+        blind_any = False
         for r in rows:
             age = now - r.last_seen
-            state = "reporting" if age <= timeout else "NOT REPORTING"
+            # Two independent questions, and only one used to be
+            # answered. `reporting` is about the LINK. `mon_blind` is
+            # what the sensor says about its OWN capture, and a sensor
+            # whose capture is dead but whose link is fine read a clean
+            # "reporting" beside camera rows it could no longer see.
+            if age > timeout:
+                state = "NOT REPORTING"
+            elif r.mon_blind:
+                state = "BLIND"
+                blind_any = True
+            elif not r.mon_alive:
+                state = "CAPTURE DOWN"
+                blind_any = True
+            else:
+                state = "reporting"
             print(f"{r.sensor_id:16s} {state:14s} {_dur(age) + ' ago':12s} "
                   f"{r.clock_skew:+7.1f}s {r.batches:8d} {r.records:9d}")
         print()
         print("A sensor that stops reporting does not mean its cameras are "
               "down — it means this collector cannot see that segment. Its "
               "camera rows read 'unknown' rather than their last state.")
+        if blind_any:
+            print("BLIND / CAPTURE DOWN: the link is fine but that sensor "
+                  "reports its own capture is not seeing traffic. Its "
+                  "camera states and availability are STALE, not current.")
     finally:
         store.close()
     return 0
@@ -485,7 +589,14 @@ def cmd_relay(args: argparse.Namespace) -> int:
         print(f"  dropped       {st.dropped_size} over size, "
               f"{st.dropped_age} over age, {st.dropped_stale} rejected")
     if state.last_error:
-        print(f"  last error    {state.last_error}")
+        # Stripped, not printed raw. This string is built from the
+        # collector's response body, and the collector echoes
+        # agent-supplied values into its own error text — so a
+        # terminal-escape payload had a path to an operator's screen,
+        # where it can clear it and print a reassuring lie. The
+        # agent->collector direction already strips control
+        # characters; this direction had no counterpart.
+        print(f"  last error    {_printable(state.last_error)}")
     return 0
 
 
@@ -502,9 +613,13 @@ def _cert_fingerprint(path: str) -> str:
 
 def cmd_baselines(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
-    store = HoundStore(path=cfg.store.path)
+    # Read-only for the listing, writable only for the reset flags.
+    # `--reset`/`--reset-all` genuinely delete rows, so they are the
+    # one path here that is not a diagnostic.
+    writes = bool(args.reset_all or args.reset)
+    store = (HoundStore(path=cfg.store.path) if writes else _ro_store(cfg))
     try:
-        if args.reset_all or args.reset:
+        if writes:
             target = None if args.reset_all else args.reset
             n = store.delete_baselines(camera_ip=target)
             label = "all cameras" if args.reset_all else target
@@ -552,7 +667,7 @@ def cmd_baselines(args: argparse.Namespace) -> int:
 
 def cmd_snapshots(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
-    store = HoundStore(path=cfg.store.path)
+    store = _ro_store(cfg)
     try:
         rows = store.list_snapshots(limit=args.limit)
         if not rows:
@@ -591,13 +706,22 @@ def cmd_prune(args: argparse.Namespace) -> int:
             kwargs["outages_older_than"] = now - args.outages_days * 86400.0
         if args.sessions_days is not None:
             kwargs["sessions_older_than"] = now - args.sessions_days * 86400.0
-        if not kwargs:
+        if args.relay_days is None and not kwargs:
             sys.exit(
                 "no cutoff given. specify one or more of --flows-days, "
                 "--alerts-days, --notifications-days, --outages-days, "
-                "--sessions-days",
+                "--sessions-days, --relay-days",
             )
-        deleted = store.prune(**kwargs)
+        deleted = store.prune(**kwargs) if kwargs else {}
+        if args.relay_days is not None:
+            # The relayed tables had no manual cutoff at all: only the
+            # daemon's own sweep touched them, so an operator whose
+            # store a sensor had inflated could not reclaim it without
+            # the daemon running — and while it is inflated the
+            # collector answers 507 to EVERY sensor. `prune_remote`
+            # also VACUUMs, so this gives bytes back and not just rows.
+            deleted.update(
+                store.prune_remote(now - args.relay_days * 86400.0))
         if not any(deleted.values()):
             print("nothing to prune")
         else:
@@ -800,6 +924,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="delete CLOSED outage rows older than N days")
     p_p.add_argument("--sessions-days", type=float,
                      help="delete ENDED monitor session rows older than N days")
+    p_p.add_argument("--relay-days", type=float,
+                     help="delete relayed (remote_*) rows older than N days, "
+                          "by when this collector received them, and reclaim "
+                          "the space")
     p_p.set_defaults(func=cmd_prune)
 
     p_w = sub.add_parser("web", help="serve the local dashboard")
@@ -837,6 +965,17 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
+        return 2
+    except sqlite3.Error as e:
+        # A damaged or unreadable store surfaces on the first QUERY,
+        # not at connect — `mode=ro` opens lazily — so neither the
+        # constructor guard nor a per-command try/except catches it.
+        # An operator diagnosing a store problem should not have to
+        # read a traceback to learn the store is the problem. `export`
+        # handles its own, because its contract is a document.
+        print(f"error: cannot read the store: {e}. If it is damaged, "
+              f"stop the daemon and check it with `sqlite3 <path> "
+              f"'PRAGMA integrity_check'`.", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130

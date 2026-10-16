@@ -73,14 +73,30 @@ _MAX_RECORDS_PER_KIND = 1000
 _REPLAY_PACE_S = 2.5
 # Budget for draining the spool on a clean shutdown. NOT a hard
 # bound on elapsed time: the deadline is checked BETWEEN batches, so
-# a post that starts just under it can still run to the socket
-# timeout. Measured 25.6s typical against this 20s budget, and ~45s
-# worst case (20 budget + a ~20s post timeout + one 2.5s pace). That
-# is inside systemd's 90s default TimeoutStopSec, which is the number
-# that actually matters; anything longer gets SIGKILLed mid-drain.
+# a post that starts just under it can still run on.
+#
+# `post_batch` uses a 10s socket timeout (`_POST_TIMEOUT_S`), and a
+# socket timeout is PER OPERATION — connect, handshake, write, each
+# read — so even 10s is not a bound on one post, only on one of its
+# steps. Typical measured shutdown is 25.6s against this 20s budget;
+# the realistic worst case is this budget plus one wedged post plus
+# one 2.5s pace. `stop()` adds a 15s join before any of it.
+#
+# What actually has to hold is that nothing OBSERVED is lost, and
+# that does not depend on finishing: `daemon.run()` drains and writes
+# in-RAM flows BEFORE calling `final_flush`, and whatever does not
+# get sent stays spooled for the next run. Both supervisors give more
+# room than the worst case (systemd 90s by default; the Docker agent
+# sets stop_grace_period: 90s for this reason).
 _FINAL_FLUSH_BUDGET_S = 20.0
 # How often a persistently unreachable collector is re-reported.
 _LINK_LOG_EVERY_S = 3600.0
+# Socket timeout for one post. Named so the shutdown-budget comment
+# above can refer to the real number — it used to quote "~20s", which
+# was not this value or any other in the file.
+_POST_TIMEOUT_S = 10.0
+# Longest a deadline-bearing flush will wait for the lock.
+_FLUSH_LOCK_WAIT_S = 5.0
 # Body-size self-limit. Mirrors the collector's documented
 # [relay].max_body_bytes default; the margin leaves room for
 # `restamp`, which rewrites the timestamp after the size is measured.
@@ -322,9 +338,24 @@ class Spool:
             if not line.strip():
                 continue
             try:
-                out.append(json.loads(line))
+                rec = json.loads(line)
             except json.JSONDecodeError:
                 continue          # a torn tail line; drop it rather than die
+            # Shape, not just syntax. A line that parses but is not a
+            # batch — `5`, or a dict missing "at" — used to reach
+            # `e["at"]` and `e.get()` downstream and raise
+            # TypeError/KeyError/AttributeError. `hound relay` is the
+            # command specified to work when things are broken, and it
+            # exited 1 with no output at all; the same two functions
+            # are on the daemon's append/pending/ack path. The
+            # counters file was already defended against exactly this
+            # and the spool was not.
+            if (not isinstance(rec, dict)
+                    or not isinstance(rec.get("at"), (int, float))
+                    or not isinstance(rec.get("body"), str)
+                    or not isinstance(rec.get("seq"), int)):
+                continue
+            out.append(rec)
         self._note_oldest(out)
         return out
 
@@ -628,7 +659,7 @@ def exclusion_filter(url: str) -> str:
 
 def post_batch(
     url: str, body: bytes, key: str, sensor_id: str, seq: int,
-    fingerprints: list[str], timeout: float = 10.0,
+    fingerprints: list[str], timeout: float = _POST_TIMEOUT_S,
 ) -> tuple[int, dict]:
     """POST one batch, pinning the collector's certificate.
 
@@ -695,10 +726,17 @@ class RelayClient:
         self.spool = Spool(base, cfg.spool_max_bytes, cfg.spool_max_age_seconds)
         self._lock = threading.Lock()
         self._flush_lock = threading.Lock()
-        # When the link first went down, and when we last said so.
-        # See `_note_link`.
+        # Link-health logging state. See `_note_link`.
+        #   _link_down_since: start of the CURRENT outage, or None
+        #   _link_logged_at:  last time we said anything — NEVER reset
+        #                     by a recovery, or a flap defeats the rate
+        #                     limit entirely
+        #   _link_warned:     did we report the current outage
+        #   _link_flaps:      outages since the last report
         self._link_down_since: float | None = None
         self._link_logged_at = 0.0
+        self._link_warned = False
+        self._link_flaps = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -738,6 +776,17 @@ class RelayClient:
             wm.outage_id, open_ids=wm.open_outage_ids, limit=per_kind)
         devices = self.store.devices_changed_since(
             wm.reported_at, limit=per_kind)
+        if len(devices) >= per_kind:
+            # Deferred, not dropped — see `_advance`, which holds the
+            # devices cursor at the newest `last_seen` actually sent so
+            # the remainder arrives next cycle. Said out loud anyway,
+            # because until it drains the collector's device list is
+            # incomplete and an operator comparing the two will notice.
+            log.info(
+                "relay: device list hit the %d-record batch limit; the "
+                "remainder follows in the next batch. Raise [relay] "
+                "max_records_per_batch on both ends if this is "
+                "routine.", per_kind)
         # Capped like every other collector here. uptime_report returns
         # one row per camera with no limit, so a sensor with more
         # cameras than the collector's max_records_per_batch had EVERY
@@ -804,7 +853,9 @@ class RelayClient:
                 for u in uptime
             ],
             "monitor": self._monitor(),
-        }, _advance(wm, flows, alerts, outages, self.now())
+        }, _advance(wm, flows, alerts, outages, self.now(),
+                    devices=devices,
+                    devices_truncated=len(devices) >= per_kind)
 
     def cfg_report_window(self) -> float:
         return 86400.0
@@ -904,30 +955,43 @@ class RelayClient:
         Rate-limited rather than per-cycle. At the 30s default a
         per-cycle warning is 2,880 identical lines a day, which is how
         an operator learns to filter the channel alerts arrive on.
-        First failure, then hourly, then recovery.
+
+        THE LIMITER MUST SURVIVE A RECOVERY. Clearing it on success
+        made every outage "the first", so a link failing on alternate
+        cycles logged a warning AND a recovery every time: measured 39
+        warnings and 38 infos in 40 cycles, about 5,544 lines a day —
+        roughly twice the volume the limiter was added to prevent, and
+        each warning also re-parses the whole spool for its figures.
+        So `_link_logged_at` is never reset; a flap is reported as a
+        count inside the next due message instead.
         """
         now = self.now()
         if ok:
             if self._link_down_since is not None:
-                log.info("relay: collector reachable again after %.0fs; "
-                         "%d spooled batch(es) remain",
-                         now - self._link_down_since,
-                         self.spool.stats(now).pending)
+                if self._link_warned:
+                    log.info("relay: collector reachable again after "
+                             "%.0fs; %d spooled batch(es) remain",
+                             now - self._link_down_since,
+                             self.spool.stats(now).pending)
+                    self._link_warned = False
                 self._link_down_since = None
-                self._link_logged_at = 0.0
             return
-        first = self._link_down_since is None
-        if first:
+        if self._link_down_since is None:
             self._link_down_since = now
-        if first or (now - self._link_logged_at) >= _LINK_LOG_EVERY_S:
+            self._link_flaps += 1
+        if (now - self._link_logged_at) >= _LINK_LOG_EVERY_S:
             self._link_logged_at = now
+            self._link_warned = True
             st = self.spool.stats(now)
+            flaps = (f" {self._link_flaps} separate outage(s) since the "
+                     f"last report." if self._link_flaps > 1 else "")
+            self._link_flaps = 0
             log.warning(
                 "relay: collector unreachable for %.0fs — spooling "
                 "(%d batch(es), %d bytes, oldest %.0fs; dropped "
-                "age=%d size=%d). Last error: %s",
+                "age=%d size=%d).%s Last error: %s",
                 now - self._link_down_since, st.pending, st.bytes,
-                st.oldest_age, st.dropped_age, st.dropped_size,
+                st.oldest_age, st.dropped_age, st.dropped_size, flaps,
                 detail or self.state.last_error or "unknown")
 
     def flush(self, deadline: float | None = None,
@@ -935,15 +999,35 @@ class RelayClient:
         """Try to deliver everything spooled. True if the spool emptied.
 
         Serialised. `stop()` clears `_thread` even when its join times
-        out — a post can sit in a socket timeout for ~20s — so the
+        out — a post can sit in a socket timeout, which is per
+        operation and so not a bound on the post as a whole — so the
         pusher could still be inside `post_batch` when `final_flush`
         began. Both then posted the same batch, the loser took the
         409, and `spool.drop()` recorded a DELIVERED batch as
         discarded. A lock is the only thing that makes that
         impossible, rather than unlikely.
         """
-        with self._flush_lock:
+        # Bounded on the shutdown path. The lock itself has no
+        # timeout, and a socket timeout is per operation rather than
+        # per post, so `final_flush` could wait here behind a wedged
+        # post with no bound at all — on the one path where a
+        # supervisor is already counting down to SIGKILL. Nothing
+        # observed is lost either way (the daemon drains and writes
+        # in-RAM flows BEFORE calling this, and whatever is unsent
+        # stays spooled), but blocking achieves nothing: the pusher
+        # holding the lock is posting the same spool we would.
+        if deadline is None:
+            with self._flush_lock:
+                return self._flush_locked(deadline, ignore_stop)
+        wait = max(0.0, min(_FLUSH_LOCK_WAIT_S, deadline - self.now()))
+        if not self._flush_lock.acquire(timeout=wait):
+            log.info("relay: another flush is still in progress at "
+                     "shutdown; the spool stays for the next run")
+            return False
+        try:
             return self._flush_locked(deadline, ignore_stop)
+        finally:
+            self._flush_lock.release()
 
     def _flush_locked(self, deadline: float | None,
                       ignore_stop: bool) -> bool:
@@ -1026,8 +1110,18 @@ class RelayClient:
                 self.state.last_error = f"{status}: {payload.get('error','')}"[:300]
                 self.state.save()
             else:
-                self.state.last_error = f"{status}: {payload.get('error','')}"[:300]
+                # 500/502/503/507 and anything else unforeseen: the
+                # collector ANSWERED, so no exception was raised and the
+                # link-down log never fired. The agent spooled in total
+                # silence while the README's troubleshooting table told
+                # the operator to look for exactly that line — and 507
+                # (collector out of disk) is documented there as a
+                # normal transient, so this was the likeliest refusal of
+                # the set to be hit and the one least likely to be seen.
+                err = f"{status}: {payload.get('error','')}"[:300]
+                self.state.last_error = err
                 self.state.save()
+                self._note_link(False, err)
                 ok = False
                 break
         return ok
@@ -1066,8 +1160,9 @@ class RelayClient:
         self.stop()
         # Bounded. With pacing, a day's spool is thousands of batches
         # and a full drain would hold shutdown for the best part of an
-        # hour — systemd SIGKILLs at its 90s default, so "finish the
-        # backlog" was never going to happen anyway. Send what fits;
+        # hour — supervisors SIGKILL well before that (systemd 90s by
+        # default, and the Docker agent sets stop_grace_period: 90s),
+        # so "finish the backlog" was never going to happen anyway. Send what fits;
         # the rest stays spooled for the next run, which is what the
         # spool is for.
         # Deliberately NOT self._stop.clear(). If the pusher's join
@@ -1083,13 +1178,56 @@ class RelayClient:
             log.exception("relay: final flush failed")
 
 
-def _advance(wm: Watermark, flows, alerts, outages, now: float) -> Watermark:
+def _advance(wm: Watermark, flows, alerts, outages, now: float,
+             devices=(), devices_truncated: bool = False) -> Watermark:
+    """The cursor for the records ACTUALLY INCLUDED in this batch.
+
+    `reported_at` is the devices cursor, and advancing it to `now`
+    unconditionally is what made device truncation permanent loss
+    rather than deferral: `devices_changed_since` is
+    `WHERE last_seen >= ? LIMIT ?`, so anything past the limit was
+    skipped and then fell behind the cursor. Measured at stock
+    defaults with 600 devices and a batch that needed halving, 100
+    devices were never relayed on any cycle. `uptime` recovers
+    because it is recomputed from scratch each cycle; a device whose
+    `last_seen` never moves again does not — and a camera that has
+    just gone silent is exactly that device.
+
+    So when the device list was cut off, resume from the newest
+    `last_seen` we did send instead of from now.
+    """
+    reported_at = now
+    if devices_truncated and devices:
+        high = max(d["last_seen"] for d in devices)
+        if high > wm.reported_at:
+            reported_at = high
+        else:
+            # More devices share one `last_seen` than fit in a batch,
+            # so there is no cursor that makes progress. Advancing is
+            # the lesser evil — holding it would re-send the same
+            # prefix forever and relay nothing new at all.
+            log.warning(
+                "relay: %d devices share the same last_seen and do not "
+                "fit in one batch; the remainder cannot be relayed. "
+                "Raise [relay] max_body_bytes and max_records_per_batch "
+                "on both ends.", len(devices))
     return Watermark(
         flow_id=max([wm.flow_id] + [f["id"] for f in flows]),
         alert_id=max([wm.alert_id] + [a["id"] for a in alerts]),
         outage_id=max([wm.outage_id] + [o["id"] for o in outages]),
-        # Carry forward only the ones still open, so each close costs
-        # exactly one extra send and the list drains by itself.
-        open_outage_ids=[o["id"] for o in outages if o.get("up_at") is None],
-        reported_at=now,
+        # Carry forward every id we have not yet seen closed, not just
+        # the ones in THIS batch. An open outage crowded out of a
+        # cycle used to drop off the list, and if it closed while
+        # absent it matched none of the query's three terms ever again
+        # — id below the cursor, `up_at` no longer null, not in the
+        # carry-forward list — so the close was never transmitted and
+        # the collector showed that camera down forever. That is the
+        # exact failure this list exists to prevent, reachable by
+        # truncation rather than by logic.
+        open_outage_ids=sorted(
+            (set(wm.open_outage_ids)
+             | {o["id"] for o in outages if o.get("up_at") is None})
+            - {o["id"] for o in outages if o.get("up_at") is not None}
+        ),
+        reported_at=reported_at,
     )
