@@ -608,6 +608,18 @@ class RelayClient:
 
     # ----- collection -----
 
+    def _per_kind(self) -> int:
+        """Records per kind this agent will send.
+
+        Taken from its OWN config so that lowering the limit on both
+        ends actually works. A collector cap below this rejects 400,
+        which the agent treats as terminal — permanent silent loss —
+        so the two must be configured together.
+        """
+        cap = getattr(self.cfg, "max_records_per_batch", 0) or 0
+        return min(cap, _MAX_RECORDS_PER_KIND) if cap > 0 \
+            else _MAX_RECORDS_PER_KIND
+
     def collect(self) -> tuple:
         """Everything new since the last successful push."""
         wm = self.state.watermark
@@ -625,8 +637,9 @@ class RelayClient:
         all_uptime = self.store.uptime_report(
             self.cfg_report_window(), self.now(),
         )
-        uptime = all_uptime[:_MAX_RECORDS_PER_KIND]
-        if len(all_uptime) > _MAX_RECORDS_PER_KIND:
+        per_kind = self._per_kind()
+        uptime = all_uptime[:per_kind]
+        if len(all_uptime) > per_kind:
             # `uptime_report` is ORDER BY ip, so a plain prefix hides
             # the SAME high-sorted cameras on every cycle — they would
             # be permanently invisible on the collector, which gets no
@@ -636,8 +649,8 @@ class RelayClient:
                 "relay: %d cameras to report but only %d fit in a batch; "
                 "%d are NOT being relayed and will not appear on the "
                 "collector. Raise [relay] max_records_per_batch on both "
-                "ends.", len(all_uptime), _MAX_RECORDS_PER_KIND,
-                len(all_uptime) - _MAX_RECORDS_PER_KIND)
+                "ends.", len(all_uptime), per_kind,
+                len(all_uptime) - per_kind)
         return {
             "devices": [
                 {"ip": d["ip"], "role": d["role"], "first_seen": d["first_seen"],

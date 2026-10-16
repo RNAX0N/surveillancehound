@@ -306,6 +306,11 @@ keep      = 5
 #                                    # shown. Dedup bounds repeats of one
 #                                    # alert; this bounds distinct ones.
 # max_rows_per_sensor   = 250000   # per table, oldest trimmed first; 0 = no cap
+# NOTE on collector memory: peak is roughly (concurrent ingest workers)
+# x max_body_bytes. The listener caps workers at 4 deliberately — the
+# expensive part of ingest is pure-Python CPU that competes with packet
+# capture under the GIL, so more workers cost capture, not throughput.
+#
 # max_records_per_batch = 5000     # PER KIND, and there are five kinds.
 #                                  # This bounds how long one batch holds
 #                                  # the store lock — which the packet

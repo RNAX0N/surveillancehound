@@ -87,6 +87,14 @@ _INGEST_REBIND_EVERY_S = 60.0
 _RELAY_DEDUP_MAX = 4096
 
 
+class _NullCtx:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+_NULL_CTX = _NullCtx()
+
+
 @dataclass
 class RunStats:
     packets_seen: int = 0
@@ -940,6 +948,18 @@ class Hound:
             total, "; ".join(f"{n} {why}" for n, why in causes if n),
         )
 
+    def _relay_store(self):
+        """Serialise the dispatch worker's store access with ingest's.
+
+        One extra thread is bounded contention, but the claim was that
+        ALL relayed store access is serialised, and these three calls
+        were outside it — remote-driven work competing with the tick
+        for HoundStore._lock.
+        """
+        if self.ingest is not None and hasattr(self.ingest, "_write_slot"):
+            return self.ingest._write_slot
+        return _NULL_CTX
+
     def _dispatch_relayed_alert(self, sensor_id: str, raw: dict,
                                 instance_id: str = "") -> None:
         """Dispatch one relayed alert.
@@ -985,7 +1005,8 @@ class Hound:
         #    collector time — never the sensor-supplied ts, which would
         #    let a backdated alert walk past the window.
         if sent is None:
-            last = self.store.remote_alert_last_at(
+            with self._relay_store():
+                last = self.store.remote_alert_last_at(
                 sensor_id, raw["dedup_key"],
                 exclude_remote_id=raw["remote_id"],
             )
@@ -1016,8 +1037,9 @@ class Hound:
             severity=raw["severity"], summary=raw["summary"],
             detail=raw["detail"], dedup_key=key, sensor=sensor_id,
         )
-        remote_id = self.store.remote_alert_id_for(
-            sensor_id, raw["remote_id"], instance_id)
+        with self._relay_store():
+            remote_id = self.store.remote_alert_id_for(
+                sensor_id, raw["remote_id"], instance_id)
 
         # Audit every attempt, not just the successful ones. A relayed
         # alert that failed to deliver is exactly the row an operator
@@ -1036,7 +1058,9 @@ class Hound:
                     "stored row was already trimmed by the quota; no "
                     "audit row written", _sid)
                 return
-            self.store.record_remote_notification(_sid, _rid, channel, ok, err)
+            with self._relay_store():
+                self.store.record_remote_notification(
+                    _sid, _rid, channel, ok, err)
 
         self.dispatcher.dispatch(alert, None, on_attempt=_audit)
         # Counted separately: mixing relayed dispatches into

@@ -94,7 +94,25 @@ def check_container_budget(body: bytes,
 
     Counts outside of strings so a payload of literal brackets in a
     summary field cannot trip it.
+
+    THIS DOES NOT BOUND MEMORY, and it is worth being precise about
+    what it does: it kills the ~25x amplification of a body made of
+    empty containers. A container-SPARSE but memory-dense body —
+    `["ab","ab",...]` is two containers and ~110 MB parsed — walks
+    straight past it. That case is bounded instead by
+    `max_workers x max_body_bytes` on the listener, which is why the
+    worker ceiling is small. Measured at 4 workers: ~242 MB peak for
+    the worst shape found, against 1 GB+ at 32.
     """
+    # Fast path, in C. Counting every delimiter INCLUDING those inside
+    # strings can only over-count, so if even that total is within
+    # budget the body is certainly fine. A legitimate batch takes this
+    # path, which matters: the careful scan below is a per-byte Python
+    # loop that cost as much as the validator itself, on the pre-store
+    # path that is already starving packet capture for CPU.
+    if body.count(b"[") + body.count(b"{") <= limit:
+        return
+
     n = 0
     in_str = False
     escaped = False
@@ -129,6 +147,14 @@ def loads_strict(body: bytes) -> Any:
 
     try:
         return json.loads(body.decode("utf-8"), parse_constant=_reject)
+    except RecursionError:
+        # Deeply nested input blows the parser's stack. Left to escape,
+        # it reached the handler's catch-all as a 500 — and the agent
+        # retries 500s from the spool forever, so one malformed body
+        # wedged the head of the queue permanently. Same defect the
+        # _MAX_SEQ guard exists for: a parse failure is the client's
+        # fault and has to say so with a 4xx.
+        raise ValidationError("body is nested too deeply to parse") from None
     except UnicodeDecodeError as e:
         raise ValidationError(f"body is not valid UTF-8: {e}") from None
     except json.JSONDecodeError as e:
@@ -412,7 +438,12 @@ def validate_records(raw: Any, max_per_kind: int) -> dict:
         items = r.get(kind, [])
         if not isinstance(items, list):
             raise ValidationError(f"records.{kind}: expected a list")
-        if len(items) > max_per_kind:
+        # 0 (or less) means no cap, matching remote_retention_days,
+        # max_rows_per_sensor and min_free_disk_mb three lines away in
+        # hound.toml.example. It previously meant "reject everything",
+        # so an operator following the documented convention got a
+        # collector that 400'd every batch while config-check smiled.
+        if max_per_kind > 0 and len(items) > max_per_kind:
             raise ValidationError(
                 f"records.{kind}: {len(items)} records exceeds the "
                 f"per-kind cap of {max_per_kind}"

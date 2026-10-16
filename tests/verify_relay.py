@@ -272,11 +272,26 @@ def _check_relay_config() -> None:
         f"per kind, relay sends {_MAX_RECORDS_PER_KIND}. If relay's is "
         f"larger, the collector floor no longer protects anything."
     )
-    rejects({"mode": "collector", "listen_host": "88.255.5.1",
-             "max_records_per_batch": 1000,
-             "sensor": [{"id": "a", "key": "shared-secret-abcdef"}]},
-            "a collector cap below what an agent sends")
-    print("  config: 15 relay guards hold; mode defaults to off")
+    # 0 means NO CAP, matching remote_retention_days /
+    # max_rows_per_sensor / min_free_disk_mb. It used to mean "reject
+    # every batch", so an operator following the documented convention
+    # got permanent silent loss with a clean config-check.
+    assert V.validate_records({"alerts": [{
+        "remote_id": 1, "ts": 1.79e9, "device_ip": "10.0.0.1",
+        "kind": "new_device", "severity": "low", "summary": "x",
+        "detail": "", "dedup_key": "k",
+    }]}, 0)["alerts"], "max_records_per_batch=0 must mean unlimited"
+
+    # A LOW cap is allowed: lowering it is the remedy hound.toml.example
+    # recommends for bounding per-batch cost, so a hard floor outlawed
+    # the documented mitigation. The agent sizes its own batches from
+    # its own cap instead, so lowering both ends works.
+    low = load({"mode": "collector", "listen_host": "88.255.5.1",
+                "max_records_per_batch": 100,
+                "sensor": [{"id": "a", "key": "shared-secret-abcdef"}]})
+    assert low.relay.max_records_per_batch == 100
+    print("  config: 15 relay guards hold; mode defaults to off; 0 means "
+          "unlimited")
 
 
 def _check_key_never_printed() -> None:
@@ -1544,7 +1559,30 @@ def _check_parse_amplification_bounded() -> None:
 
     # Brackets inside a string are data, not structure.
     V.check_container_budget(_json.dumps({"summary": "[{" * 100000}).encode())
-    print(f"  parse budget: dense bodies refused before allocation; a full "
+    # Deep nesting must be a 4xx, not a 500. The agent retries 500s
+    # from the spool forever, so one malformed body wedged the head of
+    # the queue permanently.
+    try:
+        V.loads_strict(b"[" * 140000)
+        raise AssertionError("140k nesting levels parsed")
+    except V.ValidationError:
+        pass
+    except RecursionError:
+        raise AssertionError(
+            "RecursionError escaped loads_strict; it reaches the "
+            "handler's catch-all as a 500, and the agent retries 500s "
+            "forever"
+        ) from None
+
+    # Memory-dense but container-sparse shapes: the budget counts
+    # containers, so these are bounded by max_body_bytes and the
+    # worker ceiling rather than by the scan. Asserted so the limit of
+    # the mechanism is written down rather than assumed away.
+    two_containers = b'["' + b'ab","' * 200 + b'ab"]'
+    V.check_container_budget(two_containers)
+
+    print(f"  parse budget: dense bodies refused before allocation; deep "
+          f"nesting is a 400 not a 500; a full "
           f"{len(full) // 100000 / 10:.1f} MB batch still accepted")
 
 
@@ -1984,7 +2022,6 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
             self._slots = __import__("threading").BoundedSemaphore(4)
             self._per_source = {}
             self._src_lock = __import__("threading").Lock()
-            self._active = 0
             self.rejected_overload = 0
 
         def shutdown_request(self, request):
@@ -2012,11 +2049,31 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
     assert srv._per_source.get("10.0.0.9", 0) == 0, (
         f"per-source count leaked on spawn failure: {srv._per_source}"
     )
-    assert srv.active_handlers() == 0, (
-        f"in-flight handler count leaked on spawn failure "
-        f"({srv.active_handlers()}); stop() waits on this, so a leak "
-        f"makes every shutdown take the full 10s timeout"
-    )
+    # And shutdown must not be extended by connections that are not
+    # doing work: an idle keep-alive, or a bare TCP SYN from an
+    # unauthenticated peer, used to add the full timeout to every
+    # restart — a remote host lengthening the blind window on its own
+    # schedule.
+    import socket as _sock
+
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.store import HoundStore as _HS
+    probe_store = _HS(path=tmp / "idleconn.sqlite")
+    probe = IngestServer(_collector_cfg(18993), probe_store)
+    assert probe.start()
+    try:
+        idle = _sock.create_connection(("127.0.0.1", 18993), timeout=5)
+        _t.sleep(0.3)
+        t0 = _t.time()
+        probe.stop()
+        took = _t.time() - t0
+        idle.close()
+        assert took < 3.0, (
+            f"stop() took {took:.1f}s with one idle connection and no "
+            f"batch in flight; shutdown must wait for work, not sockets"
+        )
+    finally:
+        probe_store.close()
     # Round-robin service: one sensor's backlog must not sit in front
     # of another sensor's page. Dropping was fixed earlier; DELAY is
     # the same silencing at a few seconds per channel.

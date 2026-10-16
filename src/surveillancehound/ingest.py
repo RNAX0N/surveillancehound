@@ -104,6 +104,14 @@ class IngestServer:
         # One relayed store user at a time. Named for what it guards:
         # access to HoundStore, not just writes.
         self._write_slot = threading.Semaphore(1)
+        # In-flight BATCHES, not open connections. Counting connections
+        # meant one idle keep-alive — or a bare TCP SYN from an
+        # unauthenticated peer — added the full shutdown timeout to
+        # every restart, and warned about a "current batch" that did
+        # not exist. Only work that could be mid-write matters here,
+        # because that is all a store close can damage.
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
         # Capture outranks relayed work; see relay.CaptureGate.
         self.gate = gate or relay.CaptureGate()
         self.started = False
@@ -162,10 +170,9 @@ class IngestServer:
         if self._httpd is not None:
             self._httpd.shutdown()
             deadline = time.time() + 10.0
-            while (self._httpd.active_handlers() > 0
-                   and time.time() < deadline):
+            while self.in_flight() > 0 and time.time() < deadline:
                 time.sleep(0.02)
-            left = self._httpd.active_handlers()
+            left = self.in_flight()
             if left:
                 log.warning(
                     "relay: %d ingest handler(s) still running after 10s; "
@@ -196,7 +203,20 @@ class IngestServer:
             return True
         return (st.f_bavail * st.f_frsize) >= (limit * 1024 * 1024)
 
+    def in_flight(self) -> int:
+        with self._inflight_lock:
+            return self._inflight
+
     def handle_batch(self, source: str, body: bytes, headers) -> tuple[int, dict]:
+        with self._inflight_lock:
+            self._inflight += 1
+        try:
+            return self._handle_batch(source, body, headers)
+        finally:
+            with self._inflight_lock:
+                self._inflight -= 1
+
+    def _handle_batch(self, source: str, body: bytes, headers) -> tuple[int, dict]:
         now = self.now()
 
         sensor_hint = str(headers.get(relay.SENSOR_HEADER, ""))[:128]
@@ -408,23 +428,39 @@ class _Server(ThreadingHTTPServer):
     # so anyone who can reach the port can exhaust threads and memory
     # without ever authenticating. This daemon is also doing packet
     # capture, so the ceiling keeps that failure on the relay.
-    max_workers = 32
+    # FOUR, not 32.
+    #
+    # The expensive part of ingest is pure-Python CPU that runs BEFORE
+    # any lock: hmac, the container scan, json.loads and
+    # validate_records, roughly 0.3s per max-size batch. Under the GIL
+    # that is not parallel work — it is 32 threads taking CPU away from
+    # the pcap parser and the watchdog tick, both of which are also
+    # pure Python. Measured, that starved the packet loop for seconds
+    # at a time and collapsed throughput ~15x, and no amount of lock
+    # ordering touched it, because the contention was never the lock.
+    #
+    # A collector serves a handful of sensors posting every
+    # batch_seconds (default 30), so four concurrent batches is already
+    # far more than the design needs; the ceiling exists to stop a
+    # hostile peer buying CPU, not to serve throughput. Agents retry
+    # from their spool, so refusing a connection costs delay, not data.
+    max_workers = 4
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self._slots = threading.BoundedSemaphore(self.max_workers)
         self._per_source: dict[str, int] = {}
-        self._active = 0
         self._src_lock = threading.Lock()
         self.rejected_overload = 0
 
-    # Per-source ceiling, enforced at ACCEPT time. The token-bucket rate
+    # Per-source ceiling, enforced at ACCEPT time. Two, so a single
+    # address cannot take the whole (now much smaller) pool. The token-bucket rate
     # limiter lives inside do_POST, which a peer only reaches after a
     # completed TLS handshake — so a single address could hold every
     # worker slot indefinitely by connecting and never finishing, and
     # legitimate sensors were refused ~90% of the time. The global
     # ceiling bounds resources; this one keeps one host from owning them.
-    max_per_source = 6
+    max_per_source = 2
 
     def process_request(self, request, client_address):
         source = client_address[0] if client_address else "?"
@@ -451,7 +487,6 @@ class _Server(ThreadingHTTPServer):
             return
         with self._src_lock:
             self._per_source[source] = self._per_source.get(source, 0) + 1
-            self._active += 1
         try:
             super().process_request(request, client_address)
         except BaseException:
@@ -465,13 +500,7 @@ class _Server(ThreadingHTTPServer):
             self._release(source)
             raise
 
-    def active_handlers(self) -> int:
-        with self._src_lock:
-            return self._active
-
     def _release(self, source: str) -> None:
-        with self._src_lock:
-            self._active -= 1
         self._slots.release()
         with self._src_lock:
             n = self._per_source.get(source, 1) - 1
