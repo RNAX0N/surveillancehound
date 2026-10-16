@@ -243,7 +243,15 @@ class IngestServer:
         with self._inflight_lock:
             self._inflight += 1
         try:
-            return self._handle_batch(source, body, headers)
+            status, payload = self._handle_batch(source, body, headers)
+            # Reserved slots are bought by a COMPLETED batch, not by a
+            # signature alone. Marking on verification meant a peer
+            # whose every batch was rejected 409 still earned the
+            # reservation — true of a replaying agent, and of anyone
+            # holding a key who wants the reserve without doing work.
+            if status == HTTPStatus.OK and self._httpd is not None:
+                self._httpd.mark_trusted(source)
+            return status, payload
         finally:
             with self._inflight_lock:
                 self._inflight -= 1
@@ -282,17 +290,7 @@ class IngestServer:
                         source, sensor_hint[:64])
             return HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"}
 
-        # This address has now proven it holds a key. That is what buys
-        # it the reserved slots; nothing a peer can do without the key
-        # gets it in here.
-        if self._httpd is not None:
-            with self._httpd._src_lock:
-                self._httpd._trusted[source] = time.monotonic()
-                if len(self._httpd._trusted) > 1024:
-                    cutoff = time.monotonic() - _TRUSTED_TTL
-                    for k in [k for k, v in self._httpd._trusted.items()
-                              if v < cutoff]:
-                        del self._httpd._trusted[k]
+
 
         try:
             # Before json.loads allocates: see validate.MAX_CONTAINERS.
@@ -499,13 +497,16 @@ class _Server(ThreadingHTTPServer):
         # source -> monotonic time of its last successful signature
         self._trusted: dict[str, float] = {}
         self._reaper_stop = threading.Event()
-        self._reaper = threading.Thread(
-            target=self._reap, name="hound-ingest-reaper", daemon=True)
-        self._reaper.start()
         self._slots = threading.BoundedSemaphore(self.max_workers)
         self._per_source: dict[str, int] = {}
         self._src_lock = threading.Lock()
         self.rejected_overload = 0
+        # Started LAST: it touches _src_lock, and starting it before
+        # that existed left it one scheduling accident away from dying
+        # on an AttributeError with no restart and no health signal.
+        self._reaper = threading.Thread(
+            target=self._reap, name="hound-ingest-reaper", daemon=True)
+        self._reaper.start()
 
     # Per-source ceiling, enforced at ACCEPT time, so one address
     # cannot take the whole pool. The token-bucket rate
@@ -587,6 +588,48 @@ class _Server(ThreadingHTTPServer):
             self._release(source)
             raise
 
+    # Hard ceiling on the proven-source table. A TTL-only prune is not
+    # a bound: a key holder posting from many addresses keeps every
+    # entry inside the TTL and the dict grows without limit, and the
+    # scan runs under the lock the ACCEPT path takes. `_RateLimiter`
+    # already learned this; the lesson did not get carried across.
+    max_trusted = 512
+
+    def active_slots(self) -> int:
+        """Worker slots currently held, by source accounting."""
+        with self._src_lock:
+            return sum(self._per_source.values())
+
+    def mark_trusted(self, source: str) -> None:
+        now = time.monotonic()
+        with self._src_lock:
+            self._trusted[source] = now
+            if len(self._trusted) <= self.max_trusted:
+                return
+            cutoff = now - _TRUSTED_TTL
+            for k in [k for k, v in self._trusted.items() if v < cutoff]:
+                del self._trusted[k]
+            # Still over: evict oldest. Losing a reservation costs a
+            # sensor one contested connection, never its data.
+            if len(self._trusted) > self.max_trusted:
+                excess = len(self._trusted) - self.max_trusted
+                for k in sorted(self._trusted, key=self._trusted.get)[:excess]:
+                    del self._trusted[k]
+
+    def rebind_conn(self, old, new) -> None:
+        """Track the wrapped socket instead of the raw one.
+
+        `ssl.wrap_socket` builds the SSLSocket from the raw socket's
+        fileno and then DETACHES it, leaving the object stored at
+        accept time with fileno == -1. Shutting that down raises
+        EBADF, so the reaper was closing nothing at all while
+        reporting that it had.
+        """
+        with self._src_lock:
+            due = self._deadlines.pop(old, None)
+            if due is not None:
+                self._deadlines[new] = due
+
     def _reap(self) -> None:
         """Close connections that have outstayed their budget.
 
@@ -601,15 +644,26 @@ class _Server(ThreadingHTTPServer):
             with self._src_lock:
                 stale = [c for c, due in self._deadlines.items() if due < now]
             for conn in stale:
-                with self._src_lock:
-                    self._deadlines.pop(conn, None)
-                log.warning(
-                    "relay: closing a connection that held an ingest slot "
-                    "for over %.0fs without completing a request", _CONN_BUDGET)
+                # Attempt FIRST, then report what actually happened. The
+                # previous version logged the close before trying it, so
+                # when the shutdown failed — which it always did — the
+                # collector told its operator a defence had fired that
+                # had not. A log line is a claim like any other.
+                closed = False
                 try:
                     conn.shutdown(socket.SHUT_RDWR)
+                    closed = True
                 except OSError:
                     pass
+                with self._src_lock:
+                    self._deadlines.pop(conn, None)
+                if closed:
+                    log.warning(
+                        "relay: closed a connection that held an ingest "
+                        "slot for over %.0fs without completing a request",
+                        _CONN_BUDGET)
+                else:
+                    log.debug("relay: budgeted connection was already gone")
 
     def _release(self, source: str) -> None:
         self._slots.release()
@@ -652,10 +706,13 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             # request timeout is for a peer that has proven something;
             # a peer that has not should not be able to hold a worker
             # slot for the full window just by opening a socket.
+            raw = self.request
             self.request.settimeout(_HANDSHAKE_TIMEOUT)
             self.connection = ctx.wrap_socket(self.request, server_side=True)
             self.request = self.connection
             self.connection.settimeout(self.timeout)
+            if server._httpd is not None:
+                server._httpd.rebind_conn(raw, self.connection)
             super().setup()
 
         def log_message(self, fmt, *args):

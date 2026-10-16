@@ -80,6 +80,29 @@ The relay is built to survive a hostile agent — that is the threat
 model — but it is not a service to expose broadly, and nothing in it
 pretends otherwise.
 
+### What the collector does NOT defend against
+
+Written down because finding these in the field is worse than reading
+them here.
+
+- **A compromised agent can degrade the relay.** It holds a valid key,
+  so it can occupy ingest capacity from several addresses. Each
+  connection is time-bounded and each address is capped, so this is
+  slowdown rather than silence, and a starved sensor raises
+  `sensor_offline` after `sensor_timeout_seconds`. The remedy is to
+  remove that sensor's key from `[[relay.sensor]]` and restart;
+  `hound sensors --forget <id>` then clears what it sent.
+- **Agents behind one NAT share everything keyed on their address:**
+  the per-source connection cap, the batches-per-minute bucket, and
+  the reserved-capacity credit one of them earns. A hostile host
+  behind the same NAT as a real agent can therefore crowd it out
+  without holding any key. If you run more than a couple of agents
+  behind one address, give them distinct addresses, and treat that
+  NAT as part of the collector's trust boundary.
+- **An attacker on the agent host itself** can read the shared secret
+  out of `hound.toml`. Nothing on the collector helps with that; it is
+  the agent host's own security boundary.
+
 ## Why host networking
 
 `network_mode: host` is required, not a convenience. A bridged container

@@ -2130,6 +2130,57 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
     finally:
         h2.store.close()
 
+    # The reaper must actually close the socket, not merely log that
+    # it did. `ssl.wrap_socket` DETACHES the raw socket it is given,
+    # so the object captured at accept time has fileno == -1: the
+    # shutdown raised EBADF, was swallowed, and the collector logged a
+    # defence that had never fired. A warning is a claim like any
+    # other.
+    import socket as _sk
+    import ssl as _ssl
+
+    import surveillancehound.ingest as _ing
+    from surveillancehound.store import HoundStore as _HS2
+
+    saved_budget = _ing._CONN_BUDGET
+    _ing._CONN_BUDGET = 3.0
+    reap_store = _HS2(path=tmp / "reaper.sqlite")
+    reaper_srv = IngestServer(_collector_cfg(18994), reap_store)
+    assert reaper_srv.start()
+    try:
+        cctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+        cctx.check_hostname = False
+        cctx.verify_mode = _ssl.CERT_NONE
+        sock = _sk.create_connection(("127.0.0.1", 18994), timeout=30)
+        tls = cctx.wrap_socket(sock, server_hostname="x")
+        tls.sendall(b"POST /ingest/v1 HTTP/1.1\r\nHost: x\r\n"
+                    b"Content-Length: 100000\r\n\r\n")
+        cut = None
+        start = _t.time()
+        for _ in range(20):
+            try:
+                tls.sendall(b"a")
+                _t.sleep(0.5)
+            except OSError:
+                cut = _t.time() - start
+                break
+        assert cut is not None and cut < 10, (
+            f"a dribbling peer was never disconnected (budget "
+            f"{_ing._CONN_BUDGET}s); it holds a worker slot forever "
+            f"while the reaper logs that it closed it"
+        )
+        assert reaper_srv._httpd.active_slots() == 0, (
+            "the reaped connection did not release its slot"
+        )
+        try:
+            tls.close()
+        except OSError:
+            pass
+    finally:
+        _ing._CONN_BUDGET = saved_budget
+        reaper_srv.stop()
+        reap_store.close()
+
     print("  shutdown: prompt with a full queue; slots released on spawn "
           "failure; round-robin service; budget spent only on enqueue")
 
