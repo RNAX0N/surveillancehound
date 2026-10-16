@@ -156,13 +156,20 @@ class Spool:
         self._now_hint = 0.0
 
     def _load_counters(self) -> None:
+        """Best effort. These are diagnostics; a damaged file must never
+        stop the monitor from starting, which is what a bare int() on a
+        hostile or truncated value did."""
         try:
             d = json.loads(self.counters_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        self.dropped_size = int(d.get("dropped_size", 0))
-        self.dropped_age = int(d.get("dropped_age", 0))
-        self.dropped_stale = int(d.get("dropped_stale", 0))
+            if not isinstance(d, dict):
+                return
+            self.dropped_size = int(d.get("dropped_size", 0))
+            self.dropped_age = int(d.get("dropped_age", 0))
+            self.dropped_stale = int(d.get("dropped_stale", 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            log.warning("relay: unreadable spool counters at %s; the "
+                        "drop totals restart from zero", self.counters_path)
+            self.dropped_size = self.dropped_age = self.dropped_stale = 0
 
     def _save_counters(self) -> None:
         """Best effort: a diagnostic counter is never worth failing a push."""
