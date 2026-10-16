@@ -197,6 +197,7 @@ class IngestServer:
             # The accept path needs the limiter: a source that burned
             # its budget is refused there, where refusing is cheapest.
             httpd.limiter = self._limiter
+            httpd.now_fn = self.now
         except OSError as e:
             log.error(
                 "relay: cannot bind %s:%s: %s — listener not started. The "
@@ -568,8 +569,14 @@ class _Server(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         source = client_address[0] if client_address else "?"
+        # The server's clock, not time.time(): `allow()` arms the
+        # cooldown using it, so checking against a different clock
+        # makes every cooldown look already-expired. Identical in
+        # production, where both are wall time — which is exactly why
+        # it would never have shown up there.
         limiter = getattr(self, "limiter", None)
-        if limiter is not None and limiter.in_cooldown(source, time.time()):
+        now_fn = getattr(self, "now_fn", time.time)
+        if limiter is not None and limiter.in_cooldown(source, now_fn()):
             self.rejected_overload += 1
             self.shutdown_request(request)
             return
@@ -832,10 +839,18 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             and in time: this runs only on the rate-limited path, so
             it cannot be used to hold a connection open.
             """
+            # `self.headers` may not exist yet: parse_request calls
+            # send_error for a malformed request line BEFORE assigning
+            # it, and this runs from that path. Without the guard the
+            # AttributeError was swallowed by the server's
+            # handle_error and the client got a silent close instead
+            # of its 400.
+            headers = getattr(self, "headers", None)
+            if headers is None:
+                return
             try:
-                remaining = min(int(self.headers.get("Content-Length") or 0),
-                                65536)
-            except (TypeError, ValueError):
+                remaining = min(int(headers.get("Content-Length") or 0), 65536)
+            except (TypeError, ValueError, AttributeError):
                 return
             if remaining <= 0:
                 return

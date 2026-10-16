@@ -740,15 +740,45 @@ def _check_listener_limits(tmp: Path) -> None:
                 f"an unknown HTTP verb skipped the request budget: "
                 f"{verb_codes}"
             )
+            # ...and exhausting it arms the accept-time cooldown, so
+            # the source is refused where refusing is cheapest rather
+            # than served another request cycle.
+            assert lim._limiter.in_cooldown("127.0.0.1", clock["t"]), (
+                "an unknown verb exhausted the budget without arming "
+                "the cooldown"
+            )
+            # Cooldown is armed from the runs above; clear it so this
+            # connection is accepted and we are testing the parse
+            # path rather than the limiter.
+            lim._limiter._cooldown.clear()
+            lim._limiter._hits.clear()
+
+            # A malformed request line must still get a status. The
+            # drain added to send_error touches self.headers, which
+            # parse_request has NOT assigned yet when it rejects a bad
+            # request line — the AttributeError was swallowed by the
+            # server's handle_error and the client saw a silent close.
+            import socket as _bsk
+            bad = _bsk.create_connection(("127.0.0.1", lim_port), timeout=10)
+            bw = _ssl._create_unverified_context().wrap_socket(
+                bad, server_hostname="x")
+            try:
+                bw.sendall(b"GARBAGE LINE WITH TOO MANY PARTS\r\n\r\n")
+                first = bw.recv(200).split(b"\r\n")[0]
+                assert first.startswith(b"HTTP/"), (
+                    f"a malformed request line got no status line "
+                    f"({first!r}); an exception was swallowed and the "
+                    f"connection closed silently"
+                )
+            finally:
+                try:
+                    bw.close()
+                except OSError:
+                    pass
+
             assert all(isinstance(c, int) for c in verb_codes[:3]), (
                 f"an unknown verb with a body was reset instead of "
                 f"answered: {verb_codes[:3]}"
-            )
-            # and the source is then refused at ACCEPT, where refusing
-            # is cheapest, rather than served another request cycle
-            assert lim._limiter.in_cooldown("127.0.0.1", clock["t"]), (
-                "a source over budget is not put in cooldown, so it can "
-                "keep buying request cycles at the rate it can send them"
             )
         finally:
             lim.stop()
@@ -2134,10 +2164,11 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
     from surveillancehound.ingest import IngestServer
     from surveillancehound.store import HoundStore as _HS
     probe_store = _HS(path=tmp / "idleconn.sqlite")
-    probe = IngestServer(_collector_cfg(18993), probe_store)
+    probe_port = _free_port()
+    probe = IngestServer(_collector_cfg(probe_port), probe_store)
     assert probe.start()
     try:
-        idle = _sock.create_connection(("127.0.0.1", 18993), timeout=5)
+        idle = _sock.create_connection(("127.0.0.1", probe_port), timeout=5)
         _t.sleep(0.3)
         t0 = _t.time()
         probe.stop()
@@ -2218,13 +2249,14 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
     saved_budget = _ing._CONN_BUDGET
     _ing._CONN_BUDGET = 3.0
     reap_store = _HS2(path=tmp / "reaper.sqlite")
-    reaper_srv = IngestServer(_collector_cfg(18994), reap_store)
+    reaper_port = _free_port()
+    reaper_srv = IngestServer(_collector_cfg(reaper_port), reap_store)
     assert reaper_srv.start()
     try:
         cctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
         cctx.check_hostname = False
         cctx.verify_mode = _ssl.CERT_NONE
-        sock = _sk.create_connection(("127.0.0.1", 18994), timeout=30)
+        sock = _sk.create_connection(("127.0.0.1", reaper_port), timeout=30)
         tls = cctx.wrap_socket(sock, server_hostname="x")
         tls.sendall(b"POST /ingest/v1 HTTP/1.1\r\nHost: x\r\n"
                     b"Content-Length: 100000\r\n\r\n")
@@ -2271,7 +2303,8 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
 
     if _fd_count() >= 0:
         leak_store = _HS2(path=tmp / "fdleak.sqlite")
-        leak_srv = IngestServer(_collector_cfg(18995), leak_store)
+        leak_port = _free_port()
+        leak_srv = IngestServer(_collector_cfg(leak_port), leak_store)
         assert leak_srv.start()
         try:
             lctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
@@ -2280,7 +2313,7 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
             before = _fd_count()
             for _ in range(40):
                 try:
-                    c = _sk.create_connection(("127.0.0.1", 18995), timeout=5)
+                    c = _sk.create_connection(("127.0.0.1", leak_port), timeout=5)
                     tw = lctx.wrap_socket(c, server_hostname="x")
                     tw.sendall(b"POST /nope HTTP/1.1\r\nHost: x\r\n"
                                b"Content-Length: 0\r\n\r\n")
