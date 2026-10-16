@@ -1,0 +1,14 @@
+# The agent image only needs src/. Everything else is build-context
+# weight — .git alone is most of it — and shipping repo history into a
+# container that watches a camera segment is gratuitous.
+.git
+.github
+deploy/dev
+docs
+tests
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+__pycache__
+*.pyc
+.venv

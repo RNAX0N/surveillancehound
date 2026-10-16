@@ -985,14 +985,23 @@ async function refresh() {
     // Local and relayed alerts in one list, newest first, each tagged
   // with the sensor that observed it. A collector that showed only its
   // own alerts would be hiding the segment the relay exists to watch.
+  // Sort on OUR clock. `ts` is supplied by the sensor, so sorting on it
+  // re-opens exactly what ordering remote_alerts by ingested_at closed:
+  // one alert dated 2099 pins itself above every local row, inflates the
+  // 24h count and makes "last seen" read 0s ago forever. Relayed rows
+  // carry ingested_at; local rows are authored here, so their ts IS our
+  // clock.
+  const atime = (a) => num(a.ingested_at || a.ts);
   const allAlerts = (alerts.alerts || [])
     .concat(alerts.remote_alerts || [])
-    .sort((a, b) => num(b.ts) - num(a.ts));
+    .sort((a, b) => atime(b) - atime(a));
   renderStatus(status, allAlerts, snapshots.snapshots);
     renderUptime(uptime);
     renderAlerts(allAlerts);
     renderDevices(devices.devices);
-    renderFlows(flows.flows);
+    renderFlows((flows.flows || []).concat(flows.remote_flows || [])
+    .sort((a, b) => num(b.ingested_at || b.last_seen) -
+                    num(a.ingested_at || a.last_seen)));
     renderBaselines(baselines.baselines);
     renderSnapshots(snapshots.snapshots);
   } catch (e) {
@@ -1152,6 +1161,7 @@ function renderFlows(flows) {
         <div class="row-top">
           <span class="ts">${fmtHM(f.last_seen)}</span>
           <span class="kind">${escapeHTML(f.classification)}</span>
+          <span class="dim">${escapeHTML(f.sensor || f.sensor_id || "local")}</span>
         </div>
         <div class="row-summary">
           ${escapeHTML(f.src_ip)}:${escapeHTML(f.src_port ?? "")}

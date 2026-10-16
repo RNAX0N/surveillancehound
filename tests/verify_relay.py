@@ -560,7 +560,10 @@ def _check_listener(tmp: Path) -> None:
     got_alerts = []
     srv = IngestServer(
         _collector_cfg(port), store,
-        on_alerts=lambda sid, al: got_alerts.append((sid, len(al))),
+        # *a: track the real signature. A stub pinned to an old one
+        # fails inside ingest's catch-all and reads as 'the
+        # callback never fired'.
+        on_alerts=lambda sid, al, *a: got_alerts.append((sid, len(al))),
         now=lambda: clock["t"],
     )
     assert srv.start(), "listener failed to start"
@@ -749,7 +752,7 @@ def _check_end_to_end(tmp: Path) -> None:
 
     dispatched = []
     srv = IngestServer(_collector_cfg(port), collector_store,
-                       on_alerts=lambda sid, al: dispatched.append((sid, len(al))),
+                       on_alerts=lambda sid, al, *a: dispatched.append((sid, len(al))),
                        now=now)
     assert srv.start(), "collector did not start"
 
@@ -1351,6 +1354,7 @@ def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
         hound.cfg.relay.max_notifications_per_minute = 5
         hound._relay_notify_times.clear()
         _Count.n = 0
+        burst = []
         for i in range(40):
             a = {
                 "remote_id": 2000 + i, "ts": real_now, "device_ip": "10.9.0.11",
@@ -1361,7 +1365,17 @@ def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
             store.ingest_remote_batch(
                 "burst", "inst", i + 1,
                 V.validate_records({"alerts": [a]}, 10), real_now)
-            hound._dispatch_relayed_alert("burst", a)
+            burst.append(a)
+        # Through the ENQUEUE path: the budget is applied there, because
+        # an item that has already taken a queue slot has already denied
+        # it to another sensor.
+        hound._on_relayed_alerts("burst", burst, "inst")
+        import queue as _q
+        while True:
+            try:
+                hound._dispatch_relayed_alert(*hound._relay_alertq.get_nowait())
+            except _q.Empty:
+                break
         burst_rows = store._conn.execute(
             "SELECT COUNT(*) c FROM remote_alerts WHERE sensor_id='burst'"
         ).fetchone()["c"]
@@ -1379,23 +1393,30 @@ def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
         # slowest channel takes.
         import queue as _queue
         hound.dispatcher.channels = []
-        hound.stats.relayed_alerts_dropped = 0
+        hound.stats.relayed_dropped_batch = 0
+        hound.stats.relayed_dropped_share = 0
+        hound.stats.relayed_dropped_queue = 0
+        hound.stats.relayed_dropped_budget = 0
         while True:
             try:
                 hound._relay_alertq.get_nowait()
             except _queue.Empty:
                 break
+        # Isolate the per-batch cap from the notification budget, which
+        # also admits at enqueue and would otherwise bind first.
+        hound.cfg.relay.max_notifications_per_minute = 0
+        hound._relay_inflight.clear()
         many = [dict(recs["alerts"][0], remote_id=100 + i, dedup_key=f"k{i}")
                 for i in range(500)]
-        hound._on_relayed_alerts("frigate", many)
+        hound._on_relayed_alerts("frigate", many, "inst")
         queued = hound._relay_alertq.qsize()
         assert queued == 200, (
             f"a single batch must be capped at 200 enqueued alerts so it "
             f"cannot starve other sensors; queued {queued}"
         )
-        assert hound.stats.relayed_alerts_dropped == 300, (
-            f"the overflow must be COUNTED, not silently discarded; "
-            f"counter says {hound.stats.relayed_alerts_dropped}"
+        assert hound.stats.relayed_dropped_batch == 300, (
+            f"the overflow must be COUNTED, and attributed to the right "
+            f"cause; batch counter says {hound.stats.relayed_dropped_batch}"
         )
         print("  relayed dispatch: ingest thread only enqueues; per-batch "
               "cap holds and overflow is counted")
@@ -1892,6 +1913,76 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
           "failure")
 
 
+def _check_instance_reset(tmp: Path) -> None:
+    """An agent that loses its state must not have its records swallowed.
+
+    `remote_id` is the agent's own rowid, so a wiped agent restarts at 1.
+    Keyed on (sensor_id, remote_id) alone, every colliding record was
+    dropped by ON CONFLICT, acked as accepted, and the agent advanced its
+    watermark past it — permanent loss on a documented operation
+    (`docker volume rm`), and trivially induced by anyone who can delete
+    a file on the camera-segment host the threat model assumes is
+    compromised. Outages were worse: DO UPDATE rewrote an unrelated
+    camera's outage window.
+    """
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "instance.sqlite")
+    try:
+        def alert(rid, summary, kind="new_device", sev="low"):
+            return V.validate_records({"alerts": [{
+                "remote_id": rid, "ts": T0, "device_ip": "10.0.0.5",
+                "kind": kind, "severity": sev, "summary": summary,
+                "detail": "", "dedup_key": f"dk-{summary}",
+            }]}, 10)
+
+        store.ingest_remote_batch("frigate", "INST-A", 1,
+                                  alert(1, "benign"), T0)
+        counts = store.ingest_remote_batch(
+            "frigate", "INST-B", 1,
+            alert(1, "firmware push", "bulk_inbound", "critical"), T0 + 10)
+        rows = store._conn.execute(
+            "SELECT instance_id, summary FROM remote_alerts ORDER BY id"
+        ).fetchall()
+        assert len(rows) == 2, (
+            f"a post-wipe alert was swallowed: {[tuple(r) for r in rows]}"
+        )
+        assert counts["alerts"] == 1, (
+            f"the ack must report rows actually INSERTED, not records "
+            f"submitted — the agent advances its watermark on this and "
+            f"never resends; got {counts['alerts']}"
+        )
+
+        # Outages: a reused id across instances must not rewrite another
+        # camera's window.
+        def outage(rid, cam, down, up):
+            return V.validate_records({"outages": [{
+                "remote_id": rid, "camera_ip": cam, "down_since": down,
+                "up_at": up, "last_seen_before": 0.0, "cause": "silence",
+            }]}, 10)
+
+        store.ingest_remote_batch("frigate", "INST-A", 2,
+                                  outage(7, "10.0.0.5", T0, None), T0)
+        store.ingest_remote_batch("frigate", "INST-B", 2,
+                                  outage(7, "10.0.0.99", T0 + 5000,
+                                         T0 + 5100), T0 + 20)
+        out = store._conn.execute(
+            "SELECT camera_ip, down_since, up_at FROM remote_outages "
+            "ORDER BY id").fetchall()
+        assert len(out) == 2, (
+            f"a reused outage id across instances rewrote the other "
+            f"camera's outage instead of inserting: {[tuple(o) for o in out]}"
+        )
+        first = dict(out[0])
+        assert first["camera_ip"] == "10.0.0.5" and first["up_at"] is None, (
+            f"the pre-wipe outage was corrupted: {first}"
+        )
+        print("  instance reset: post-wipe records stored, acked honestly, "
+              "and outage history not rewritten")
+    finally:
+        store.close()
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -1909,6 +2000,7 @@ def main() -> int:
         _check_remote_store(Path(td))
         _check_quarantine(Path(td))
         _check_resource_bounds(Path(td))
+        _check_instance_reset(Path(td))
         _check_relayed_dispatch_is_quarantined(Path(td))
         _check_sensor_offline_alerts(Path(td))
         _check_relayed_api_surface(Path(td))

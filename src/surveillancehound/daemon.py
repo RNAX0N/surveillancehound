@@ -93,7 +93,10 @@ class RunStats:
     flows_flushed: int = 0
     alerts_emitted: int = 0
     uptime_transitions: int = 0
-    relayed_alerts_dropped: int = 0
+    relayed_dropped_batch: int = 0      # over the per-batch cap
+    relayed_dropped_budget: int = 0     # over the per-sensor notify budget
+    relayed_dropped_share: int = 0      # over this sensor's queue share
+    relayed_dropped_queue: int = 0      # queue full outright
     started_at: float = 0.0
     stopped_at: float | None = None
 
@@ -183,6 +186,8 @@ class Hound:
         # (sensor_id, dedup_key) -> when we last DISPATCHED it
         self._relay_last_dispatch: dict[tuple, float] = {}
         self._relay_notify_times: dict[str, deque] = {}
+        self._relay_inflight: dict[str, int] = {}
+        self._relay_inflight_lock = threading.Lock()
         self._relay_budget_warned: dict[str, bool] = {}
         # Bounded hand-off from the ingest threads to one dispatch worker.
         self._relay_alertq: queue.Queue | None = (
@@ -635,33 +640,77 @@ class Hound:
         if tr.outage_id is not None and tr.kind in ("down", "never_seen"):
             self.store.set_outage_alert(tr.outage_id, alert_id)
 
-    def _on_relayed_alerts(self, sensor_id: str, alerts: list[dict]) -> None:
+    def _on_relayed_alerts(self, sensor_id: str, alerts: list[dict],
+                           instance_id: str = "") -> None:
         """Hand relayed alerts to the dispatch worker. Called ON AN INGEST
         THREAD, so it must not block.
 
-        Dispatching inline would let one authenticated batch hold an ingest
-        thread for as long as its slowest channel takes — ftp and email are
-        seconds each, and a batch may carry thousands of alerts. The queue
-        is bounded and overflow is counted rather than buffered, because
-        the queue depth would otherwise be chosen by the remote host.
+        Dispatching inline would let one authenticated batch hold an
+        ingest thread for as long as its slowest channel takes. Three
+        admission checks happen HERE rather than downstream, because a
+        slot consumed is a slot another sensor cannot have:
+
+        1. a per-batch cap, so one batch cannot fill the queue;
+        2. the per-sensor notification budget — checked at enqueue, since
+           checking it after the item had already taken a queue slot
+           meant an over-budget sensor still denied slots to everyone
+           else;
+        3. a per-sensor share of the queue. Without it one sensor
+           holding a valid key could saturate the shared queue and
+           suppress every OTHER sensor's pages indefinitely: ingest
+           admits far more per minute than a worker doing multi-second
+           channel fan-outs can drain.
         """
         q = self._relay_alertq
         if q is None:
             return
+        now = time.time()
+        share = self._relay_queue_share()
+        over_batch = max(0, len(alerts) - _RELAY_ALERTS_PER_BATCH)
+
         for raw in alerts[:_RELAY_ALERTS_PER_BATCH]:
+            if not self._relay_notify_budget(sensor_id, now):
+                self.stats.relayed_dropped_budget += 1
+                continue
+            with self._relay_inflight_lock:
+                if self._relay_inflight.get(sensor_id, 0) >= share:
+                    self.stats.relayed_dropped_share += 1
+                    continue
+                self._relay_inflight[sensor_id] = (
+                    self._relay_inflight.get(sensor_id, 0) + 1)
             try:
-                q.put_nowait((sensor_id, raw))
+                q.put_nowait((sensor_id, raw, instance_id))
             except queue.Full:
-                self.stats.relayed_alerts_dropped += 1
-        over = max(0, len(alerts) - _RELAY_ALERTS_PER_BATCH)
-        if over:
-            self.stats.relayed_alerts_dropped += over
+                with self._relay_inflight_lock:
+                    self._relay_inflight[sensor_id] -= 1
+                self.stats.relayed_dropped_queue += 1
+
+        if over_batch:
+            self.stats.relayed_dropped_batch += over_batch
             log.warning(
                 "relay: sensor %r sent %d alerts in one batch; dispatching "
-                "the first %d and dropping %d. They remain in remote_alerts "
+                "at most %d and dropping %d. They remain in remote_alerts "
                 "and on the dashboard — only the notification is skipped.",
-                sensor_id, len(alerts), _RELAY_ALERTS_PER_BATCH, over,
+                sensor_id, len(alerts), _RELAY_ALERTS_PER_BATCH, over_batch,
             )
+
+    def _relay_queue_share(self) -> int:
+        """How many queue slots any ONE sensor may hold at once.
+
+        An equal split, floored so a single sensor is not throttled on a
+        quiet collector. The point is only that no sensor can take the
+        whole queue.
+        """
+        n = max(1, len(self.cfg.relay.sensors))
+        return max(50, _RELAY_ALERT_QUEUE // n)
+
+    def _relay_inflight_done(self, sensor_id: str) -> None:
+        with self._relay_inflight_lock:
+            n = self._relay_inflight.get(sensor_id, 1) - 1
+            if n > 0:
+                self._relay_inflight[sensor_id] = n
+            else:
+                self._relay_inflight.pop(sensor_id, None)
 
     def _start_relay_dispatch(self) -> None:
         if self._relay_alertq is None:
@@ -688,6 +737,8 @@ class Hound:
                     self._dispatch_relayed_alert(*item)
                 except Exception:           # noqa: BLE001
                     log.exception("relay: dispatching a relayed alert failed")
+                finally:
+                    self._relay_inflight_done(item[0])
 
         self._relay_worker = threading.Thread(
             target=_run, name="hound-relay-dispatch", daemon=True)
@@ -708,16 +759,43 @@ class Hound:
         except queue.Full:
             pass
         self._relay_worker.join(timeout=10)
+        # Whatever was still queued is not dispatched. Counting it keeps
+        # the shutdown report honest — and these stay suppressed for the
+        # dedup window after a restart, because dedup measures receipt,
+        # so an operator needs to know they were skipped.
+        abandoned = self._relay_alertq.qsize()
+        if abandoned:
+            self.stats.relayed_dropped_queue += abandoned
         self._relay_worker = None
-        if self.stats.relayed_alerts_dropped:
-            log.warning(
-                "relay: %d relayed alert(s) were never dispatched because "
-                "the dispatch queue was full. The alerts themselves are "
-                "stored; only the notifications were skipped.",
-                self.stats.relayed_alerts_dropped,
-            )
+        self._log_relay_drops()
 
-    def _dispatch_relayed_alert(self, sensor_id: str, raw: dict) -> None:
+    def _log_relay_drops(self) -> None:
+        """Report undispatched relayed alerts BY CAUSE.
+
+        One counter attributing everything to "the queue was full" told
+        an operator the wrong thing three times out of four — and a
+        collector that has quietly stopped paging looks healthy until
+        then, so the causes have to be distinguishable.
+        """
+        st = self.stats
+        causes = [
+            (st.relayed_dropped_budget, "over the per-sensor notify budget"),
+            (st.relayed_dropped_share, "over that sensor's queue share"),
+            (st.relayed_dropped_batch, "over the per-batch cap"),
+            (st.relayed_dropped_queue, "dispatch queue full"),
+        ]
+        total = sum(n for n, _ in causes)
+        if not total:
+            return
+        log.warning(
+            "relay: %d relayed alert(s) were stored and shown but NOT "
+            "dispatched — %s. Raise the relevant [relay] limit if this is "
+            "legitimate traffic.",
+            total, "; ".join(f"{n} {why}" for n, why in causes if n),
+        )
+
+    def _dispatch_relayed_alert(self, sensor_id: str, raw: dict,
+                                instance_id: str = "") -> None:
         """Dispatch one relayed alert.
 
         Deliberately not `_emit`. That writes `alerts`, updates it again via
@@ -748,7 +826,7 @@ class Hound:
         # the thing sent. Treating a reused id as the same record is
         # what keeps the record and the page agreeing.
         dkey = ("k", sensor_id, raw["dedup_key"])
-        rkey = ("r", sensor_id, raw["remote_id"])
+        rkey = ("r", sensor_id, instance_id, raw["remote_id"])
         for k in (dkey, rkey):
             seen = self._relay_last_dispatch.get(k)
             if seen is not None and (now - seen) < window:
@@ -776,15 +854,13 @@ class Hound:
                             key=self._relay_last_dispatch.get,
                             )[:_RELAY_DEDUP_MAX // 2]:
                 del self._relay_last_dispatch[k]
-        if not self._relay_notify_budget(sensor_id, now):
-            return
-
         alert = Alert(
             ts=raw["ts"], device_ip=raw["device_ip"], kind=raw["kind"],
             severity=raw["severity"], summary=raw["summary"],
             detail=raw["detail"], dedup_key=key, sensor=sensor_id,
         )
-        remote_id = self.store.remote_alert_id_for(sensor_id, raw["remote_id"])
+        remote_id = self.store.remote_alert_id_for(
+            sensor_id, raw["remote_id"], instance_id)
 
         # Audit every attempt, not just the successful ones. A relayed
         # alert that failed to deliver is exactly the row an operator
@@ -804,8 +880,10 @@ class Hound:
         sensor holding a valid key can otherwise emit alerts with
         distinct dedup keys as fast as it can post, and every one fans
         out to email, webhook and FTP. The alerts themselves are still
-        stored, still relayed to the dashboard, and still audited — only
-        the paging stops, which is the part that cannot be undone.
+        stored and still relayed to the dashboard — only the paging
+        stops, which is the part that cannot be undone. There is no
+        notification audit row for a budget denial, because nothing was
+        attempted; the shutdown report counts it by cause instead.
         """
         cap = self.cfg.relay.max_notifications_per_minute
         if cap <= 0:
@@ -814,7 +892,6 @@ class Hound:
         while q and (now - q[0]) > 60.0:
             q.popleft()
         if len(q) >= cap:
-            self.stats.relayed_alerts_dropped += 1
             if not self._relay_budget_warned.get(sensor_id):
                 self._relay_budget_warned[sensor_id] = True
                 log.warning(

@@ -366,6 +366,7 @@ CREATE TABLE IF NOT EXISTS remote_flows (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     sensor_id         TEXT NOT NULL,
     remote_id         INTEGER NOT NULL,
+    instance_id TEXT NOT NULL DEFAULT '',
     src_ip            TEXT NOT NULL,
     src_port          INTEGER,
     dst_ip            TEXT NOT NULL,
@@ -380,7 +381,7 @@ CREATE TABLE IF NOT EXISTS remote_flows (
     tcp_flags_seen    TEXT NOT NULL DEFAULT '',
     classification    TEXT NOT NULL DEFAULT 'normal',
     ingested_at       REAL NOT NULL,
-    UNIQUE (sensor_id, remote_id)
+    UNIQUE (sensor_id, instance_id, remote_id)
 );
 CREATE INDEX IF NOT EXISTS idx_remote_flows_seen ON remote_flows(last_seen);
 
@@ -388,6 +389,7 @@ CREATE TABLE IF NOT EXISTS remote_alerts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     sensor_id   TEXT NOT NULL,
     remote_id   INTEGER NOT NULL,
+    instance_id TEXT NOT NULL DEFAULT '',
     ts          REAL NOT NULL,
     device_ip   TEXT NOT NULL DEFAULT '',
     kind        TEXT NOT NULL,
@@ -396,11 +398,17 @@ CREATE TABLE IF NOT EXISTS remote_alerts (
     detail      TEXT NOT NULL DEFAULT '',
     dedup_key   TEXT NOT NULL,
     ingested_at REAL NOT NULL,
-    UNIQUE (sensor_id, remote_id)
+    UNIQUE (sensor_id, instance_id, remote_id)
 );
 CREATE INDEX IF NOT EXISTS idx_remote_alerts_dedup ON remote_alerts(dedup_key, ts);
 CREATE INDEX IF NOT EXISTS idx_remote_alerts_ts ON remote_alerts(ts);
 
+-- Keyed on (sensor, INSTANCE, agent row id). The instance matters: an
+-- agent whose state is lost restarts its row ids at 1, and keying on the
+-- id alone made every colliding record silently vanish — not stored, not
+-- paged, and acked as accepted, so the agent advanced its watermark and
+-- never resent. Permanent loss on a documented operation (`docker volume
+-- rm`), triggerable by anyone who can delete a file on the agent host.
 -- Keyed on the agent's own row id so a close UPDATES its open row. Without
 -- that key a recovery either inserts a duplicate (double-counting the
 -- outage) or is dropped, leaving an outage open forever while the uptime
@@ -409,13 +417,14 @@ CREATE TABLE IF NOT EXISTS remote_outages (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     sensor_id        TEXT NOT NULL,
     remote_id        INTEGER NOT NULL,
+    instance_id TEXT NOT NULL DEFAULT '',
     camera_ip        TEXT NOT NULL,
     down_since       REAL NOT NULL,
     up_at            REAL,
     last_seen_before REAL NOT NULL DEFAULT 0.0,
     cause            TEXT NOT NULL DEFAULT 'silence',
     ingested_at      REAL NOT NULL,
-    UNIQUE (sensor_id, remote_id)
+    UNIQUE (sensor_id, instance_id, remote_id)
 );
 
 CREATE TABLE IF NOT EXISTS remote_uptime (
@@ -1039,48 +1048,58 @@ class HoundStore:
                 )
             counts["devices"] = len(records.get("devices", []))
 
+            _before_flows = self._conn.total_changes
             for f in records.get("flows", []):
                 self._conn.execute(
                     """INSERT INTO remote_flows
-                           (sensor_id, remote_id, src_ip, src_port, dst_ip,
+                           (sensor_id, instance_id, remote_id, src_ip,
+                            src_port, dst_ip,
                             dst_port, proto, first_seen, last_seen, packets,
                             bytes, bytes_to_camera, bytes_from_camera,
                             tcp_flags_seen, classification, ingested_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                       ON CONFLICT(sensor_id, remote_id) DO NOTHING""",
-                    (sensor_id, f["remote_id"], f["src_ip"], f["src_port"],
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(sensor_id, instance_id, remote_id)
+                       DO NOTHING""",
+                    (sensor_id, instance_id,
+                     f["remote_id"], f["src_ip"], f["src_port"],
                      f["dst_ip"], f["dst_port"], f["proto"], f["first_seen"],
                      f["last_seen"], f["packets"], f["bytes"],
                      f["bytes_to_camera"], f["bytes_from_camera"],
                      f["tcp_flags_seen"], f["classification"], now),
                 )
-            counts["flows"] = len(records.get("flows", []))
+            counts["flows"] = self._conn.total_changes - _before_flows
 
+            _before_alerts = self._conn.total_changes
             for a in records.get("alerts", []):
                 self._conn.execute(
                     """INSERT INTO remote_alerts
-                           (sensor_id, remote_id, ts, device_ip, kind,
-                            severity, summary, detail, dedup_key, ingested_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)
-                       ON CONFLICT(sensor_id, remote_id) DO NOTHING""",
-                    (sensor_id, a["remote_id"], a["ts"], a["device_ip"],
+                           (sensor_id, instance_id, remote_id, ts, device_ip,
+                            kind, severity, summary, detail, dedup_key,
+                            ingested_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(sensor_id, instance_id, remote_id)
+                       DO NOTHING""",
+                    (sensor_id, instance_id,
+                     a["remote_id"], a["ts"], a["device_ip"],
                      a["kind"], a["severity"], a["summary"], a["detail"],
                      a["dedup_key"], now),
                 )
-            counts["alerts"] = len(records.get("alerts", []))
+            counts["alerts"] = self._conn.total_changes - _before_alerts
 
             for o in records.get("outages", []):
                 # upsert, so a recovery closes the open row instead of
                 # inserting a second one
                 self._conn.execute(
                     """INSERT INTO remote_outages
-                           (sensor_id, remote_id, camera_ip, down_since,
+                           (sensor_id, instance_id, remote_id, camera_ip,
+                            down_since,
                             up_at, last_seen_before, cause, ingested_at)
-                       VALUES (?,?,?,?,?,?,?,?)
-                       ON CONFLICT(sensor_id, remote_id) DO UPDATE SET
+                       VALUES (?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(sensor_id, instance_id, remote_id)
+                       DO UPDATE SET
                            up_at = excluded.up_at,
                            ingested_at = excluded.ingested_at""",
-                    (sensor_id, o["remote_id"], o["camera_ip"],
+                    (sensor_id, instance_id, o["remote_id"], o["camera_ip"],
                      o["down_since"], o["up_at"], o["last_seen_before"],
                      o["cause"], now),
                 )
@@ -1197,12 +1216,23 @@ class HoundStore:
                  1 if ok else 0, error),
             )
 
-    def remote_alert_id_for(self, sensor_id: str, remote_id: int) -> int | None:
+    def remote_alert_id_for(self, sensor_id: str, remote_id: int,
+                            instance_id: str = "") -> int | None:
+        """The stored row id for an audit record.
+
+        `instance_id` disambiguates: an agent that lost its state
+        restarts its row ids at 1, so without it the audit row for a new
+        alert attaches to a pre-wipe row with entirely different content
+        — a notification record citing something that was never sent.
+        """
+        sql = "SELECT id FROM remote_alerts WHERE sensor_id = ? AND remote_id = ?"
+        args: list = [sensor_id, remote_id]
+        if instance_id:
+            sql += " AND instance_id = ?"
+            args.append(instance_id)
+        sql += " ORDER BY id DESC"
         with self._lock:
-            r = self._conn.execute(
-                "SELECT id FROM remote_alerts WHERE sensor_id = ? AND remote_id = ?",
-                (sensor_id, remote_id),
-            ).fetchone()
+            r = self._conn.execute(sql, tuple(args)).fetchone()
         return r["id"] if r is not None else None
 
     def list_remote_alerts(self, *, limit: int = 100) -> list[dict]:

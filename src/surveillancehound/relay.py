@@ -120,9 +120,15 @@ class Spool:
     age cap alone lets a busy segment fill the disk inside an hour.
     """
 
-    def __init__(self, directory: Path, max_bytes: int, max_age_seconds: float):
+    def __init__(self, directory: Path, max_bytes: int, max_age_seconds: float,
+                 *, readonly: bool = False):
         self.dir = Path(directory)
-        self.dir.mkdir(parents=True, exist_ok=True)
+        # `hound relay` constructs a Spool purely to read it. Creating
+        # the directory there means a diagnostic run as the wrong user
+        # leaves a root-owned path the daemon then cannot write.
+        # AgentState.load was fixed for this; the spool was not.
+        if not readonly:
+            self.dir.mkdir(parents=True, exist_ok=True)
         self.path = self.dir / "spool.jsonl"
         self.max_bytes = int(max_bytes)
         self.max_age = float(max_age_seconds)

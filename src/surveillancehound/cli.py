@@ -366,7 +366,11 @@ def cmd_export(args: argparse.Namespace) -> int:
             ],
             "alerts": [a.__dict__ for a in alerts],
             "devices": [d.__dict__ for d in devices],
-            "flows": [f.__dict__ for f in flows],
+            "flows": [dict(f.__dict__, sensor="local") for f in flows],
+            # The OPNsense dashboard renders THIS document and cannot
+            # reach /api/flows, so omitting relayed flows here made them
+            # invisible on the collector's own platform.
+            "remote_flows": store.list_remote_flows(limit=args.limit),
         }
     finally:
         store.close()
@@ -437,7 +441,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
     from surveillancehound.relay import AgentState, Spool
     base = Path(cfg.store.path).parent / "relay"
     state = AgentState.load(base, readonly=True)
-    spool = Spool(base, r.spool_max_bytes, r.spool_max_age_seconds)
+    spool = Spool(base, r.spool_max_bytes, r.spool_max_age_seconds,
+                  readonly=True)
     st = spool.stats(time.time())
     print(f"relay: agent {r.sensor_id!r} -> {r.url}")
     print(f"  instance      {state.instance_id}")
@@ -793,7 +798,20 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
-    return args.func(args)
+    try:
+        return args.func(args)
+    except ValueError as e:
+        # Config errors already carry a full explanation and a remedy.
+        # Wrapping them in a traceback buries that under a stack an
+        # operator cannot act on — and `config-check` is the first
+        # command the deployment docs tell them to run.
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":

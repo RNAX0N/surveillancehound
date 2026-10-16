@@ -292,7 +292,15 @@ class IngestServer:
 
         if self.on_alerts and records.get("alerts"):
             try:
-                self.on_alerts(sensor_id, records["alerts"])
+                self.on_alerts(sensor_id, records["alerts"], instance_id)
+            except TypeError:
+                # A signature mismatch here is a programming error, and
+                # swallowing it reads as "the callback never fired" —
+                # which is how a broken dispatch hook looked like a
+                # broken relay for an entire test run.
+                log.exception(
+                    "relay: on_alerts has the wrong signature; relayed "
+                    "alerts are NOT being dispatched")
             except Exception:       # noqa: BLE001 - never fail ingest on dispatch
                 log.exception("relay: queuing relayed alerts failed")
 

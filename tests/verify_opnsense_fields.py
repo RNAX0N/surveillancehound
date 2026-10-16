@@ -529,7 +529,7 @@ def _check_volt_renders_relayed_data() -> None:
     volt = PLUGIN / "views/OPNsense/Hound/index.volt"
     text = volt.read_text()
 
-    for key in ("remote_uptime", "remote_alerts", "sensors"):
+    for key in ("remote_uptime", "remote_alerts", "remote_flows", "sensors"):
         assert key in text, (
             f"index.volt never reads d.{key}; `hound export` emits it and "
             f"the plugin dashboard is the only view a collector operator "
@@ -572,6 +572,30 @@ def _check_volt_renders_relayed_data() -> None:
     assert f'colspan="{n_head}"' in text, (
         f"the empty-table placeholder must span all {n_head} columns"
     )
+    # The flows table too.
+    fhead = text[text.index('id="tbl-flows"'):]
+    fhead = fhead[:fhead.index("</thead>")]
+    f_head = fhead.count("<th>")
+    fbody = text[text.index("$.each(flows"):]
+    fbody = fbody[:fbody.index('$("#tbl-flows')]
+    f_body = fbody.count("'<td>")
+    assert f_head == f_body, (
+        f"flows table has {f_head} header cells but rows emit {f_body}"
+    )
+    assert f'colspan="{f_head}"' in text
+
+    # Merged lists must sort on OUR clock. `ts`/`last_seen` come from the
+    # sensor, so sorting on them re-opens the pinning the server-side
+    # ORDER BY ingested_at was changed to close.
+    assert "ingested_at" in text, (
+        "merged alert/flow lists must sort on ingested_at; sorting on the "
+        "sensor-supplied ts lets one future-dated row pin itself to the "
+        "top of the dashboard forever"
+    )
+    assert "num(y.ts) - num(x.ts)" not in text, (
+        "a merged list still sorts on the sensor-supplied ts"
+    )
+
     # Numerics interpolated into innerHTML must be coerced. This view
     # renders rows produced on another host now, and the spec names
     # outage_count/packets as the stored-XSS vector precisely because

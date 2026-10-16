@@ -205,8 +205,12 @@ $(document).ready(function() {
             // Local and relayed alerts together, newest first, each
             // tagged with the sensor that observed it. Showing only
             // local alerts hid the segment the relay exists to watch.
+            // Sorted on OUR clock: `ts` comes from the sensor, so
+            // sorting on it lets one alert dated 2099 pin itself above
+            // every local row forever. Relayed rows carry ingested_at.
+            function atime(a) { return num(a.ingested_at || a.ts); }
             var alerts = (d.alerts || []).concat(d.remote_alerts || [])
-                .sort(function (x, y) { return num(y.ts) - num(x.ts); });
+                .sort(function (x, y) { return atime(y) - atime(x); });
             $.each(alerts, function (i, a) {
                 rows += '<tr>' +
                     '<td>' + esc(new Date(num(a.ts) * 1000).toLocaleString()) + '</td>' +
@@ -221,19 +225,25 @@ $(document).ready(function() {
                 '<tr><td colspan="6">' + "{{ lang._('No alerts yet.') }}" + '</td></tr>');
 
             rows = '';
-            $.each(d.flows, function (i, f) {
+            var flows = (d.flows || []).concat(d.remote_flows || [])
+                .sort(function (x, y) {
+                    return num(y.ingested_at || y.last_seen) -
+                           num(x.ingested_at || x.last_seen);
+                });
+            $.each(flows, function (i, f) {
                 rows += '<tr>' +
-                    '<td>' + new Date(f.last_seen * 1000).toLocaleTimeString() + '</td>' +
+                    '<td>' + esc(new Date(num(f.last_seen) * 1000).toLocaleTimeString()) + '</td>' +
+                    '<td>' + esc(f.sensor || f.sensor_id || 'local') + '</td>' +
                     '<td>' + esc(f.src_ip) + ':' + esc(f.src_port) + '</td>' +
                     '<td>' + esc(f.dst_ip) + ':' + esc(f.dst_port) + '</td>' +
                     '<td>' + esc(f.proto) + '</td>' +
                     '<td>' + num(f.packets) + '</td>' +
-                    '<td>' + fmtBytes(f.bytes) + '</td>' +
+                    '<td>' + fmtBytes(num(f.bytes)) + '</td>' +
                     '<td><code>' + esc(f.classification) + '</code></td>' +
                     '</tr>';
             });
             $("#tbl-flows tbody").html(rows ||
-                '<tr><td colspan="7">' + "{{ lang._('No flows recorded yet.') }}" + '</td></tr>');
+                '<tr><td colspan="8">' + "{{ lang._('No flows recorded yet.') }}" + '</td></tr>');
         }, function () {
             $("#hound-dash-error")
                 .text("{{ lang._('Request to the hound backend failed.') }}")
@@ -370,6 +380,7 @@ $(document).ready(function() {
                     <thead>
                         <tr>
                             <th>{{ lang._('Time') }}</th>
+                            <th>{{ lang._('Sensor') }}</th>
                             <th>{{ lang._('Source') }}</th>
                             <th>{{ lang._('Destination') }}</th>
                             <th>{{ lang._('Proto') }}</th>
