@@ -65,7 +65,10 @@ completed a signed request, so a flood of unauthenticated addresses
 cannot starve a sensor that is already reporting. It cannot make the
 port free, though: enough unauthenticated connections will still
 delay a sensor's **first** batch after an install or an address
-change, and they cost the collector threads.
+change. Each such connection costs a worker thread, a socket and a
+file descriptor until it completes or hits the connection budget, so
+a sustained flood is a real resource cost even though it cannot read
+or write anything.
 
 Put a firewall rule in front of it. The port should be reachable from
 your agents and nothing else:

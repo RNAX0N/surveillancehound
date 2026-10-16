@@ -2181,6 +2181,57 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
         reaper_srv.stop()
         reap_store.close()
 
+    # File descriptors must not leak per connection. Keying the
+    # deadline map on the WRAPPED socket meant the handler's cleanup
+    # popped the raw one, matched nothing, and left a strong reference
+    # to the only object holding the real fd for the whole budget:
+    # measured, an unauthenticated peer reached EMFILE in 14s and the
+    # accept loop then span at 99.8% of a core in the same process as
+    # the pcap parser.
+    import os as _os
+
+    def _fd_count() -> int:
+        try:
+            return len(_os.listdir("/proc/self/fd"))
+        except OSError:
+            return -1
+
+    if _fd_count() >= 0:
+        leak_store = _HS2(path=tmp / "fdleak.sqlite")
+        leak_srv = IngestServer(_collector_cfg(18995), leak_store)
+        assert leak_srv.start()
+        try:
+            lctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+            lctx.check_hostname = False
+            lctx.verify_mode = _ssl.CERT_NONE
+            before = _fd_count()
+            for _ in range(40):
+                try:
+                    c = _sk.create_connection(("127.0.0.1", 18995), timeout=5)
+                    tw = lctx.wrap_socket(c, server_hostname="x")
+                    tw.sendall(b"POST /nope HTTP/1.1\r\nHost: x\r\n"
+                               b"Content-Length: 0\r\n\r\n")
+                    tw.recv(200)
+                    tw.close()
+                except OSError:
+                    pass
+            _t.sleep(0.5)
+            grew = _fd_count() - before
+            assert grew < 20, (
+                f"{grew} file descriptors leaked over 40 completed "
+                f"connections. They are pinned for the whole connection "
+                f"budget, so a peer needing no key reaches EMFILE and "
+                f"the accept loop livelocks against packet capture"
+            )
+            assert len(leak_srv._httpd._deadlines) < 10, (
+                f"{len(leak_srv._httpd._deadlines)} deadline entries "
+                f"outlived their handlers; each pins a socket"
+            )
+        finally:
+            leak_srv.stop()
+            leak_store.close()
+        print("  fd hygiene: 40 completed connections leak no descriptors")
+
     print("  shutdown: prompt with a full queue; slots released on spawn "
           "failure; round-robin service; budget spent only on enqueue")
 

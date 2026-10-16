@@ -572,7 +572,13 @@ class _Server(ThreadingHTTPServer):
             return
         with self._src_lock:
             self._per_source[source] = self._per_source.get(source, 0) + 1
-            self._deadlines[request] = time.monotonic() + _CONN_BUDGET
+            # [deadline, socket-to-shut-down]. The key is the raw
+            # socket for the connection's whole life so cleanup can
+            # always find it; the socket in the value is swapped for
+            # the wrapped one once the handshake completes.
+            # [deadline, socket-to-shut-down, requests-completed]
+            self._deadlines[request] = [time.monotonic() + _CONN_BUDGET,
+                                        request, 0]
         try:
             super().process_request(request, client_address)
         except BaseException:
@@ -616,19 +622,36 @@ class _Server(ThreadingHTTPServer):
                 for k in sorted(self._trusted, key=self._trusted.get)[:excess]:
                     del self._trusted[k]
 
+    def note_served(self, key) -> None:
+        """Record that this connection completed a request."""
+        with self._src_lock:
+            entry = self._deadlines.get(key)
+            if entry is not None:
+                entry[2] += 1
+
     def rebind_conn(self, old, new) -> None:
-        """Track the wrapped socket instead of the raw one.
+        """Record the LIVE socket for a connection, keeping its key.
 
         `ssl.wrap_socket` builds the SSLSocket from the raw socket's
-        fileno and then DETACHES it, leaving the object stored at
-        accept time with fileno == -1. Shutting that down raises
-        EBADF, so the reaper was closing nothing at all while
-        reporting that it had.
+        fileno and then DETACHES it, so the object stored at accept
+        time has fileno == -1 and shutting it down raises EBADF. The
+        reaper therefore needs the wrapped socket.
+
+        It must NOT become the dict key, though. Rebinding the key
+        meant the handler's cleanup — which pops by the raw socket it
+        was given — silently matched nothing, so every connection left
+        a live entry for the whole budget. That entry is a strong
+        reference to the SSLSocket, which after the detach is the only
+        object holding the real fd, so fds leaked at one per
+        connection: measured, an unauthenticated peer reached EMFILE in
+        14 seconds and the accept loop then span at 99.8% of a core in
+        the same process as the pcap parser. The key stays the raw
+        socket; only the value changes.
         """
         with self._src_lock:
-            due = self._deadlines.pop(old, None)
-            if due is not None:
-                self._deadlines[new] = due
+            entry = self._deadlines.get(old)
+            if entry is not None:
+                entry[1] = new
 
     def _reap(self) -> None:
         """Close connections that have outstayed their budget.
@@ -642,8 +665,9 @@ class _Server(ThreadingHTTPServer):
         while not self._reaper_stop.wait(1.0):
             now = time.monotonic()
             with self._src_lock:
-                stale = [c for c, due in self._deadlines.items() if due < now]
-            for conn in stale:
+                stale = [(k, v[1], v[2]) for k, v in self._deadlines.items()
+                         if v[0] < now]
+            for key, conn, served in stale:
                 # Attempt FIRST, then report what actually happened. The
                 # previous version logged the close before trying it, so
                 # when the shutdown failed — which it always did — the
@@ -656,14 +680,25 @@ class _Server(ThreadingHTTPServer):
                 except OSError:
                     pass
                 with self._src_lock:
-                    self._deadlines.pop(conn, None)
-                if closed:
+                    self._deadlines.pop(key, None)
+                if not closed:
+                    log.debug("relay: budgeted connection was already gone")
+                elif served:
+                    # It did work and then lingered on a keep-alive
+                    # socket. Reaping is still right — it was holding a
+                    # worker slot — but calling that "without
+                    # completing a request" was simply untrue, and an
+                    # operator who cannot tell a real slot-hogger from
+                    # a polite client learns to ignore both.
+                    log.info(
+                        "relay: closed an idle connection after %.0fs; it "
+                        "had completed %d request(s) and was holding a "
+                        "worker slot", _CONN_BUDGET, served)
+                else:
                     log.warning(
                         "relay: closed a connection that held an ingest "
-                        "slot for over %.0fs without completing a request",
-                        _CONN_BUDGET)
-                else:
-                    log.debug("relay: budgeted connection was already gone")
+                        "slot for over %.0fs without ever completing a "
+                        "request", _CONN_BUDGET)
 
     def _release(self, source: str) -> None:
         self._slots.release()
@@ -707,6 +742,7 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             # a peer that has not should not be able to hold a worker
             # slot for the full window just by opening a socket.
             raw = self.request
+            self._budget_key = raw
             self.request.settimeout(_HANDSHAKE_TIMEOUT)
             self.connection = ctx.wrap_socket(self.request, server_side=True)
             self.request = self.connection
@@ -714,6 +750,22 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             if server._httpd is not None:
                 server._httpd.rebind_conn(raw, self.connection)
             super().setup()
+
+        def finish(self):
+            # Close the WRAPPED socket explicitly. socketserver's
+            # close_request acts on the raw socket, which wrap_socket
+            # already detached, so it closes nothing — teardown was
+            # relying entirely on refcounting, and anything that kept a
+            # reference (a deadline entry, a traceback) kept the fd
+            # open with it. Explicit beats incidental for a resource a
+            # remote peer can consume.
+            try:
+                super().finish()
+            finally:
+                try:
+                    self.connection.close()
+                except OSError:
+                    pass
 
         def log_message(self, fmt, *args):
             log.debug("ingest: " + fmt, *args)
@@ -804,6 +856,8 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                             {"error": "internal error"})
                 return
             self._reply(status, payload)
+            if server._httpd is not None:
+                server._httpd.note_served(self._budget_key)
             return
 
     return Handler
