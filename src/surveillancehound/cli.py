@@ -1121,6 +1121,13 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    except RuntimeError as e:
+        # The writer lock, mainly: "another process already has this
+        # store open". That is an operational fact with a remedy, not
+        # a crash, and it reaches an operator through `service hound
+        # start`, where a traceback is noise.
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     except sqlite3.Error as e:
         # A damaged or unreadable store surfaces on the first QUERY,
         # not at connect — `mode=ro` opens lazily — so neither the

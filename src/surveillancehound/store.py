@@ -53,6 +53,10 @@ log = logging.getLogger(__name__)
 # never written at all and "no heartbeat" cannot be read as "no
 # daemon".
 _DAEMON_ALIVE_S = 120.0
+# How long a starting daemon waits for a predecessor to let go of the
+# writer lock. Longer than a clean shutdown's drain, so a restart is
+# a restart and not an outage.
+_WRITER_LOCK_WAIT_S = 60.0
 
 
 @dataclass
@@ -1933,15 +1937,30 @@ class HoundStore:
         if fcntl is None:
             return
         fh = open(self._writer_lock_path(), "a+b")
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            fh.close()
-            raise RuntimeError(
-                f"another process already has {self.path} open as a "
-                f"writer. Only one daemon may write a store; check for "
-                f"a running `hound run`."
-            ) from None
+        # Brief retry, because the common case for contention is a
+        # RESTART, not a second daemon. `service hound restart` can
+        # start the new process while the old one is still draining —
+        # a clean shutdown flushes in-RAM flows and the relay spool
+        # and is allowed tens of seconds — and failing instantly there
+        # would turn a restart into an outage. FreeBSD's `daemon -r -R
+        # 5` would eventually retry, but only after logging a failure
+        # that looks like a real fault.
+        deadline = time.monotonic() + _WRITER_LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    fh.close()
+                    raise RuntimeError(
+                        f"another process already has {self.path} open "
+                        f"as a writer, and still had it after "
+                        f"{_WRITER_LOCK_WAIT_S:.0f}s. Only one daemon "
+                        f"may write a store; check for a running "
+                        f"`hound run`."
+                    ) from None
+                time.sleep(0.25)
         self._writer_fh = fh
 
     def _require_no_writer(self) -> None:

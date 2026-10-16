@@ -914,6 +914,63 @@ def _check_heartbeat_does_not_depend_on_uptime(tmp: Path) -> None:
           "enabled = false")
 
 
+def _check_writer_lock_survives_a_restart(tmp: Path) -> None:
+    """A restart must be a restart, not an outage.
+
+    The writer lock is taken at daemon construction. The common case
+    for contention is not a second daemon — it is `service hound
+    restart` starting the new process while the old one is still
+    draining, which a clean shutdown is allowed tens of seconds to
+    do. Failing instantly there turns a restart into downtime, and
+    FreeBSD's `daemon -r -R 5` would retry only after logging what
+    looks like a real fault.
+
+    It must also refuse eventually, and refuse cleanly: `hound run`
+    reaches an operator through `service hound start`, where a
+    traceback is noise.
+    """
+    import threading as _th
+    import time as _t
+    from surveillancehound import daemon as daemon_mod, store as store_mod
+    from surveillancehound.config import load_from_dict
+
+    cfg = load_from_dict({
+        "capture": {"interface": "test0"},
+        "network": {"camera_ips": ["10.9.0.5"]},
+        "store": {"path": str(tmp / "restart.sqlite")},
+    })
+    first = daemon_mod.Hound(cfg)
+    # The predecessor lets go after a moment, as a drain would.
+    _th.Timer(1.0, first.store.close).start()
+    t0 = _t.monotonic()
+    second = daemon_mod.Hound(cfg)
+    waited = _t.monotonic() - t0
+    second.store.close()
+    assert 0.5 < waited < 30.0, (
+        f"the restarting daemon waited {waited:.1f}s for its "
+        f"predecessor. It must wait (an instant failure makes every "
+        f"restart an outage) but not indefinitely")
+
+    # And it does give up, with a message rather than a traceback.
+    holder = daemon_mod.Hound(cfg)
+    saved = store_mod._WRITER_LOCK_WAIT_S
+    store_mod._WRITER_LOCK_WAIT_S = 0.5
+    try:
+        try:
+            daemon_mod.Hound(cfg)
+            raise AssertionError(
+                "a second daemon opened a store another already holds; "
+                "the one-writer invariant is not enforced")
+        except RuntimeError as e:
+            assert "open as a writer" in str(e), e
+    finally:
+        store_mod._WRITER_LOCK_WAIT_S = saved
+        holder.store.close()
+    print(f"  writer lock: a restart waits {waited:.1f}s for the "
+          f"predecessor to drain, then proceeds; a genuine second "
+          f"daemon is refused with a message")
+
+
 def _check_writer_lock_guards_the_swap(tmp: Path) -> None:
     """The compaction guard must not depend on an optional feature.
 
@@ -5593,6 +5650,7 @@ def main() -> int:
         _check_prune_does_not_outrun_a_live_daemon(Path(td))
         _check_writer_lock_guards_the_swap(Path(td))
         _check_heartbeat_does_not_depend_on_uptime(Path(td))
+        _check_writer_lock_survives_a_restart(Path(td))
         _check_relayed_alerts_count_in_the_tile(Path(td))
         _check_shutdown_flushes_the_relay(Path(td))
         _check_instance_reset_log_is_throttled(Path(td))
