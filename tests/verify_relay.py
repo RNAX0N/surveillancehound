@@ -752,6 +752,16 @@ def _check_resplit_always_makes_progress(tmp: Path) -> None:
     )
     client = RelayClient(cfg, store, now=lambda: T0 + 10_000)
     limits = {"max_records_per_batch": 1, "max_body_bytes": 1024}
+    # The sensor's CURRENT state: daemon ticking, last packet long ago
+    # => blind. The batch below carries a STALE `blind: False`. A part
+    # that copies the old block reports False; one that rebuilds
+    # reports True. That difference is the finding: parts get new
+    # highest sequence numbers and go to the spool tail, so they post
+    # AFTER later batches carrying a newer monitor, and `build_batch`
+    # re-stamps `sent_at` so the stale snapshot looks freshest to the
+    # collector's unconditional upsert.
+    store.set_heartbeat(T0 + 1000, T0 + 10_000)
+    assert client._monitor()["blind"] is True, client._monitor()
 
     def spool_one(records):
         body = _R.build_batch("frigate", client.state.instance_id,
@@ -772,7 +782,7 @@ def _check_resplit_always_makes_progress(tmp: Path) -> None:
                         "down_since": None, "current_downtime": 0.0,
                         "outage_count": 0, "downtime_seconds": 0.0,
                         "monitored_seconds": 60.0, "availability": 1.0}],
-            "monitor": {"alive": True, "blind": True,
+            "monitor": {"alive": True, "blind": False,
                         "last_activity_ts": T0}}
     seq, body = spool_one(recs)
     assert client._resplit(seq, body, {"error": "too big",
@@ -790,10 +800,18 @@ def _check_resplit_always_makes_progress(tmp: Path) -> None:
         # EVERY part carries monitor: the collector writes mon_blind
         # unconditionally from it, so a part without one CLEARS the
         # blind flag and the sensor renders healthy.
-        assert r.get("monitor", {}).get("blind") is True, (
-            f"a split part lost the monitor block: {r.get('monitor')!r}. "
-            f"The collector writes mon_blind from it unconditionally, so "
-            f"the half without one marks a blind sensor as seeing")
+        mon = r.get("monitor")
+        assert mon is not None, (
+            "a split part lost the monitor block entirely. The "
+            "collector writes mon_blind from it unconditionally, so a "
+            "part without one CLEARS the flag")
+        assert mon.get("blind") is True, (
+            f"a split part carried the STALE monitor {mon!r}. The batch "
+            f"was built when the sensor could see; it is being sent now, "
+            f"when it cannot. These parts jump to the spool tail and "
+            f"post after newer batches, and build_batch re-stamps "
+            f"sent_at, so a stale snapshot wins the collector's upsert "
+            f"and a blind sensor renders as seeing")
     assert all(sum(k.values()) == 1 for k in kinds), kinds
     # CONSERVATION: the parts together hold exactly the original
     # records, once each. A split that loses or duplicates is worse
@@ -846,6 +864,110 @@ def _check_resplit_always_makes_progress(tmp: Path) -> None:
     store.close()
     print("  resplit: splits across kinds when halving cannot, refuses "
           "the indivisible and the unexplained, and keeps the batch age")
+
+
+def _check_prune_does_not_outrun_a_live_daemon(tmp: Path) -> None:
+    """Pruning must never swap the file under a running daemon.
+
+    `vacuum()` briefly preferred `VACUUM INTO` plus `os.replace` to
+    avoid the plain form's need for twice the file size free. But
+    `vacuum()` is only reached from `hound prune`, a SEPARATE
+    PROCESS, and the daemon is another process holding the old inode
+    open: `os.replace` is invisible to it and it goes on writing to
+    an unlinked file, with no error on either side. Measured through
+    the documented command with a daemon-like writer running, 777 of
+    1363 writes (57%) were silently discarded and `monitor_heartbeat`
+    froze at the swap instant — so every reader then rendered a
+    healthy collector as stalled.
+
+    SQLite's own locking coordinates two processes through a plain
+    VACUUM. It knows nothing about `os.replace`.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    import threading as _th
+    import time as _t
+    from surveillancehound.store import HoundStore
+
+    path = tmp / "live.sqlite"
+    store = HoundStore(path=path)
+    for b in range(2):
+        store.ingest_remote_batch(
+            "frigate", "inst-aaaa1111", b + 1,
+            V.validate_records({"flows": [
+                {"remote_id": b * 3000 + i + 1, "src_ip": "10.0.0.1",
+                 "src_port": 1, "dst_ip": "10.0.0.2", "dst_port": 2,
+                 "proto": "tcp", "first_seen": T0, "last_seen": T0 + 1,
+                 "packets": 1, "bytes": 1, "bytes_to_camera": 1,
+                 "bytes_from_camera": 0, "tcp_flags_seen": "S",
+                 "classification": "lan_normal"}
+                for i in range(3000)]}, 10**6), T0)
+    inode_before = path.stat().st_ino
+
+    stop = _th.Event()
+    wrote = {"n": 0}
+
+    def daemonish():
+        n = 0
+        while not stop.is_set():
+            n += 1
+            store.upsert_device(f"10.1.{n % 250}.{n % 251}", "camera",
+                                T0, 1, 1)
+            store.set_heartbeat(_t.time(), _t.time())
+        wrote["n"] = n
+
+    worker = _th.Thread(target=daemonish, daemon=True)
+    worker.start()
+    cfg_path = tmp / "live.toml"
+    cfg_path.write_text(
+        f"[capture]\npcap_file = '/nonexistent.pcap'\n"
+        f"[network]\ncamera_ips = []\n"
+        f"[store]\npath = {str(path)!r}\n")
+    out = _sp.run([_sys.executable, "-m", "surveillancehound.cli", "prune",
+                   str(cfg_path), "--relay-days", "0.00001"],
+                  capture_output=True, text=True,
+                  env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    _t.sleep(0.3)
+    stop.set()
+    worker.join(timeout=10)
+    assert out.returncode == 0, out.stderr[-300:]
+    assert path.stat().st_ino == inode_before, (
+        "the store was REPLACED while a daemon held it open. Every "
+        "write that daemon makes from now on goes to an unlinked "
+        "inode nothing will ever read, with no error on either side")
+    live = store._conn.execute(
+        "SELECT COUNT(*) c FROM devices").fetchone()["c"]
+    store._conn.execute("PRAGMA wal_checkpoint(FULL)")
+    truth = HoundStore(path=path, readonly=True)
+    on_disk = truth._conn.execute(
+        "SELECT COUNT(*) c FROM devices").fetchone()["c"]
+    hb_at = truth.heartbeat()[1]
+    truth.close()
+    store.close()
+    assert on_disk == live, (
+        f"the daemon-like writer made {wrote['n']} upserts and the "
+        f"file on disk holds {on_disk} of the {live} it believes it "
+        f"wrote. Everything after the swap went to an unlinked file")
+    assert _t.time() - hb_at < 30, (
+        f"the heartbeat on disk is {_t.time() - hb_at:.0f}s old. It is "
+        f"the row readers use to tell 'watching' from 'blind', so a "
+        f"frozen one renders a healthy collector as stalled")
+    # And the offline form must REFUSE while that heartbeat is fresh.
+    reopened = HoundStore(path=path)
+    try:
+        reopened.set_heartbeat(_t.time(), _t.time())
+        try:
+            reopened.vacuum(offline=True)
+            raise AssertionError(
+                "offline compaction ran with a fresh heartbeat. It "
+                "swaps the file, so it must refuse unless the daemon "
+                "is stopped")
+        except RuntimeError as e:
+            assert "running" in str(e), e
+    finally:
+        reopened.close()
+    print(f"  live prune: {wrote['n']} concurrent writes all survive, "
+          f"inode and heartbeat intact, offline compaction refuses")
 
 
 def _check_prune_relay_days_returns_bytes(tmp: Path) -> None:
@@ -905,6 +1027,354 @@ def _check_prune_relay_days_returns_bytes(tmp: Path) -> None:
     assert "reclaimed" in out.stdout, out.stdout
     print(f"  prune --relay-days: {before:,} -> {after:,} bytes returned "
           f"to the filesystem")
+
+
+def _check_collector_surfaces_show_relayed_rows(tmp: Path) -> None:
+    """A collector's own [network] is often EMPTY by design.
+
+    The cameras sit behind the NVR and never cross the firewall —
+    that is the entire reason relay mode exists — so on a collector
+    the relayed rows are frequently the only uptime data there is.
+    Deleting them from `hound uptime` outright (`relayed = []`) left
+    all eight suites green.
+
+    Also covers the ordering: `list_remote_outages` orders on
+    `ingested_at` because `down_since` is sensor-supplied and
+    validated only up to the year 2100, and the CLI used to re-sort
+    on that hostile field, pushing honest rows below hundreds of
+    future-dated ones.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    import time as _t
+    from surveillancehound.store import HoundStore
+
+    # Real wall clock, not T0: `hound uptime` windows on time.time()
+    # and the stale gate uses sensor_timeout_seconds, so synthetic
+    # timestamps days in the past render as `unknown` and fall outside
+    # the 24h outage window.
+    wall = _t.time()
+    store = HoundStore(path=tmp / "surf.sqlite")
+    up = [{"ip": "192.168.10.11", "role": "camera", "state": "up",
+           "last_seen": wall, "first_seen": wall - 9000,
+           "down_since": None,
+           "current_downtime": 0.0, "outage_count": 1,
+           "downtime_seconds": 60.0, "monitored_seconds": 9000.0,
+           "availability": 0.993}]
+    store.ingest_remote_batch(
+        "honest", "inst-aaaa1111", 1,
+        V.validate_records({"uptime": up, "outages": [
+            {"remote_id": 1, "camera_ip": "192.168.10.11",
+             "down_since": wall - 300, "up_at": wall - 240,
+             "last_seen_before": wall - 301, "cause": "silence"}]}, 1000),
+        wall)
+    # A second sensor dates 300 outages in the year 2096.
+    store.ingest_remote_batch(
+        "hostile", "inst-bbbb2222", 1,
+        V.validate_records({"outages": [
+            {"remote_id": i + 1, "camera_ip": f"10.9.{i // 256}.{i % 256}",
+             "down_since": 4_000_000_000.0, "up_at": None,
+             "last_seen_before": 3_999_999_999.0, "cause": "silence"}
+            for i in range(300)]}, 1000),
+        wall - 1)
+    store.close()
+
+    cfg_path = tmp / "surf.toml"
+    cfg_path.write_text(
+        f"[capture]\npcap_file = '/nonexistent.pcap'\n"
+        f"[network]\ncamera_ips = []\n"
+        f"[store]\npath = {str(tmp / 'surf.sqlite')!r}\n"
+        f"[relay]\nmode = 'collector'\nlisten_host = '127.0.0.1'\n"
+        f"[[relay.sensor]]\nid = 'honest'\nkey = 'shared-secret-abcdef'\n"
+        f"[[relay.sensor]]\nid = 'hostile'\nkey = 'shared-secret-ghijkl'\n")
+    env = {"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"}
+
+    out = _sp.run([_sys.executable, "-m", "surveillancehound.cli",
+                   "uptime", str(cfg_path)],
+                  capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stderr[-300:]
+    assert "192.168.10.11" in out.stdout and "honest" in out.stdout, (
+        "`hound uptime` on a collector showed no relayed camera. Its "
+        "own [network] is empty by design here, so this is the only "
+        "uptime data that exists:\n" + out.stdout[:400])
+    assert "no cameras" not in out.stdout, out.stdout[:300]
+
+    out = _sp.run([_sys.executable, "-m", "surveillancehound.cli",
+                   "uptime", str(cfg_path), "--outages"],
+                  capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stderr[-300:]
+    body = [l for l in out.stdout.splitlines()
+            if l.startswith(("honest", "hostile"))]
+    assert body, out.stdout[:400]
+    first_honest = next((i for i, l in enumerate(body)
+                         if l.startswith("honest")), None)
+    assert first_honest is not None, "the honest sensor's outage vanished"
+    assert first_honest < 10, (
+        f"the honest outage is at display line {first_honest} behind "
+        f"future-dated rows from another sensor. The store orders on "
+        f"`ingested_at` for exactly this reason; the reader must not "
+        f"re-sort on the sensor-supplied `down_since`")
+    print(f"  collector surfaces: relayed cameras and outages render, "
+          f"and 300 rows dated 2096 do not bury the honest one "
+          f"(line {first_honest})")
+
+
+def _check_relayed_outage_fair_share(tmp: Path) -> None:
+    """One key holder must not own the relayed-outage view.
+
+    `hound uptime --outages` is its ONLY reader, so a sensor that
+    fills a flat limit blinds the operator to every other sensor.
+    Measured on the first revision: 600 hostile rows left 0 of 5
+    honest rows visible. Both the fair share and the ordering could
+    be mutated away with the whole suite green.
+    """
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "share.sqlite")
+    store.ingest_remote_batch(
+        "honest", "inst-aaaa1111", 1,
+        V.validate_records({"outages": [
+            {"remote_id": i + 1, "camera_ip": f"192.168.10.{i + 11}",
+             "down_since": T0 + i, "up_at": None,
+             "last_seen_before": T0 + i - 1, "cause": "silence"}
+            for i in range(5)]}, 1000), T0)
+    store.ingest_remote_batch(
+        "hostile", "inst-bbbb2222", 1,
+        V.validate_records({"outages": [
+            {"remote_id": i + 1, "camera_ip": f"10.9.{i // 256}.{i % 256}",
+             "down_since": 4_000_000_000.0, "up_at": None,
+             "last_seen_before": 3_999_999_999.0, "cause": "silence"}
+            for i in range(600)]}, 1000), T0 + 1)
+
+    rows = store.list_remote_outages(since=T0 - 1, limit=500)
+    by = {}
+    for r in rows:
+        by[r["sensor_id"]] = by.get(r["sensor_id"], 0) + 1
+    assert by.get("honest", 0) == 5, (
+        f"{by.get('honest', 0)} of 5 honest outages visible among "
+        f"{len(rows)} rows: {by}. One sensor inside its own quota must "
+        f"not be able to fill the only view of relayed outages")
+    assert by.get("hostile", 0) <= 250, (
+        f"the hostile sensor took {by['hostile']} of a 500 limit; the "
+        f"share must be per sensor")
+    store.close()
+    print(f"  relayed outage share: honest 5/5 visible beside "
+          f"{by.get('hostile', 0)} hostile rows")
+
+
+def _check_learned_limit_is_actually_used(tmp: Path) -> None:
+    """Adopting the collector's cap must change what the agent BUILDS.
+
+    The existing test asserted `_learned_records == 500` — that the
+    value was recorded. Nothing asserted it was used, and both
+    `_per_kind` and `_body_limit` could ignore it with the suite
+    green. `_resplit` masks the regression by rescuing each rejected
+    batch, so the documented "the mismatch costs one rejected batch
+    rather than every batch" degrades silently to every batch.
+    """
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import HoundStore
+
+    home = tmp / "learned"
+    home.mkdir()
+    store = HoundStore(path=home / "agent.sqlite")
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url="https://127.0.0.1:1/ingest/v1",
+        tls_fingerprint=["sha256:" + "ab" * 32],
+    )
+    client = RelayClient(cfg, store, now=lambda: T0)
+    before_records = client._per_kind()
+    before_body = client._body_limit()
+    client._learn_limits({"limits": {"max_records_per_batch": 17,
+                                     "max_body_bytes": 70_000}})
+    assert client._per_kind() == 17, (
+        f"_per_kind is {client._per_kind()} after the collector said "
+        f"17 (was {before_records}). Recording the limit without using "
+        f"it means every batch is rejected instead of one")
+    after_body = client._body_limit()
+    assert after_body < before_body and after_body <= 70_000, (
+        f"_body_limit is {after_body} after the collector said 70,000 "
+        f"(was {before_body})")
+    # A collector reporting a LARGER cap must not raise our own.
+    client._learn_limits({"limits": {"max_records_per_batch": 10**6,
+                                     "max_body_bytes": 10**9}})
+    assert client._per_kind() <= before_records, (
+        "a collector advertising a huge cap raised the agent's own; the "
+        "lower of the two is the one that has to hold")
+    store.close()
+    print("  learned limits: adopted into _per_kind and _body_limit, "
+          "and never used to raise the agent's own")
+
+
+def _check_ingest_store_writes_go_through_the_gate(tmp: Path) -> None:
+    """Every relayed store access must yield to the packet loop.
+
+    `CaptureGate` was unit-tested; its call sites in `ingest.py` were
+    not, so removing `gate.deferred()` from the store-write path left
+    the suite green. That is exactly the class
+    `_check_guards_at_their_call_sites` exists for.
+    """
+    from surveillancehound import relay as _R
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.relay import CaptureGate
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "gate.sqlite")
+    gate = CaptureGate()
+    # Not a COUNT — there are several call sites, so "at least one"
+    # still passed with one of them removed. Flag while inside a
+    # deferral, and make the store write itself assert it.
+    import contextlib as _ctx
+    state = {"inside": False, "writes": 0, "ungated": 0}
+    real = gate.deferred
+
+    @_ctx.contextmanager
+    def tracking(*a, **kw):
+        with real(*a, **kw):
+            was, state["inside"] = state["inside"], True
+            try:
+                yield
+            finally:
+                state["inside"] = was
+
+    gate.deferred = tracking
+    # EVERY relayed store access, not just the write. The comment at
+    # the read site says so in as many words — "Serialising only the
+    # write left the collector's packet loop freezing for seconds ...
+    # Every relayed store access belongs here" — and a test that
+    # watched only the write let the gate be removed from the read.
+    for name in ("ingest_remote_batch", "get_remote_sensor"):
+        def make(real):
+            def watched(*a, **kw):
+                state["writes"] += 1
+                if not state["inside"]:
+                    state["ungated"] += 1
+                return real(*a, **kw)
+            return watched
+        setattr(store, name, make(getattr(store, name)))
+    srv = IngestServer(_collector_cfg(0), store, now=lambda: T0,
+                       gate=gate)
+    body = _R.build_batch(
+        "frigate", "inst-aaaa1111", 1,
+        {"devices": [{"ip": "192.168.10.11", "role": "camera",
+                      "first_seen": T0, "last_seen": T0,
+                      "packet_count": 1, "byte_count": 1}],
+         "flows": [], "alerts": [], "outages": [], "uptime": [],
+         "monitor": None}, T0)
+    status, _ = srv.handle_batch(
+        "10.0.0.9", body,
+        {_R.SENSOR_HEADER: "frigate",
+         _R.SIG_HEADER: _R.sign("shared-secret-abcdef", body)})
+    assert status == 200, status
+    assert state["writes"] >= 2, (
+        f"expected the batch to both read the sensor row and write "
+        f"the records; saw {state['writes']} store access(es)")
+    assert state["ungated"] == 0, (
+        f"{state['ungated']} of {state['writes']} relayed store "
+        f"write(s) ran OUTSIDE the capture gate. That write holds the "
+        f"store lock the packet loop waits behind, so an ungated one "
+        f"lets a remote peer stall local capture")
+    store.close()
+    print("  capture gate: the relayed store write runs inside it, not "
+          "merely near it")
+
+
+def _check_outage_rotation_window(tmp: Path) -> None:
+    """The rotation step must match the store's bind window.
+
+    `outages_changed_since` clamps to `_OUTAGE_ID_BINDS` ids, and
+    `enqueue`'s halving loop can lower `_per_kind` — so stepping by
+    `_per_kind` alone made step and window disagree. With the step
+    larger than the window the ids in between are never examined:
+    measured, 2,000 carry-forward ids with a step of 1,000 reached 2
+    of 2,000 offsets in 400 cycles.
+    """
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient, _OUTAGE_ID_BINDS
+    from surveillancehound.store import HoundStore
+
+    home = tmp / "rot2"
+    home.mkdir()
+    store = HoundStore(path=home / "agent.sqlite")
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url="https://127.0.0.1:1/ingest/v1",
+        tls_fingerprint=["sha256:" + "ab" * 32],
+        max_records_per_batch=_OUTAGE_ID_BINDS * 2,
+    )
+    client = RelayClient(cfg, store, now=lambda: T0)
+    # n a clean multiple of the WRONG step, so stepping by `_per_kind`
+    # (1800) instead of the bind window (900) visits every other
+    # window and half the ids are unreachable. At n just above the
+    # step the two strides blur and the gap hides.
+    n = _OUTAGE_ID_BINDS * 10
+    ids = list(range(1, n + 1))
+    # Only the first `_OUTAGE_ID_BINDS` of each rotation are bound by
+    # the store, so that prefix is what actually gets examined.
+    examined = set()
+    for _ in range(14):
+        examined.update(client._rotate_open(ids)[:_OUTAGE_ID_BINDS])
+    assert len(examined) == n, (
+        f"{len(examined)} of {n} carry-forward ids were ever inside "
+        f"the store's bind window after 14 cycles. Ids outside it are "
+        f"never re-queried, so a close among them is never relayed and "
+        f"that camera reads down on the collector forever")
+    store.close()
+    print(f"  outage rotation: all {n} ids enter the "
+          f"{_OUTAGE_ID_BINDS}-id bind window within 14 cycles")
+
+
+def _check_uptime_report_is_bounded(tmp: Path) -> None:
+    """The relayed uptime read must have a limit, and a fair one.
+
+    `remote_uptime_report` was the only relay reader with no `LIMIT`,
+    over a table capped only by `max_rows_per_sensor` (250,000 by
+    default) — and the store's own comment notes a sensor can claim an
+    unbounded number of distinct IPs. Its callers are `hound uptime`,
+    `hound export` and `/api/uptime`, and the OPNsense dashboard runs
+    `hound export` through configd every 10 seconds on the 1-vCPU box
+    this plugin exists for. Measured at one sensor's stock quota:
+    4.29s of CPU and 300 MB of RSS for an 86.8 MB document.
+    """
+    import time as _t
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "bounded.sqlite")
+    wall = _t.time()
+    per = 1200
+    for sid in ("loud", "quiet"):
+        n = per if sid == "loud" else 4
+        store.ingest_remote_batch(
+            sid, "inst-aaaa1111", 1,
+            V.validate_records({"uptime": [
+                {"ip": f"10.{i // 256}.{i % 256}.7", "role": "camera",
+                 "state": "up", "last_seen": wall, "first_seen": wall - 60,
+                 "down_since": None, "current_downtime": 0.0,
+                 "outage_count": 0, "downtime_seconds": 0.0,
+                 "monitored_seconds": 60.0, "availability": 1.0}
+                for i in range(n)]}, 10**6), wall)
+
+    rows = store.remote_uptime_report(wall, 600.0, limit=500)
+    assert len(rows) <= 500, (
+        f"remote_uptime_report returned {len(rows)} rows for a limit of "
+        f"500. Unbounded, one key holder makes every dashboard poll "
+        f"cost seconds of CPU and hundreds of MB")
+    by = {}
+    for r in rows:
+        by[r["sensor_id"]] = by.get(r["sensor_id"], 0) + 1
+    assert by.get("quiet", 0) == 4, (
+        f"the quiet sensor got {by.get('quiet', 0)} of its 4 cameras "
+        f"through beside a loud one: {by}. The bound has to be a fair "
+        f"share, or a noisy sensor hides every other sensor's cameras")
+    assert by.get("loud", 0) <= 250, by
+    # Deterministic order, since the rows are now fetched per sensor.
+    assert rows == sorted(rows, key=lambda r: (r["sensor_id"], r["ip"])), (
+        "rows must come back in a stable order")
+    store.close()
+    print(f"  uptime read: bounded at 500 with a fair share "
+          f"({by}), quiet sensor fully visible")
 
 
 def _check_blind_sensor_is_never_rendered_current(tmp: Path) -> None:
@@ -1059,7 +1529,13 @@ def _check_shutdown_flushes_the_relay(tmp: Path) -> None:
     import inspect
     from surveillancehound import daemon as _d
 
-    src = inspect.getsource(_d.Hound.run)
+    # Comments stripped: `pass  # self.relay.final_flush()` passed
+    # the plain substring check, so the only guard on a hard
+    # constraint could be satisfied by deleting the call and leaving
+    # the text behind.
+    raw = inspect.getsource(_d.Hound.run)
+    src = "\n".join(
+        line.split("#", 1)[0] for line in raw.splitlines())
     assert "final_flush" in src, (
         "daemon.Hound.run() never calls relay.final_flush(). The last "
         "window of observations is then left spooled on every clean "
@@ -1707,10 +2183,17 @@ def _check_drain_deadline_is_total(tmp: Path) -> None:
         # `_CONN_BUDGET` (120s) per unauthenticated connection. That is
         # the slow-loris the budget exists to stop, and the test for it
         # was blind to the only mutation that mattered.
-        assert held < 4.0, (
+        # 2.6s, not 4.0s. The pre-fix measurement in this docstring is
+        # 3.80-3.84s, so a 4.0s bound sat ABOVE the regression it was
+        # written to catch: restoring the old per-iteration timeout
+        # made this test PASS while printing 3.80s and claiming the
+        # bound had held. An absolute bound is only an improvement on
+        # a self-scaling one if it is tighter than the defect.
+        assert held < 2.6, (
             f"a dribbling peer held the drain {held:.2f}s; the stated "
             f"bound is {_DRAIN_BUDGET_S}s and the per-iteration timeout "
-            f"must come from the REMAINING budget")
+            f"must come from the REMAINING budget. ~3.8s means one full "
+            f"budget per byte received, which is the regression")
         assert _DRAIN_BUDGET_S <= 2.5, (
             f"_DRAIN_BUDGET_S is {_DRAIN_BUDGET_S}s. An unauthenticated "
             f"peer can hold a worker for this long per refusal; at 16 "
@@ -4771,7 +5254,7 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
         _held = _t.time() - _t0
         # Absolute, for the same reason as the other drain test: a
         # bound read from the module cannot catch the module changing.
-        assert _held < 4.0 and _ding._DRAIN_BUDGET_S <= 2.5, (
+        assert _held < 2.6 and _ding._DRAIN_BUDGET_S <= 2.5, (
             f"the body drain held {_held:.1f}s against a stated "
             f"{_ding._DRAIN_BUDGET_S}s budget; a dribbling peer owns the "
             f"handler for as long as it likes"
@@ -4873,9 +5356,16 @@ def main() -> int:
         _check_guards_at_their_call_sites(Path(td))
         _check_disk_guard_needs_real_space(Path(td))
         _check_blind_sensor_is_never_rendered_current(Path(td))
+        _check_uptime_report_is_bounded(Path(td))
+        _check_collector_surfaces_show_relayed_rows(Path(td))
+        _check_relayed_outage_fair_share(Path(td))
+        _check_learned_limit_is_actually_used(Path(td))
+        _check_ingest_store_writes_go_through_the_gate(Path(td))
+        _check_outage_rotation_window(Path(td))
         _check_resplit_always_makes_progress(Path(td))
         _check_clock_skew_does_not_destroy_data(Path(td))
         _check_prune_relay_days_returns_bytes(Path(td))
+        _check_prune_does_not_outrun_a_live_daemon(Path(td))
         _check_relayed_alerts_count_in_the_tile(Path(td))
         _check_shutdown_flushes_the_relay(Path(td))
         _check_instance_reset_log_is_throttled(Path(td))

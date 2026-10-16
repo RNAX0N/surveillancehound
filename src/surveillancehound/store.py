@@ -42,6 +42,11 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# A heartbeat newer than this means the daemon is running. Used only
+# to refuse the offline compaction, which swaps the database file and
+# would otherwise leave a live daemon writing to an unlinked inode.
+_DAEMON_ALIVE_S = 120.0
+
 
 @dataclass
 class DeviceRow:
@@ -448,6 +453,33 @@ CREATE TABLE IF NOT EXISTS remote_uptime (
 -- Relayed dispatch must not write `notifications`, whose alert_id
 -- implicitly means alerts.id — relayed ids collide with local ones and
 -- would make the audit trail ambiguous and attacker-writable.
+-- Relay indices on the COLLECTOR-TIME columns.
+--
+-- Rounds 19-20 moved every relay read, the retention sweep and the
+-- per-batch quota trim onto `ingested_at`/`reported_at`/`attempted_at`
+-- and left the indices on `ts`/`last_seen`, which none of those paths
+-- use. Measured at 250k rows: `_enforce_sensor_quota` cost 80ms per
+-- batch INSIDE the ingest transaction (15ms even with nothing to
+-- trim), and `prune_remote` 0.65s from the watchdog tick, which holds
+-- `_loop_lock` and therefore the packet path. The VACUUM was taken
+-- off that tick for exactly this reason; unindexed scans put a
+-- smaller version of it back.
+CREATE INDEX IF NOT EXISTS idx_rflows_sensor_ing
+    ON remote_flows (sensor_id, ingested_at);
+CREATE INDEX IF NOT EXISTS idx_rflows_ing   ON remote_flows (ingested_at);
+CREATE INDEX IF NOT EXISTS idx_ralerts_sensor_ing
+    ON remote_alerts (sensor_id, ingested_at);
+CREATE INDEX IF NOT EXISTS idx_ralerts_ing  ON remote_alerts (ingested_at);
+CREATE INDEX IF NOT EXISTS idx_routages_sensor_ing
+    ON remote_outages (sensor_id, ingested_at);
+CREATE INDEX IF NOT EXISTS idx_routages_ing ON remote_outages (ingested_at);
+CREATE INDEX IF NOT EXISTS idx_rdevices_sensor_ing
+    ON remote_devices (sensor_id, ingested_at);
+CREATE INDEX IF NOT EXISTS idx_rdevices_ing ON remote_devices (ingested_at);
+CREATE INDEX IF NOT EXISTS idx_ruptime_sensor_rep
+    ON remote_uptime (sensor_id, reported_at);
+CREATE INDEX IF NOT EXISTS idx_ruptime_rep  ON remote_uptime (reported_at);
+
 CREATE TABLE IF NOT EXISTS remote_notifications (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     sensor_id       TEXT NOT NULL,
@@ -1474,8 +1506,8 @@ class HoundStore:
         return [dict(r) for r in rows]
 
     def remote_uptime_report(self, now: float, stale_after: float,
-                             blind_sensors: "Sequence[str]" = ()
-                             ) -> list[dict]:
+                             blind_sensors: "Sequence[str]" = (),
+                             limit: int = 5000) -> list[dict]:
         """Relayed camera state, stale-gated.
 
         A sensor that stopped reporting leaves its last snapshot behind. The
@@ -1487,10 +1519,25 @@ class HoundStore:
         the same treatment, for the same reason: a figure from a blind
         sensor is not a current figure.
         """
+        # BOUNDED, and fairly. This was the only relay reader with no
+        # limit at all, over a table capped only by
+        # `max_rows_per_sensor` — 250,000 by default, and the store's
+        # own comment notes a sensor can claim an unbounded number of
+        # distinct IPs. Measured with one sensor at its stock quota:
+        # `hound export` took 4.29s of CPU and 300 MB of RSS to emit an
+        # 86.8 MB document, and the OPNsense dashboard runs it through
+        # configd every 10 seconds on a 1-vCPU box.
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM remote_uptime ORDER BY sensor_id, ip"
-            ).fetchall()
+            sensors = [r["sensor_id"] for r in self._conn.execute(
+                "SELECT DISTINCT sensor_id FROM remote_uptime").fetchall()]
+            if not sensors:
+                return []
+            share = max(1, int(limit) // len(sensors))
+            rows = []
+            for sid in sensors:
+                rows.extend(self._conn.execute(
+                    "SELECT * FROM remote_uptime WHERE sensor_id = ? "
+                    "ORDER BY ip LIMIT ?", (sid, share)).fetchall())
         out = []
         for r in rows:
             d = dict(r)
@@ -1523,6 +1570,8 @@ class HoundStore:
             else:
                 d["stale"] = False
             out.append(d)
+        # Stable order regardless of the per-sensor fetch above.
+        out.sort(key=lambda d: (d["sensor_id"], d["ip"]))
         return out
 
     def list_remote_outages(self, since: float,
@@ -1674,7 +1723,7 @@ class HoundStore:
         # are reusable in place, which is what the disk guard counts.
         return deleted
 
-    def vacuum(self) -> tuple[int, int]:
+    def vacuum(self, offline: bool = False) -> tuple[int, int]:
         """Rebuild the database to return free pages to the filesystem.
 
         NOT for the daemon. See the note in `prune_remote`: this holds
@@ -1684,54 +1733,102 @@ class HoundStore:
         fine in a one-shot CLI process and unacceptable inside the
         packet loop.
 
-        Prefers `VACUUM INTO`, which needs room for the LIVE data
-        only — a few MB after retention has deleted most of the rows.
-        A plain `VACUUM` needs roughly twice the CURRENT file size
-        free, which is exactly false on the full disk this command is
-        the documented recovery for: the collector answers 507 below
-        `min_free_disk_mb`, so the one state an operator needs to
-        reclaim from was the one state the reclaim refused to run in.
+        PLAIN `VACUUM` BY DEFAULT, because it is the only variant that
+        is safe while the daemon is running.
+
+        A previous revision preferred `VACUUM INTO` plus `os.replace`,
+        to avoid the plain form's need for roughly twice the file size
+        free. That was a worse bug than the one it solved. `vacuum()`
+        is only ever reached from `hound prune`, a SEPARATE PROCESS,
+        and the daemon is another process holding the old inode open.
+        `os.replace` is invisible to it: it goes on writing to an
+        unlinked file forever, with no error on either side. Measured
+        through the documented command with a daemon-like writer
+        running: 777 of 1363 writes (57%) silently discarded, and
+        `monitor_heartbeat` frozen at the swap instant so every reader
+        renders a healthy collector as stalled. The replacement file
+        also took the pruning process's umask and ownership — root on
+        OPNsense, where the daemon runs as `hound`, so the breakage
+        survives the restart that would otherwise have ended it.
+
+        SQLite's own locking coordinates two processes through a plain
+        VACUUM. It does not know about `os.replace`.
+
+        `offline=True` opts into the compacting form for the case the
+        plain one cannot serve — a disk too full to hold a second copy
+        — and refuses unless the heartbeat shows no daemon running.
+        The CLI only passes it when the operator asks explicitly.
 
         Returns (before, after) file sizes.
         """
         before = self.path.stat().st_size
         if self.readonly:
             return before, before
-        live = self._live_bytes()
-        free = self._fs_free()
-        tmp = self.path.with_name(self.path.name + ".vacuum.tmp")
-        # 1.15x the live data: VACUUM INTO writes a fresh compact
-        # database and nothing else.
-        if live and free is not None and free > live * 1.15:
-            try:
-                with self._lock:
-                    tmp.unlink(missing_ok=True)
-                    self._conn.execute("VACUUM INTO ?", (str(tmp),))
-                    # Close before replacing so the WAL is
-                    # checkpointed and removed; a stale -wal beside a
-                    # swapped-in main file is a corrupt store.
-                    self._conn.close()
-                    os.replace(tmp, self.path)
-                    for suffix in ("-wal", "-shm"):
-                        Path(str(self.path) + suffix).unlink(
-                            missing_ok=True)
-                    self._connect()
-                return before, self.path.stat().st_size
-            except (sqlite3.Error, OSError) as e:
-                # VACUUM INTO needs SQLite 3.27; fall through to the
-                # in-place rebuild rather than leaving this unreclaimed.
-                log.warning("store: VACUUM INTO failed (%s); trying an "
-                            "in-place VACUUM", e)
-                tmp.unlink(missing_ok=True)
-                try:
-                    self._conn.execute("SELECT 1")
-                except sqlite3.Error:
-                    self._connect()
+        if offline:
+            return before, self._compact_offline(before)
         if not self._vacuum_is_safe():
             return before, before
         with self._lock:
             self._conn.execute("VACUUM")
+            # Checkpoint, or the rebuild sits in -wal and the file on
+            # disk is unchanged — so this returned before == after and
+            # the CLI told the operator the reclaim had failed for
+            # lack of disk, which `_vacuum_is_safe` had just ruled out.
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return before, self.path.stat().st_size
+
+    def _compact_offline(self, before: int) -> int:
+        """`VACUUM INTO` + swap. ONLY safe with the daemon stopped.
+
+        Needs room for the live data rather than twice the file, which
+        is why it exists; see `vacuum()` for why it is not the default.
+        """
+        last_packet, updated = self.heartbeat()
+        if updated and (time.time() - updated) < _DAEMON_ALIVE_S:
+            raise RuntimeError(
+                f"the daemon wrote its heartbeat "
+                f"{time.time() - updated:.0f}s ago, so it is running. "
+                f"Compacting swaps the database file underneath it and "
+                f"everything it writes afterwards goes to a file "
+                f"nothing will ever read. Stop the service first."
+            )
+        live = self._live_bytes()
+        free = self._fs_free()
+        if live and free is not None and free < live * 1.15:
+            log.warning(
+                "store: not compacting — needs about %.0f MB free and "
+                "only %.0f MB is available.", live * 1.15 / 1e6,
+                free / 1e6)
+            return before
+        tmp = self.path.with_name(self.path.name + ".vacuum.tmp")
+        try:
+            mode = self.path.stat().st_mode & 0o7777
+            st = self.path.stat()
+        except OSError:
+            mode, st = 0o600, None
+        with self._lock:
+            tmp.unlink(missing_ok=True)
+            self._conn.execute("VACUUM INTO ?", (str(tmp),))
+            # Mode and owner come from the pruning process's umask
+            # otherwise: measured 0600 -> 0644, and on OPNsense a root
+            # prune would leave the store root-owned under a daemon
+            # running as `hound`.
+            os.chmod(tmp, mode)
+            if st is not None and hasattr(os, "chown"):
+                try:
+                    os.chown(tmp, st.st_uid, st.st_gid)
+                except (OSError, AttributeError):
+                    pass
+            # Close FIRST so the WAL is checkpointed into the OLD file
+            # and removed. Replacing while a -wal survives leaves that
+            # stale journal beside a different database, which is a
+            # corrupt store.
+            self._conn.close()
+            for suffix in ("-wal", "-shm"):
+                Path(str(self.path) + suffix).unlink(missing_ok=True)
+            os.replace(tmp, self.path)
+            self._connect()
+        return self.path.stat().st_size
 
     def _live_bytes(self) -> int:
         """Bytes of pages actually in use. 0 if it cannot be read."""

@@ -260,8 +260,23 @@ def cmd_uptime(args: argparse.Namespace) -> int:
                 return 0
             print(f"\n{'sensor':12s} {'camera':18s} {'from':19s} "
                   f"{'to':19s} {'duration':>10s}  cause")
+            # Sort key is OUR clock, never the sensor's.
+            #
+            # `store.list_remote_outages` orders on `ingested_at`
+            # precisely because `validate_outage` accepts `down_since`
+            # up to the year 2100, so one key holder can put
+            # future-dated rows at the top of any query ordered by it.
+            # Re-sorting here on `down_since` handed that back:
+            # measured, 300 rows dated 2096 pushed the first honest
+            # row to display line 254, rendered as tidy `-` durations
+            # by the clamp two lines below.
+            #
+            # A local row's `down_since` IS our clock — this daemon
+            # observed it — so the two are comparable as "when did we
+            # learn of this".
             rows = [("local", o.camera_ip, o.down_since, o.up_at,
-                     o.duration(now), o.cause) for o in local]
+                     o.duration(now), o.cause, o.down_since)
+                    for o in local]
             # max(0, ...): `down_since` is sensor-supplied and
             # validated only up to the year 2100, so a future value
             # made this negative and `_dur` printed a bare "-" — a
@@ -269,9 +284,9 @@ def cmd_uptime(args: argparse.Namespace) -> int:
             rows += [(r["sensor_id"], r["camera_ip"], r["down_since"],
                       r["up_at"],
                       max(0.0, (r["up_at"] or now) - r["down_since"]),
-                      r["cause"]) for r in relayed]
-            rows.sort(key=lambda r: r[2], reverse=True)
-            for sensor, ip, down, up, dur, cause in rows:
+                      r["cause"], r["ingested_at"]) for r in relayed]
+            rows.sort(key=lambda r: r[6], reverse=True)
+            for sensor, ip, down, up, dur, cause, _k in rows:
                 until = (
                     f"{datetime.fromtimestamp(up):%Y-%m-%d %H:%M:%S}"
                     if up is not None else "(ongoing)"
@@ -810,13 +825,26 @@ def cmd_prune(args: argparse.Namespace) -> int:
         if kwargs:
             deleted.update(store.prune(**kwargs))
         if args.relay_days is not None and any(deleted.values()):
-            before, after = store.vacuum()
+            try:
+                before, after = store.vacuum(offline=args.offline_compact)
+            except RuntimeError as e:
+                sys.exit(f"error: {e}")
             if after < before:
                 print(f"reclaimed {(before - after) / 1e6:,.1f} MB "
                       f"({before:,} -> {after:,} bytes)")
             else:
-                print(f"store is {before:,} bytes; no space reclaimed "
-                      f"(not enough free disk to rebuild it)")
+                # Do not guess the cause. The plain rebuild needs about
+                # twice the file size free; the compacting one needs
+                # room for the live data but requires the daemon to be
+                # stopped, because it swaps the file and a running
+                # daemon would keep writing to the old inode.
+                print(f"store is {before:,} bytes; rows were deleted but "
+                      f"no space was returned to the filesystem. The "
+                      f"freed pages are reusable in place, so ingest is "
+                      f"not blocked by this. To shrink the file, free "
+                      f"about {before * 2 / 1e6:,.0f} MB and re-run — or "
+                      f"stop the daemon and re-run with "
+                      f"--offline-compact, which needs far less.")
         if not any(deleted.values()):
             print("nothing to prune")
         else:
@@ -1024,6 +1052,12 @@ def build_parser() -> argparse.ArgumentParser:
                           "by when this collector received them, then "
                           "rebuild the store to return the space to the "
                           "filesystem")
+    p_p.add_argument("--offline-compact", action="store_true",
+                     help="STOP THE DAEMON FIRST. Rebuilds the store into "
+                          "a new file and swaps it in, which needs far less "
+                          "free disk than the default in-place rebuild but "
+                          "is only safe with nothing else writing. Refuses "
+                          "if the heartbeat shows the daemon running.")
     p_p.set_defaults(func=cmd_prune)
 
     p_w = sub.add_parser("web", help="serve the local dashboard")

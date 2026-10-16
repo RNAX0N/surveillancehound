@@ -1134,20 +1134,34 @@ class RelayClient:
             # kind cannot move anything. Deal the kinds out instead.
             for i, (kind, items) in enumerate(sorted(lists.items())):
                 halves[i % 2][kind] = items
-        # `monitor` goes in EVERY part, not just the first.
+        # `monitor` goes in EVERY part, and is REBUILT, not copied.
         #
         # It is a snapshot upserted onto the sensor row, not a counted
         # record, so repeating it is idempotent. Sending it with only
         # the first half meant the second half arrived with no monitor
         # block — and the collector writes `mon_blind` unconditionally
-        # from `records.get("monitor") or {}`, so that CLEARED it. A
-        # sensor that had reported itself blind then rendered as
-        # reporting, with its camera rows and availability shown as
-        # current, on every surface. That is exactly the fabrication
-        # the `blind_sensors` gating exists to prevent.
+        # from `records.get("monitor") or {}`, so that CLEARED it.
+        #
+        # Copying the ORIGINAL block into both parts fixed that and
+        # created a subtler version of the same fabrication. The parts
+        # get new, highest sequence numbers and go to the TAIL of the
+        # spool, so they are posted after batches enqueued later that
+        # carry a newer monitor — and `build_batch` re-stamps
+        # `sent_at`, so the stale snapshot looks freshest to the
+        # collector and its upsert takes it. A sensor that had gone
+        # blind rendered as seeing again. Measured: posting order
+        # (2, blind=True), (3, blind=False), (4, blind=False), ending
+        # at mon_blind = 0.
+        #
+        # These parts are being sent NOW, so they carry what is true
+        # NOW. There is no ordering guarantee to repair; there is just
+        # no reason to ship a snapshot we know is out of date.
+        fresh = dict(scalars)
+        if "monitor" in fresh:
+            fresh["monitor"] = self._monitor()
         for half in halves:
             if any(half.get(k) for k in half):
-                half.update(scalars)
+                half.update(fresh)
         shaped = [h for h in halves
                   if any(isinstance(v, list) and v for v in h.values())]
         if len(shaped) < 2:
