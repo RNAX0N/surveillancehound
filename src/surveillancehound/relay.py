@@ -47,8 +47,15 @@ log = logging.getLogger(__name__)
 # documented default rather than discovering the cap by rejection.
 _MAX_RECORDS_PER_KIND = 1000
 # Seconds between spooled batches when replaying a backlog. Chosen to
-# sit under the collector's default request budget (60/min) with room
+# sit under the collector's DEFAULT request budget (60/min) with room
 # to spare, since the agent cannot see that setting.
+#
+# If an operator lowers max_batches_per_minute below ~50 the agent
+# will out-pace it and self-throttle on 429s: lossless, because a 429
+# ends the flush cycle without acking, but slower than it looks. That
+# is the same both-ends coupling as max_records_per_batch, and the
+# honest fix is to configure the pair together rather than to guess
+# here.
 _REPLAY_PACE_S = 1.2
 
 SCHEMA_VERSION = 1

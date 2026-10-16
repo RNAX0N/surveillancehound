@@ -822,34 +822,95 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             self.end_headers()
             self.wfile.write(raw)
 
-        def do_GET(self):          # noqa: N802
+        def _drain_unread_body(self) -> None:
+            """Discard a bounded amount of an unread request body.
+
+            Closing a socket that still holds unread incoming data
+            makes the kernel send RST, which discards the response we
+            just wrote — so a client refused before its body was read
+            would never see the 429 explaining why. Bounded in size
+            and in time: this runs only on the rate-limited path, so
+            it cannot be used to hold a connection open.
+            """
+            try:
+                remaining = min(int(self.headers.get("Content-Length") or 0),
+                                65536)
+            except (TypeError, ValueError):
+                return
+            if remaining <= 0:
+                return
+            try:
+                self.connection.settimeout(2.0)
+            except OSError:
+                return
+            try:
+                while remaining > 0:
+                    try:
+                        chunk = self.rfile.read(min(remaining, 8192))
+                    except (OSError, ValueError):
+                        return
+                    if not chunk:
+                        return
+                    remaining -= len(chunk)
+            finally:
+                try:
+                    self.connection.settimeout(self.timeout)
+                except OSError:
+                    pass
+
+        def send_error(self, code, message=None, explain=None):
+            # The stdlib error path (501 for an unknown verb, 414, …)
+            # sets close_connection and writes its reply. If the peer
+            # sent a body we never read, closing makes the kernel RST
+            # and the client sees a connection reset instead of the
+            # status telling it what was wrong. Drain first.
+            self._drain_unread_body()
+            super().send_error(code, message, explain)
+
+        def parse_request(self):
+            """Meter every request, whatever its method.
+
+            Metering inside do_GET/do_POST missed every OTHER verb:
+            BaseHTTPRequestHandler dispatches an unknown method
+            straight to send_error(501) without ever reaching them, so
+            a PUT flood was unmetered — the exact class the previous
+            commit claimed to have closed, through a different shape.
+            parse_request runs after the request line is read and
+            before dispatch, which is the one place that sees all of
+            them.
+
+            It also closes the connection for a source in cooldown. The
+            cooldown was only consulted at accept, so a peer holding
+            ONE keep-alive socket never re-entered that path and kept
+            being served cheap 429s indefinitely — the bound there was
+            TCP backpressure, not the mechanism this comment describes.
+            """
+            if not super().parse_request():
+                return False
             source = self.client_address[0] if self.client_address else "?"
-            if not server._limiter.allow(source, server.now()):
+            now = server.now()
+            if server._limiter.in_cooldown(source, now):
+                self.close_connection = True
+                self._drain_unread_body()
+                self._reply(HTTPStatus.TOO_MANY_REQUESTS,
+                            {"error": "cooling down"})
+                return False
+            if not server._limiter.allow(source, now):
+                self.close_connection = True
+                self._drain_unread_body()
                 self._reply(HTTPStatus.TOO_MANY_REQUESTS,
                             {"error": "slow down"})
-                return
+                return False
+            return True
+
+        def do_GET(self):          # noqa: N802
             self._reply(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "POST only"})
 
         def do_POST(self):         # noqa: N802
             source = self.client_address[0] if self.client_address else "?"
 
-            # Budget FIRST, before the path check and before any
-            # other work.
-            #
-            # Rejections used to be the cheapest thing a peer could
-            # ask for: a pipelined POST that is refused still costs a
-            # full stdlib request cycle — parse_request, the email
-            # header parser, send_response, json.dumps — about 61us of
-            # GIL-held Python each, and 404s skipped the budget
-            # entirely by being checked first. Measured, one
-            # connection with no key took 80% of packet-parsing
-            # throughput and twelve took 97%. Counting every request
-            # and then refusing the source AT ACCEPT for a cooldown
-            # turns an unbounded request rate into a bounded one.
-            if not server._limiter.allow(source, server.now()):
-                self._reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": "slow down"})
-                return
-
+            # Metering happens in parse_request, which sees every
+            # method and runs before dispatch.
             if self.path != INGEST_PATH:
                 self._reply(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return

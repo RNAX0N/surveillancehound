@@ -718,12 +718,31 @@ def _check_listener_limits(tmp: Path) -> None:
                     c.request(method, path, body=b"{}",
                               headers={"Content-Length": "2"})
                     return c.getresponse().status
+                except OSError as e:
+                    return type(e).__name__
                 finally:
                     c.close()
 
             codes = [hit(path="/nope") for _ in range(6)]
             assert 429 in codes, (
                 f"a 404 path skipped the request budget entirely: {codes}"
+            )
+
+            # EVERY method, not just the ones we implement. An unknown
+            # verb is dispatched by the stdlib straight to
+            # send_error(501) and never reaches do_GET/do_POST, so
+            # metering there left PUT/HEAD/OPTIONS unmetered — the same
+            # unmetered-request class, through a different shape.
+            lim._limiter._hits.clear()
+            lim._limiter._cooldown.clear()
+            verb_codes = [hit(method="PUT") for _ in range(6)]
+            assert 429 in verb_codes, (
+                f"an unknown HTTP verb skipped the request budget: "
+                f"{verb_codes}"
+            )
+            assert all(isinstance(c, int) for c in verb_codes[:3]), (
+                f"an unknown verb with a body was reset instead of "
+                f"answered: {verb_codes[:3]}"
             )
             # and the source is then refused at ACCEPT, where refusing
             # is cheapest, rather than served another request cycle
