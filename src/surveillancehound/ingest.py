@@ -276,13 +276,22 @@ class IngestServer:
             return HTTPStatus.BAD_REQUEST, {
                 "error": f"seq must be an integer in [1, {_MAX_SEQ}]"}
 
+        # Slot first, then the gate, so the gate is checked as close to
+        # the store access as possible. Measured, the order makes no
+        # difference today — the slot already admits one thread at a
+        # time, so only one is ever past the gate either way — but it
+        # is the order that stays correct if the slot is ever widened.
+        # The bound on the tick's wait comes from the SLOT; the gate
+        # adds protection against losing an unfair-RLock race
+        # repeatedly rather than once.
+        #
         # Under the slot: this is a store read, and 32 threads doing it
         # concurrently contend with the watchdog tick for
         # HoundStore._lock exactly as a write does. Serialising only
         # the write left the collector's packet loop freezing for
         # seconds — a 5x improvement that was still remote-triggered
         # blindness. Every relayed store access belongs here.
-        with self.gate.deferred(), self._write_slot:
+        with self._write_slot, self.gate.deferred():
             known = self.store.get_remote_sensor(sensor_id)
         if known is not None and known.instance_id == instance_id:
             if seq <= known.last_seq:
@@ -344,7 +353,7 @@ class IngestServer:
         # to prevent by avoiding `_loop_lock`. Avoiding that lock was
         # necessary and not sufficient; the store lock is the other
         # half of the same path.
-        with self.gate.deferred(), self._write_slot:
+        with self._write_slot, self.gate.deferred():
             counts = self.store.ingest_remote_batch(
                 sensor_id, instance_id, seq, records, now,
                 skew=skew, body_bytes=len(body),
