@@ -668,8 +668,12 @@ def _check_listener_limits(tmp: Path) -> None:
     clock = {"t": T0}
     port = _free_port()
     store = HoundStore(path=tmp / "lim.sqlite")
+    # Generous budget for the shape checks below: EVERY request now
+    # counts against it, including 404/405/413, because a rejection
+    # that skipped the budget was the cheapest request a flooder
+    # could make. The limiter itself is exercised separately.
     srv = IngestServer(_collector_cfg(port, max_body_bytes=2048,
-                                      max_batches_per_minute=3),
+                                      max_batches_per_minute=100),
                        store, now=lambda: clock["t"])
     assert srv.start()
 
@@ -696,11 +700,44 @@ def _check_listener_limits(tmp: Path) -> None:
         assert raw(headers={"Transfer-Encoding": "chunked"}) == 400, \
             "chunked should be rejected"
 
-        # rate limit is by source address and fires before auth
-        codes = [raw(body=b"{}") for _ in range(6)]
-        assert 429 in codes, f"rate limit never fired: {codes}"
-        print("  listener: 405/404/413/400-chunked enforced; rate limit is "
-              "pre-auth and by source address")
+        # Rate limit is by source address and fires before auth, and
+        # counts EVERY request shape — a 404 used to skip it entirely,
+        # which made "POST /nope" an unmetered way to burn collector
+        # CPU.
+        lim_port = _free_port()
+        lim_store = HoundStore(path=tmp / "lim2.sqlite")
+        lim = IngestServer(_collector_cfg(lim_port, max_batches_per_minute=3),
+                           lim_store, now=lambda: clock["t"])
+        assert lim.start()
+        try:
+            def hit(path="/ingest/v1", method="POST"):
+                c = http.client.HTTPSConnection(
+                    "127.0.0.1", lim_port, timeout=10,
+                    context=_ssl._create_unverified_context())
+                try:
+                    c.request(method, path, body=b"{}",
+                              headers={"Content-Length": "2"})
+                    return c.getresponse().status
+                finally:
+                    c.close()
+
+            codes = [hit(path="/nope") for _ in range(6)]
+            assert 429 in codes, (
+                f"a 404 path skipped the request budget entirely: {codes}"
+            )
+            # and the source is then refused at ACCEPT, where refusing
+            # is cheapest, rather than served another request cycle
+            assert lim._limiter.in_cooldown("127.0.0.1", clock["t"]), (
+                "a source over budget is not put in cooldown, so it can "
+                "keep buying request cycles at the rate it can send them"
+            )
+        finally:
+            lim.stop()
+            lim_store.close()
+
+        print("  listener: 405/404/413/400-chunked enforced; every request "
+              "shape counts against the budget; over-budget sources enter "
+              "an accept-time cooldown")
     finally:
         srv.stop()
         store.close()

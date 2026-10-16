@@ -90,11 +90,18 @@ them here.
 
 - **A compromised agent can degrade the relay.** It holds a valid key,
   so it can occupy ingest capacity from several addresses. Each
-  connection is time-bounded and each address is capped, so this is
-  slowdown rather than silence, and a starved sensor raises
-  `sensor_offline` after `sensor_timeout_seconds`. The remedy is to
-  remove that sensor's key from `[[relay.sensor]]` and restart;
-  `hound sensors --forget <id>` then clears what it sent.
+  connection is time-bounded, each address is capped, and requests are
+  metered per source — so a starved sensor raises `sensor_offline`
+  after `sensor_timeout_seconds` rather than vanishing.
+
+  Do not read that as contained. It holds an address your firewall
+  rule must permit, so that control does not apply to it, and a flood
+  from an allowed address costs local capture throughput — which no
+  alert reports, because packets are still arriving and
+  `capture_stalled` only fires when none are. A compromised agent is a
+  reason to remove its key promptly: delete it from
+  `[[relay.sensor]]`, restart, then `hound sensors --forget <id>` to
+  clear what it sent.
 - **Agents behind one NAT share everything keyed on their address:**
   the per-source connection cap, the batches-per-minute bucket, and
   the reserved-capacity credit one of them earns. A hostile host

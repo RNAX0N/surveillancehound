@@ -45,6 +45,10 @@ _CPU_SLOTS = 2
 # until it completes the peer has proven nothing and is holding a
 # worker slot.
 _HANDSHAKE_TIMEOUT = 5.0
+# How long a source that exhausted its request budget is refused at
+# accept. Long enough that flooding is not free, short enough that a
+# misconfigured agent recovers on its own.
+_REJECT_COOLDOWN = 30.0
 # Absolute wall-clock a connection may hold a worker slot, from accept
 # to done. This is the bound that was missing: the handshake deadline
 # only covers a peer that sends nothing, and the socket timeout is
@@ -83,6 +87,7 @@ class _RateLimiter:
     def __init__(self, per_minute: int):
         self.per_minute = max(1, int(per_minute))
         self._hits: dict[str, deque] = defaultdict(deque)
+        self._cooldown: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def allow(self, source: str, now: float) -> bool:
@@ -91,10 +96,25 @@ class _RateLimiter:
             while q and (now - q[0]) > 60.0:
                 q.popleft()
             if len(q) >= self.per_minute:
+                # Over budget: refuse at accept for a while, so the
+                # next attempt costs this peer a handshake it does not
+                # get to complete rather than costing us a request.
+                self._cooldown[source] = now + _REJECT_COOLDOWN
                 return False
             q.append(now)
             if len(self._hits) > 1024:
                 self._sweep(now)
+            return True
+
+    def in_cooldown(self, source: str, now: float) -> bool:
+        """Is this source serving a penalty? Checked at accept time."""
+        with self._lock:
+            until = self._cooldown.get(source)
+            if until is None:
+                return False
+            if until <= now:
+                del self._cooldown[source]
+                return False
             return True
 
     def _sweep(self, now: float) -> None:
@@ -111,6 +131,8 @@ class _RateLimiter:
                  if not v or (now - v[-1]) > 60.0]
         for k in stale:
             del self._hits[k]
+        for k in [k for k, v in self._cooldown.items() if v <= now]:
+            del self._cooldown[k]
         if len(self._hits) > 4096:
             # Still oversized: a genuine flood from many live sources.
             # Keep the most recent and let the rest re-register; the
@@ -166,6 +188,9 @@ class IngestServer:
         handler = _make_handler(server, ctx)
         try:
             httpd = _Server((self.cfg.listen_host, self.cfg.listen_port), handler)
+            # The accept path needs the limiter: a source that burned
+            # its budget is refused there, where refusing is cheapest.
+            httpd.limiter = self._limiter
         except OSError as e:
             log.error(
                 "relay: cannot bind %s:%s: %s — listener not started. The "
@@ -537,6 +562,11 @@ class _Server(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         source = client_address[0] if client_address else "?"
+        limiter = getattr(self, "limiter", None)
+        if limiter is not None and limiter.in_cooldown(source, time.time()):
+            self.rejected_overload += 1
+            self.shutdown_request(request)
+            return
         with self._src_lock:
             in_use = sum(self._per_source.values())
             free = self.max_workers - in_use
@@ -572,10 +602,9 @@ class _Server(ThreadingHTTPServer):
             return
         with self._src_lock:
             self._per_source[source] = self._per_source.get(source, 0) + 1
-            # [deadline, socket-to-shut-down]. The key is the raw
-            # socket for the connection's whole life so cleanup can
-            # always find it; the socket in the value is swapped for
-            # the wrapped one once the handshake completes.
+            # The key is the raw socket for the connection's whole
+            # life so cleanup can always find it; the socket in the
+            # value is swapped for the wrapped one after the handshake.
             # [deadline, socket-to-shut-down, requests-completed]
             self._deadlines[request] = [time.monotonic() + _CONN_BUDGET,
                                         request, 0]
@@ -679,8 +708,17 @@ class _Server(ThreadingHTTPServer):
                     closed = True
                 except OSError:
                     pass
-                with self._src_lock:
-                    self._deadlines.pop(key, None)
+                if closed:
+                    with self._src_lock:
+                        self._deadlines.pop(key, None)
+                else:
+                    # Leave it registered: a connection we could not
+                    # close must stay budgeted, or a single failure
+                    # exempts it forever.
+                    with self._src_lock:
+                        entry = self._deadlines.get(key)
+                        if entry is not None:
+                            entry[0] = now + _CONN_BUDGET
                 if not closed:
                     log.debug("relay: budgeted connection was already gone")
                 elif served:
@@ -691,9 +729,9 @@ class _Server(ThreadingHTTPServer):
                     # operator who cannot tell a real slot-hogger from
                     # a polite client learns to ignore both.
                     log.info(
-                        "relay: closed an idle connection after %.0fs; it "
-                        "had completed %d request(s) and was holding a "
-                        "worker slot", _CONN_BUDGET, served)
+                        "relay: closed a connection after its %.0fs "
+                        "budget; it had completed %d request(s) and was "
+                        "holding a worker slot", _CONN_BUDGET, served)
                 else:
                     log.warning(
                         "relay: closed a connection that held an ingest "
@@ -779,18 +817,35 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             self.wfile.write(raw)
 
         def do_GET(self):          # noqa: N802
+            source = self.client_address[0] if self.client_address else "?"
+            if not server._limiter.allow(source, server.now()):
+                self._reply(HTTPStatus.TOO_MANY_REQUESTS,
+                            {"error": "slow down"})
+                return
             self._reply(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "POST only"})
 
         def do_POST(self):         # noqa: N802
             source = self.client_address[0] if self.client_address else "?"
 
-            if self.path != INGEST_PATH:
-                self._reply(HTTPStatus.NOT_FOUND, {"error": "not found"})
-                return
-
-            # Rate limit BEFORE reading the body or authenticating.
+            # Budget FIRST, before the path check and before any
+            # other work.
+            #
+            # Rejections used to be the cheapest thing a peer could
+            # ask for: a pipelined POST that is refused still costs a
+            # full stdlib request cycle — parse_request, the email
+            # header parser, send_response, json.dumps — about 61us of
+            # GIL-held Python each, and 404s skipped the budget
+            # entirely by being checked first. Measured, one
+            # connection with no key took 80% of packet-parsing
+            # throughput and twelve took 97%. Counting every request
+            # and then refusing the source AT ACCEPT for a cooldown
+            # turns an unbounded request rate into a bounded one.
             if not server._limiter.allow(source, server.now()):
                 self._reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": "slow down"})
+                return
+
+            if self.path != INGEST_PATH:
+                self._reply(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
 
             if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
@@ -856,7 +911,11 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                             {"error": "internal error"})
                 return
             self._reply(status, payload)
-            if server._httpd is not None:
+            # Only a SUCCESSFUL batch counts. Counting rejections let a
+            # peer downgrade its own reap log from WARNING to INFO by
+            # sending one junk POST first.
+            if (int(status) == int(HTTPStatus.OK)
+                    and server._httpd is not None):
                 server._httpd.note_served(self._budget_key)
             return
 
