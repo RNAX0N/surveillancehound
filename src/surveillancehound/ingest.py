@@ -49,6 +49,11 @@ _HANDSHAKE_TIMEOUT = 5.0
 # accept. Long enough that flooding is not free, short enough that a
 # misconfigured agent recovers on its own.
 _REJECT_COOLDOWN = 30.0
+# Total wall-clock for draining an unread body before closing. A
+# deadline, not a socket timeout: the latter resets on every byte.
+_DRAIN_BUDGET_S = 2.0
+# How often the listener summarises refused connections.
+_OVERLOAD_REPORT_S = 60.0
 # Absolute wall-clock a connection may hold a worker slot, from accept
 # to done. This is the bound that was missing: the handshake deadline
 # only covers a peer that sends nothing, and the socket timeout is
@@ -704,8 +709,24 @@ class _Server(ThreadingHTTPServer):
         socket down makes the blocked recv raise, the handler unwind,
         and the slot return.
         """
+        last_report = time.monotonic()
+        last_count = 0
         while not self._reaper_stop.wait(1.0):
             now = time.monotonic()
+            # Report refusals periodically. This counter was
+            # incremented in five places and read in none — the one
+            # number that would tell an operator the port is being
+            # flooded, never shown anywhere.
+            if now - last_report >= _OVERLOAD_REPORT_S:
+                refused = self.rejected_overload - last_count
+                if refused:
+                    log.warning(
+                        "relay: refused %d connection(s) in the last %.0fs "
+                        "— the ingest port is being flooded, or an agent is "
+                        "misconfigured. Relayed data may be delayed; local "
+                        "capture is unaffected.", refused, _OVERLOAD_REPORT_S)
+                last_count = self.rejected_overload
+                last_report = now
             with self._src_lock:
                 stale = [(k, v[1], v[2]) for k, v in self._deadlines.items()
                          if v[0] < now]
@@ -835,9 +856,15 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             Closing a socket that still holds unread incoming data
             makes the kernel send RST, which discards the response we
             just wrote — so a client refused before its body was read
-            would never see the 429 explaining why. Bounded in size
-            and in time: this runs only on the rate-limited path, so
-            it cannot be used to hold a connection open.
+            would never see the status explaining why.
+
+            Bounded by a TOTAL deadline, not a per-recv timeout. A
+            socket timeout resets on every byte, so a peer dribbling
+            one byte per second held the handler here indefinitely —
+            measured 21s on 20 of 65,536 bytes — and the real bound
+            was the 120s connection reaper. It runs from the
+            rate-limited path AND from `send_error`, so "only on the
+            metered path" was never true either.
             """
             # `self.headers` may not exist yet: parse_request calls
             # send_error for a malformed request line BEFORE assigning
@@ -854,12 +881,15 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                 return
             if remaining <= 0:
                 return
+            give_up_at = time.monotonic() + _DRAIN_BUDGET_S
             try:
-                self.connection.settimeout(2.0)
+                self.connection.settimeout(_DRAIN_BUDGET_S)
             except OSError:
                 return
             try:
                 while remaining > 0:
+                    if time.monotonic() >= give_up_at:
+                        return
                     try:
                         chunk = self.rfile.read(min(remaining, 8192))
                     except (OSError, ValueError):
@@ -873,7 +903,34 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                 except OSError:
                     pass
 
+        def handle_one_request(self):
+            # One request, one meter. `handle_one_request` rejects an
+            # over-long request line (414) ITSELF, before
+            # parse_request runs, so that shape slipped past metering
+            # even after it moved earlier. The flag lets send_error
+            # meter whatever the stdlib rejected without
+            # double-counting anything parse_request already saw.
+            self._metered = False
+            super().handle_one_request()
+
+        def _meter_once(self) -> bool:
+            """Charge this request to its source, at most once.
+
+            Returns False if the source is over budget.
+            """
+            if getattr(self, "_metered", False):
+                return True
+            self._metered = True
+            source = self.client_address[0] if self.client_address else "?"
+            now = server.now()
+            if server._limiter.in_cooldown(source, now):
+                return False
+            return server._limiter.allow(source, now)
+
         def send_error(self, code, message=None, explain=None):
+            # Catches every stdlib rejection that never reached
+            # parse_request — 414 above all.
+            self._meter_once()
             # The stdlib error path (501 for an unknown verb, 414, …)
             # sets close_connection and writes its reply. If the peer
             # sent a body we never read, closing makes the kernel RST
@@ -900,17 +957,30 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             being served cheap 429s indefinitely — the bound there was
             TCP backpressure, not the mechanism this comment describes.
             """
+            # BEFORE super(), not after.
+            #
+            # Metering after it only saw requests the stdlib had
+            # already accepted. Everything it rejects earlier — a
+            # 70 kB request line (414), a bad version (505), a header
+            # flood (431), a malformed line (400) — never reached the
+            # limiter at all. Measured: ~1,900 req/s from ONE address
+            # with no key, costing 62-66% of packet-parse throughput,
+            # with the cooldown never arming and nothing logged above
+            # DEBUG. That is two thirds of the way back to the
+            # pre-metering regime, through the shapes the stdlib
+            # handles for us.
+            #
+            # Safe to meter here: handle_one_request only calls
+            # parse_request once it has actually read a request line,
+            # so this cannot count a connection that is merely idle.
+            # Meter FIRST so every shape is charged, but reply AFTER
+            # the stdlib parse: before it, `request_version` is still
+            # HTTP/0.9 and send_response suppresses the status line
+            # entirely, so the peer saw a reset instead of its 429.
+            over_budget = not self._meter_once()
             if not super().parse_request():
-                return False
-            source = self.client_address[0] if self.client_address else "?"
-            now = server.now()
-            if server._limiter.in_cooldown(source, now):
-                self.close_connection = True
-                self._drain_unread_body()
-                self._reply(HTTPStatus.TOO_MANY_REQUESTS,
-                            {"error": "cooling down"})
-                return False
-            if not server._limiter.allow(source, now):
+                return False          # the stdlib already answered
+            if over_budget:
                 self.close_connection = True
                 self._drain_unread_body()
                 self._reply(HTTPStatus.TOO_MANY_REQUESTS,

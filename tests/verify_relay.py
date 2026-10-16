@@ -704,6 +704,7 @@ def _check_listener_limits(tmp: Path) -> None:
         # counts EVERY request shape — a 404 used to skip it entirely,
         # which made "POST /nope" an unmetered way to burn collector
         # CPU.
+        import socket as _bsk2
         lim_port = _free_port()
         lim_store = HoundStore(path=tmp / "lim2.sqlite")
         lim = IngestServer(_collector_cfg(lim_port, max_batches_per_minute=3),
@@ -747,6 +748,40 @@ def _check_listener_limits(tmp: Path) -> None:
                 "an unknown verb exhausted the budget without arming "
                 "the cooldown"
             )
+            # Shapes the STDLIB rejects before parse_request ever
+            # runs — an over-long request line, a bad version, a
+            # header flood. Metering after super().parse_request()
+            # never saw any of them: measured ~1,900 req/s from one
+            # address with no key, costing 62-66% of packet-parse
+            # throughput, cooldown never arming.
+            for label, payload in (
+                ("over-long request line",
+                 b"GET /" + b"x" * 70000 + b" HTTP/1.1\r\n\r\n"),
+                ("bad HTTP version", b"GET / HTTP/9.9\r\n\r\n"),
+                ("header flood",
+                 b"GET / HTTP/1.1\r\n"
+                 + b"".join(b"X-%d: y\r\n" % i for i in range(200))
+                 + b"\r\n"),
+            ):
+                lim._limiter._hits.clear()
+                lim._limiter._cooldown.clear()
+                for _ in range(6):
+                    try:
+                        sk = _bsk2.create_connection(
+                            ("127.0.0.1", lim_port), timeout=5)
+                        tw = _ssl._create_unverified_context().wrap_socket(
+                            sk, server_hostname="x")
+                        tw.sendall(payload)
+                        tw.recv(300)
+                        tw.close()
+                    except OSError:
+                        pass
+                assert lim._limiter.in_cooldown("127.0.0.1", clock["t"]), (
+                    f"{label} is rejected by the stdlib before "
+                    f"parse_request, so it never reached the limiter — "
+                    f"an unmetered request shape"
+                )
+
             # Cooldown is armed from the runs above; clear it so this
             # connection is accepted and we are testing the parse
             # path rather than the limiter.
@@ -758,8 +793,7 @@ def _check_listener_limits(tmp: Path) -> None:
             # parse_request has NOT assigned yet when it rejects a bad
             # request line — the AttributeError was swallowed by the
             # server's handle_error and the client saw a silent close.
-            import socket as _bsk
-            bad = _bsk.create_connection(("127.0.0.1", lim_port), timeout=10)
+            bad = _bsk2.create_connection(("127.0.0.1", lim_port), timeout=10)
             bw = _ssl._create_unverified_context().wrap_socket(
                 bad, server_hostname="x")
             try:

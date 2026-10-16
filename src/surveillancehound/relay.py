@@ -57,6 +57,8 @@ _MAX_RECORDS_PER_KIND = 1000
 # honest fix is to configure the pair together rather than to guess
 # here.
 _REPLAY_PACE_S = 1.2
+# Longest a clean shutdown will spend draining the spool.
+_FINAL_FLUSH_BUDGET_S = 20.0
 
 SCHEMA_VERSION = 1
 SIG_HEADER = "X-Hound-Signature"
@@ -751,12 +753,27 @@ class RelayClient:
             self.state.save()
             return seq
 
-    def flush(self) -> bool:
-        """Try to deliver everything spooled. Returns True if the spool emptied."""
+    def flush(self, deadline: float | None = None) -> bool:
+        """Try to deliver everything spooled. True if the spool emptied."""
         with self._lock:
             pending = self.spool.pending(self.now())
         ok = True
         for i, (seq, body) in enumerate(pending):
+            # Stop promptly when asked. The pacing sleep below had no
+            # stop check, so a backlog drain ran on for its full
+            # duration after stop() was called: the 15s join expired,
+            # `stop()` cleared the thread anyway, and `final_flush()`
+            # then ran a SECOND flush concurrently with the pusher it
+            # was supposed to have quiesced. Both posted the same
+            # batches; the loser got 409s and recorded them as drops,
+            # so `hound relay` reported batches discarded that had in
+            # fact been delivered.
+            if self._stop.is_set():
+                return False
+            if deadline is not None and self.now() >= deadline:
+                log.info("relay: shutdown flush budget reached; %d batch(es) "
+                         "stay spooled for the next run", len(pending) - i)
+                return False
             # Pace a backlog. The collector meters REQUESTS per source,
             # so an agent draining a day of spool in a tight loop trips
             # that limit and earns itself an accept-time cooldown — a
@@ -764,8 +781,10 @@ class RelayClient:
             # trying to catch up. Nothing is lost (a 429 ends the cycle
             # and the batch stays spooled), but the recovery is slower
             # and noisier than just going at a sustainable rate.
-            if i:
-                time.sleep(_REPLAY_PACE_S)
+            if i and not self._stop.wait(_REPLAY_PACE_S):
+                pass
+            elif i:
+                return False
             try:
                 # Re-stamp: a batch spooled during an outage is older than
                 # the collector's skew window allows.
@@ -845,9 +864,17 @@ class RelayClient:
         again afterwards is fine.
         """
         self.stop()
+        # Bounded. With pacing, a day's spool is thousands of batches
+        # and a full drain would hold shutdown for the best part of an
+        # hour — systemd SIGKILLs at its 90s default, so "finish the
+        # backlog" was never going to happen anyway. Send what fits;
+        # the rest stays spooled for the next run, which is what the
+        # spool is for.
+        self._stop.clear()
+        deadline = self.now() + _FINAL_FLUSH_BUDGET_S
         try:
             self.enqueue()
-            self.flush()
+            self.flush(deadline=deadline)
         except Exception:               # noqa: BLE001
             log.exception("relay: final flush failed")
 
