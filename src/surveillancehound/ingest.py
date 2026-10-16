@@ -51,6 +51,7 @@ _HANDSHAKE_TIMEOUT = 5.0
 _REJECT_COOLDOWN = 30.0
 # Total wall-clock for draining an unread body before closing. A
 # deadline, not a socket timeout: the latter resets on every byte.
+_DRAIN_LIMIT = 65536      # default lingering-close absorption
 _DRAIN_BUDGET_S = 2.0
 # How often the listener summarises refused connections.
 _OVERLOAD_REPORT_S = 60.0
@@ -599,9 +600,13 @@ class _Server(ThreadingHTTPServer):
             # firewall VM is exactly what this project ships plugins
             # for.
             #
-            # A real agent opens one connection per batch, so this
-            # costs it one unit of a 60/minute budget every
-            # batch_seconds.
+            # A real agent opens one connection per batch and makes
+            # one request on it, so a batch costs TWO units of a
+            # 60/minute budget, not one — the connection here and the
+            # request in `parse_request`. At the 30s default cadence
+            # that is 4 units/minute, but a spool replay runs at
+            # `relay._REPLAY_PACE_S`, and that constant is sized
+            # against this one. Change either and check the pair.
             if limiter.in_cooldown(source, now) or not limiter.allow(
                     source, now):
                 self.rejected_overload += 1
@@ -866,6 +871,37 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
         def log_message(self, fmt, *args):
             log.debug("ingest: " + fmt, *args)
 
+        def _reply_and_end(self, status, payload, drain_limit=_DRAIN_LIMIT):
+            """Reply to a request whose body we will not read.
+
+            Closing with unread incoming data makes the kernel RST,
+            which DISCARDS the reply — measured, a 2.05 MB batch
+            against the 2 MB cap never saw its 413 at all. The agent
+            then took the reset as a transient network error instead
+            of the permanent rejection it is, retried the same batch
+            forever, wedged everything behind it, and at the age cap
+            discarded the lot while `flush()` returned success and
+            `hound relay` showed an empty spool with zero drops.
+
+            Write the reply BEFORE lingering, not after. `wfile` is
+            unbuffered, so this puts the status on the wire while the
+            peer is still sending; the drain that follows is only
+            there to keep the final close from resetting a connection
+            whose receive queue still holds body bytes.
+
+            `drain_limit` is how much of that body we are willing to
+            absorb. Callers that must be understood exactly — 413
+            above all, since the agent treats it as terminal and
+            anything else as retryable — pass the whole body cap. A
+            refusal aimed at a source already over budget keeps the
+            small default and accepts that it may reset: every status
+            on that path is retryable, so a reset costs the peer
+            nothing it did not already have coming.
+            """
+            self._reply(status, payload)
+            self._drain_unread_body(limit=drain_limit)
+            self.close_connection = True
+
         def _reply(self, status, payload):
             raw = json.dumps(payload).encode()
             self.send_response(int(status))
@@ -874,7 +910,7 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             self.end_headers()
             self.wfile.write(raw)
 
-        def _drain_unread_body(self) -> None:
+        def _drain_unread_body(self, limit: int = _DRAIN_LIMIT) -> None:
             """Discard a bounded amount of an unread request body.
 
             Closing a socket that still holds unread incoming data
@@ -899,10 +935,26 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             headers = getattr(self, "headers", None)
             if headers is None:
                 return
-            try:
-                remaining = min(int(headers.get("Content-Length") or 0), 65536)
-            except (TypeError, ValueError, AttributeError):
+            if getattr(self, "_body_read", False):
+                # The body was already consumed (or the peer stopped
+                # short of what it declared). Content-Length still
+                # names the full size, so draining again would just
+                # sit on the deadline for nothing.
                 return
+            if headers.get("Transfer-Encoding", "").lower() == "chunked":
+                # No Content-Length to go on, and the handler refuses
+                # chunked outright. Absorb best-effort up to the same
+                # ceiling and stop at EOF: without this the refusal
+                # closed on an unread chunked body and the 400 was
+                # lost to an RST, which is the same silent-retry trap
+                # the 413 had.
+                remaining = limit
+            else:
+                try:
+                    remaining = min(int(headers.get("Content-Length") or 0),
+                                    limit)
+                except (TypeError, ValueError, AttributeError):
+                    return
             if remaining <= 0:
                 return
             give_up_at = time.monotonic() + _DRAIN_BUDGET_S
@@ -1022,7 +1074,7 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             return True
 
         def do_GET(self):          # noqa: N802
-            self._reply(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "POST only"})
+            self._reply_and_end(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "POST only"})
 
         def do_POST(self):         # noqa: N802
             source = self.client_address[0] if self.client_address else "?"
@@ -1030,30 +1082,37 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             # Metering happens in parse_request, which sees every
             # method and runs before dispatch.
             if self.path != INGEST_PATH:
-                self._reply(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                self._reply_and_end(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
 
             if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
                 # BaseHTTPRequestHandler cannot read a chunked body, and
                 # silently treating it as empty would be worse.
-                self._reply(HTTPStatus.BAD_REQUEST,
-                            {"error": "chunked encoding not supported"})
+                self._reply_and_end(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "chunked encoding not supported"})
                 return
 
             raw_len = self.headers.get("Content-Length")
             if raw_len is None:
-                self._reply(HTTPStatus.LENGTH_REQUIRED,
+                self._reply_and_end(HTTPStatus.LENGTH_REQUIRED,
                             {"error": "Content-Length required"})
                 return
             try:
                 length = int(raw_len)
             except ValueError:
-                self._reply(HTTPStatus.BAD_REQUEST, {"error": "bad Content-Length"})
+                self._reply_and_end(HTTPStatus.BAD_REQUEST,
+                                    {"error": "bad Content-Length"})
                 return
             # Check the declared size before reading a single byte.
             if length < 0 or length > server.cfg.max_body_bytes:
-                self._reply(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                            {"error": f"body over {server.cfg.max_body_bytes} bytes"})
+                # Full-body drain: the agent treats 413 as terminal
+                # and a reset as retryable, so this is the one status
+                # that must not be lost to an RST.
+                self._reply_and_end(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    {"error": f"body over {server.cfg.max_body_bytes} bytes"},
+                    drain_limit=max(_DRAIN_LIMIT, server.cfg.max_body_bytes))
                 return
 
             # Read the body OUTSIDE the CPU slot.
@@ -1071,10 +1130,13 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             # connections buffering at once is 32 MB.
             try:
                 body = self.rfile.read(length)
+                self._body_read = True
             except (TimeoutError, socket.timeout, OSError):
+                self._body_read = True
                 return
             if len(body) != length:
-                self._reply(HTTPStatus.BAD_REQUEST, {"error": "short body"})
+                self._reply_and_end(HTTPStatus.BAD_REQUEST,
+                                    {"error": "short body"})
                 return
             # Deliberately NO deadline refresh here.
             #

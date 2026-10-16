@@ -67,15 +67,24 @@ port free, though: enough unauthenticated connections will still
 delay a sensor's **first** batch after an install or an address
 change.
 
-Do not read that as harmless. Connections AND requests are metered per
-source, and an over-budget source is refused at accept — but a peer
-that can reach the port still makes the collector do work, and the
-collector is the same process that parses packets. Before the
-metering that now covers it, a sustained TLS handshake flood was
-measured taking two thirds of local packet-parse throughput on a
-single-CPU collector, which is what a 1-vCPU firewall VM is. No alert
-reports that: packets are still arriving, so `capture_stalled` cannot
-fire.
+Do not read that as harmless. Connections AND requests are metered
+per source, and an over-budget source is refused at accept — but a
+peer that can reach the port still makes the collector do work, and
+the collector is the same process that parses packets. An
+unauthenticated TLS handshake flood was measured taking two thirds of
+local packet-parse throughput on a single-CPU collector, which is
+what a 1-vCPU firewall VM is.
+
+**The metering reduces that; it does not close it.** The budget is
+keyed on the source address, so it only bites a source that comes
+back. Measured from a few addresses, capture loss falls from 62-97%
+to 2-6%. Measured from 20,000 rotating addresses — every connection a
+first offence, nothing ever in cooldown — **38% of packets are still
+lost.** Nothing alerts on it either: packets are still arriving, so
+`capture_stalled` cannot fire, and the loss shows up only as flows
+that were never recorded.
+
+A firewall rule is not defence in depth here. It is the control.
 
 Put a firewall rule in front of it. The port should be reachable from
 your agents and nothing else:
@@ -113,9 +122,16 @@ them here.
   the per-source connection cap, the batches-per-minute bucket, and
   the reserved-capacity credit one of them earns. A hostile host
   behind the same NAT as a real agent can therefore crowd it out
-  without holding any key. If you run more than a couple of agents
-  behind one address, give them distinct addresses, and treat that
-  NAT as part of the collector's trust boundary.
+  without holding any key.
+
+  This bites honest agents too, and sooner than "more than a
+  couple". A single agent replaying a spool costs 48 of the default
+  60 units per minute, so **two agents recovering behind one address
+  throttle each other** — 96 against 60. Nothing is lost (a `429`
+  ends the cycle with the batch still spooled) but recovery stretches
+  out and `hound sensors` may show both as stale meanwhile. Give
+  agents distinct addresses, and treat that NAT as part of the
+  collector's trust boundary.
 - **An attacker on the agent host itself** can read the shared secret
   out of `hound.toml`. Nothing on the collector helps with that; it is
   the agent host's own security boundary.
@@ -191,7 +207,7 @@ The named volume is untouched by a rebuild, so no re-alert storm.
 | Symptom | Cause |
 |---|---|
 | `No such device exists` | `interface` names a container interface, or a host interface that does not exist. Check `ip -br link` **on the host**. |
-| Nothing relays, no error | Check `docker compose logs`. A spooling agent logs the failure each flush; `hound relay` on the agent config prints spool depth. |
+| Nothing relays, no error | Check `docker compose logs`: a spooling agent logs `collector unreachable ... spooling` when the link first drops and hourly after, with batch count and last error. `hound relay` on the agent config prints the same depth plus the drop totals. |
 | `certificate fingerprint mismatch` | The collector's cert was regenerated. Re-read it and update `tls_fingerprint`. Do not disable pinning. |
 | `401` from the collector | Key mismatch, or `sensor_id` has no `[[relay.sensor]]` entry on the collector. |
 | `507` from the collector | The collector is low on disk. The agent spools and retries; free space there. |

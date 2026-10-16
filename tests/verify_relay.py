@@ -659,6 +659,96 @@ def _check_listener(tmp: Path) -> None:
         store.close()
 
 
+def _check_refusals_reach_the_client(tmp: Path) -> None:
+    """A refusal the agent must act on has to ARRIVE as a status.
+
+    Two regressions, both of which turned a clear rejection into
+    something the agent read as a transient network fault and retried
+    forever:
+
+    * An over-size POST was answered and then closed with megabytes of
+      body still unread, so the kernel sent RST and discarded the 413.
+      `relay.py` treats 413 as terminal and a reset as retryable, so
+      the head of the spool wedged and everything behind it aged out
+      silently while `flush()` reported success.
+    * A signature header with a byte >= 0x80 reached
+      `hmac.compare_digest`, which raises TypeError on non-ASCII str.
+      That surfaced as HTTP 500 with a logged traceback per request —
+      a retryable status and a log amplifier, from an unauthenticated
+      peer.
+    """
+    import http.client
+    import logging as _logging
+    import ssl as _ssl
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.store import HoundStore
+
+    port = _free_port()
+    store = HoundStore(path=tmp / "refusal.sqlite")
+    cap = 256 * 1024
+    srv = IngestServer(_collector_cfg(port, max_body_bytes=cap,
+                                      max_batches_per_minute=100),
+                       store, now=lambda: T0)
+    assert srv.start()
+
+    def post(body, headers=None):
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        c = http.client.HTTPSConnection("127.0.0.1", port, timeout=20,
+                                        context=ctx)
+        try:
+            h = {"Content-Length": str(len(body)),
+                 "Content-Type": "application/json"}
+            h.update(headers or {})
+            c.request("POST", "/ingest/v1", body=body, headers=h)
+            return c.getresponse().status
+        finally:
+            c.close()
+
+    # Collect what the server logs, so a 500-with-traceback cannot
+    # pass as "well, it returned something".
+    records = []
+
+    class _Grab(_logging.Handler):
+        def emit(self, rec):
+            records.append(rec)
+
+    grab = _Grab()
+    _logging.getLogger("surveillancehound.ingest").addHandler(grab)
+
+    try:
+        # Larger than the drain limit AND larger than any socket
+        # buffer, so a close without lingering really does reset.
+        over = b"{" + b"x" * (cap + 512 * 1024)
+        try:
+            status = post(over)
+        except (ConnectionResetError, http.client.BadStatusLine,
+                _ssl.SSLError, OSError) as exc:
+            raise AssertionError(
+                f"over-size POST was reset instead of answered: {exc!r} "
+                "— the agent reads a reset as retryable and wedges") from None
+        assert status == 413, f"over-size POST returned {status}, want 413"
+
+        # Non-ASCII signature: unauthorised, not a server error.
+        status = post(b'{"sensor_id":"a"}',
+                      {"X-Hound-Signature": "sha256=\xa9bad",
+                       "X-Hound-Sensor": "a"})
+        assert status == 401, \
+            f"non-ASCII signature returned {status}, want 401"
+        bad = [r for r in records
+               if r.levelno >= _logging.ERROR or r.exc_info]
+        assert not bad, (
+            "non-ASCII signature logged "
+            f"{len(bad)} error/traceback record(s): "
+            f"{bad[0].getMessage()[:120]!r}")
+    finally:
+        _logging.getLogger("surveillancehound.ingest").removeHandler(grab)
+        srv.stop()
+        store.close()
+    print("  refusals reach the client: 413 is delivered, bad signature is 401")
+
+
 def _check_listener_limits(tmp: Path) -> None:
     import http.client
     import ssl as _ssl
@@ -883,6 +973,142 @@ def _seed_agent_store(path: Path):
     oid = st.open_outage(OutageRow(
         None, "117.111.102.2", T0 - 600, None, T0 - 660, "silence", None))
     return st, oid
+
+
+def _check_batch_fits_the_body_cap(tmp: Path) -> None:
+    """The agent must not build a batch its collector will refuse.
+
+    At stock defaults — 1000 records per kind, 1024-char strings,
+    2 MiB body cap — 1000 maximal alerts serialise to 2.24 MB. The
+    collector answers 413, the agent treats 413 as terminal, and the
+    whole batch is discarded. No hostile input, no odd configuration:
+    a segment producing a thousand alerts between pushes is a bad
+    afternoon.
+
+    Checks that it splits instead, and that splitting LOSES NOTHING —
+    the watermark must follow the records actually sent.
+    """
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import AlertRow, HoundStore
+
+    home = tmp / "bigbatch"
+    home.mkdir()
+    store = HoundStore(path=home / "agent.sqlite")
+    big = "s" * 1024
+    total = 1200
+    for i in range(total):
+        store.insert_alert(AlertRow(
+            id=None, ts=T0 + i, device_ip="192.168.10.11",
+            kind="control_channel_suspect", severity="critical",
+            summary=big, detail=big, dedup_key=f"k{i}"))
+
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url="https://127.0.0.1:1/ingest/v1",
+        tls_fingerprint=["sha256:" + "ab" * 32], batch_seconds=1.0,
+    )
+    limit = cfg.max_body_bytes
+    client = RelayClient(cfg, store, now=lambda: T0 + 10_000)
+
+    seen_ids, batches = set(), 0
+    while client.enqueue():
+        batches += 1
+        pend = client.spool.pending(T0 + 10_000)
+        seq, body = pend[-1]
+        assert len(body) <= limit, (
+            f"batch {seq} is {len(body)} bytes against a {limit}-byte "
+            f"collector cap — it would be refused 413 and, because the "
+            f"agent treats 413 as terminal, silently discarded")
+        import json as _json
+        for a in _json.loads(body)["records"].get("alerts", []):
+            rid = a["remote_id"]
+            assert rid not in seen_ids, f"alert {rid} relayed twice"
+            seen_ids.add(rid)
+        assert batches < 64, "split did not converge"
+
+    assert batches > 1, (
+        "1200 maximal alerts must not fit in one batch; the split never "
+        "happened and the test proves nothing")
+    assert len(seen_ids) == total, (
+        f"splitting lost records: {total} alerts stored, {len(seen_ids)} "
+        f"relayed — the watermark must follow what was actually sent")
+    store.close()
+    print(f"  body cap: {total} maximal alerts split into {batches} "
+          f"batches under the cap, nothing lost")
+
+
+def _check_outage_is_logged(tmp: Path) -> None:
+    """An agent that is spooling must SAY SO in its own log.
+
+    The troubleshooting table's "Nothing relays, no error" row sends
+    the operator to `docker compose logs`, and the failure only ever
+    went to `state.last_error` — which lives in a file that only
+    `hound relay` reads, on a box the operator is not already looking
+    at. Equally, it must not say so 2,880 times a day.
+    """
+    import logging as _logging
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient, _LINK_LOG_EVERY_S
+    from surveillancehound.store import HoundStore
+
+    clock = {"t": T0 + 10}
+    # Its own directory: RelayClient puts spool + state in
+    # `<store parent>/relay`, so sharing a parent with another check
+    # shares the sequence counter.
+    home = tmp / "logagent"
+    home.mkdir()
+    store, _ = _seed_agent_store(home / "agent.sqlite")
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        # Nothing is listening here; that is the point.
+        url=f"https://127.0.0.1:{_free_port()}/ingest/v1",
+        tls_fingerprint=["sha256:" + "ab" * 32], batch_seconds=1.0,
+    )
+    client = RelayClient(cfg, store, now=lambda: clock["t"])
+
+    seen = []
+
+    class _Grab(_logging.Handler):
+        def emit(self, rec):
+            seen.append((rec.levelno, rec.getMessage()))
+
+    grab = _Grab()
+    lg = _logging.getLogger("surveillancehound.relay")
+    lg.addHandler(grab)
+    try:
+        client.enqueue()
+        assert client.flush() is False, "the collector is down; flush must fail"
+        warns = [m for lv, m in seen if lv >= _logging.WARNING
+                 and "unreachable" in m]
+        assert len(warns) == 1, (
+            f"a spooling agent must report the outage exactly once at "
+            f"first failure; got {len(warns)}: {seen}")
+        assert "spooling" in warns[0] and "batch(es)" in warns[0], warns[0]
+
+        # Quiet for the rest of the hour, however many cycles run.
+        for _ in range(5):
+            clock["t"] += 30.0
+            client.enqueue()
+            client.flush()
+        again = [m for lv, m in seen if lv >= _logging.WARNING
+                 and "unreachable" in m]
+        assert len(again) == 1, (
+            f"a per-cycle warning is 2,880 lines a day and trains the "
+            f"operator to filter the channel; got {len(again)}")
+
+        # Then once more, an hour on.
+        clock["t"] += _LINK_LOG_EVERY_S
+        client.enqueue()
+        client.flush()
+        later = [m for lv, m in seen if lv >= _logging.WARNING
+                 and "unreachable" in m]
+        assert len(later) == 2, (
+            f"a still-dead link must be re-reported hourly; got {len(later)}")
+    finally:
+        lg.removeHandler(grab)
+        store.close()
+    print("  spooling is logged: once at onset, hourly after, not per cycle")
 
 
 def _check_end_to_end(tmp: Path) -> None:
@@ -1981,6 +2207,37 @@ def _check_spool_counters(tmp: Path) -> None:
     sp.ack(3)
     assert sp.dropped_age == 2, "a second ack must not re-count"
 
+    # AN OUTAGE IS WHEN BATCHES EXPIRE, AND AN OUTAGE HAS NO ACKS.
+    #
+    # Counting only on ack/drop meant the one situation the counter
+    # exists for never reached it: with the collector down nothing is
+    # acked and nothing is dropped-as-rejected, so a spool under its
+    # byte cap quietly shed a day of observations while `hound relay`
+    # printed `dropped_age 0`. The operator sees a backlog that stops
+    # growing and no statement that anything was lost.
+    sp_out = Spool(tmp / "spool_outage", 10 * 1024 * 1024, 60.0)
+    for i in range(5):
+        sp_out.append(i, b'{"a":%d}' % i, 0.0)
+    assert sp_out.stats(0.0).pending == 5
+    # The link is down for an hour: no ack, no drop, only the agent
+    # continuing to enqueue what it observes.
+    for i in range(5, 10):
+        sp_out.append(i, b'{"a":%d}' % i, 3600.0 + i)
+    st3 = sp_out.stats(3610.0)
+    assert st3.pending == 5, f"the five fresh batches must survive: {st3.pending}"
+    assert sp_out.dropped_age == 5, (
+        f"five batches aged out during an outage and must be counted "
+        f"without any ack; got {sp_out.dropped_age}"
+    )
+    assert st3.dropped_age == 5, "stats() must surface it"
+    # Still exactly once.
+    sp_out.append(10, b'{"a":10}', 3611.0)
+    assert sp_out.dropped_age == 5, f"re-counted: {sp_out.dropped_age}"
+    # And it survives the process boundary `hound relay` crosses.
+    assert Spool(tmp / "spool_outage", 10 * 1024 * 1024, 60.0,
+                 readonly=True).stats(3611.0).dropped_age == 5, \
+        "the drop total must persist for the diagnostic command"
+
     # Live entries survive, and the byte cap evicts oldest-first.
     sp2 = Spool(tmp / "spool2", 200, 3600.0)
     for i in range(20):
@@ -2985,10 +3242,13 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         _check_listener(Path(td))
         _check_listener_limits(Path(td))
+        _check_refusals_reach_the_client(Path(td))
         _check_pinning(Path(td))
     print("=== end to end ===")
     with tempfile.TemporaryDirectory() as td:
         _check_agent_is_silent(Path(td))
+        _check_batch_fits_the_body_cap(Path(td))
+        _check_outage_is_logged(Path(td))
         _check_end_to_end(Path(td))
     print("\nRELAY VERIFICATION PASSED")
     return 0

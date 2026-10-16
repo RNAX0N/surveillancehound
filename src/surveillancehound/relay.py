@@ -50,12 +50,19 @@ _MAX_RECORDS_PER_KIND = 1000
 # sit under the collector's DEFAULT request budget (60/min) with room
 # to spare, since the agent cannot see that setting.
 #
-# If an operator lowers max_batches_per_minute below ~50 the agent
-# will out-pace it and self-throttle on 429s: lossless, because a 429
-# ends the flush cycle without acking, but slower than it looks. That
-# is the same both-ends coupling as max_records_per_batch, and the
-# honest fix is to configure the pair together rather than to guess
-# here.
+# A replaying agent costs 2 units every 2.5s = 48 units/minute
+# against the default 60. If an operator lowers max_batches_per_minute
+# below 48 the agent will out-pace it and self-throttle on 429s:
+# lossless, because a 429 ends the flush cycle without acking, but
+# slower than it looks. That is the same both-ends coupling as
+# max_records_per_batch, and the honest fix is to configure the pair
+# together rather than to guess here.
+#
+# 48 of 60 is not much headroom, and it is per SOURCE ADDRESS, not
+# per sensor. Two agents replaying behind one NAT present as one
+# source at 96 units/minute and throttle each other; see the NAT
+# paragraph in deploy/agent/README.md. Distinct addresses are the
+# answer — the collector has no way to tell them apart.
 # 2.5s, not 1.2s. Each spooled batch costs the collector TWO metered
 # units, not one: it opens a connection (metered at accept, because an
 # unmetered TLS handshake was itself a capture-starvation vector) and
@@ -64,8 +71,24 @@ _MAX_RECORDS_PER_KIND = 1000
 # recovering, which is the exact defect this pacing was added to
 # prevent, reintroduced by making connections cost something.
 _REPLAY_PACE_S = 2.5
-# Longest a clean shutdown will spend draining the spool.
+# Budget for draining the spool on a clean shutdown. NOT a hard
+# bound on elapsed time: the deadline is checked BETWEEN batches, so
+# a post that starts just under it can still run to the socket
+# timeout. Measured 25.6s typical against this 20s budget, and ~45s
+# worst case (20 budget + a ~20s post timeout + one 2.5s pace). That
+# is inside systemd's 90s default TimeoutStopSec, which is the number
+# that actually matters; anything longer gets SIGKILLed mid-drain.
 _FINAL_FLUSH_BUDGET_S = 20.0
+# How often a persistently unreachable collector is re-reported.
+_LINK_LOG_EVERY_S = 3600.0
+# Body-size self-limit. Mirrors the collector's documented
+# [relay].max_body_bytes default; the margin leaves room for
+# `restamp`, which rewrites the timestamp after the size is measured.
+_DEFAULT_BODY_LIMIT = 2 * 1024 * 1024
+_BODY_MARGIN = 0.95
+# Floor, so a misconfigured tiny cap cannot stop the agent relaying
+# anything at all.
+_MIN_BODY_LIMIT = 64 * 1024
 
 SCHEMA_VERSION = 1
 SIG_HEADER = "X-Hound-Signature"
@@ -121,6 +144,18 @@ def sign(key: str, body: bytes) -> str:
 
 
 def verify(key: str, body: bytes, signature: str) -> bool:
+    """Constant-time signature check.
+
+    `hmac.compare_digest` raises TypeError on non-ASCII str operands,
+    and HTTP headers are decoded latin-1 — so one byte >= 0x80 in the
+    signature header turned an unauthenticated request into a 500 with
+    a full traceback at ERROR level. Measured: 1,102 log lines and 58
+    tracebacks in 20s from a single address, and a 500 is the status
+    the agent retries forever. A signature that cannot be ASCII cannot
+    be valid, so reject it as unauthorised.
+    """
+    if not signature.isascii():
+        return False
     return hmac.compare_digest(sign(key, body), signature or "")
 
 
@@ -231,6 +266,11 @@ class Spool:
         # their compaction uses a real clock rather than wall time, which
         # keeps replay deterministic.
         self._now_hint = 0.0
+        # Timestamp of the oldest entry the last read/write saw, or
+        # None if unknown. It exists so `append` can tell that
+        # something has aged out without re-reading the whole spool
+        # every cycle — see the age check there.
+        self._oldest_at: float | None = None
 
     def _load_counters(self) -> None:
         """Best effort. These are diagnostics; a damaged file must never
@@ -285,7 +325,12 @@ class Spool:
                 out.append(json.loads(line))
             except json.JSONDecodeError:
                 continue          # a torn tail line; drop it rather than die
+        self._note_oldest(out)
         return out
+
+    def _note_oldest(self, entries: list[dict]) -> None:
+        ats = [e["at"] for e in entries if isinstance(e.get("at"), (int, float))]
+        self._oldest_at = min(ats) if ats else None
 
     def _write(self, entries: list[dict]) -> None:
         # Unique per writer, for the same reason AgentState.save is: the
@@ -298,6 +343,7 @@ class Spool:
             encoding="utf-8",
         )
         os.replace(tmp, self.path)
+        self._note_oldest(entries)
 
     def append(self, seq: int, body: bytes, now: float) -> None:
         """Append one batch, compacting only when a cap is actually at risk.
@@ -322,8 +368,28 @@ class Spool:
                 oversized = self.path.stat().st_size > self.max_bytes
             except OSError:
                 oversized = True
-            if oversized:
+            # Compact on expiry too, not only on size.
+            #
+            # The age cap being enforced on read is enough to stop a
+            # stale batch being SENT, but counting only happens on a
+            # mutating path — and during an outage there are no acks
+            # and no drops, which is exactly when batches expire. A
+            # day of observations aged out of a spool that had never
+            # grown past its byte cap, and `hound relay` reported
+            # `dropped_age 0` throughout: the operator saw a shrinking
+            # backlog and no indication anything had been lost.
+            #
+            # `_oldest_at` is a hint maintained by the last read or
+            # write, so the usual cycle costs one float compare rather
+            # than re-reading a 64 MB file. When it is unknown the
+            # check simply does not fire; `pending()` runs every cycle
+            # and populates it.
+            expired = (self._oldest_at is not None
+                       and (now - self._oldest_at) > self.max_age)
+            if oversized or expired:
                 self._write(self._enforce_caps(self._read(), now))
+            elif self._oldest_at is None:
+                self._oldest_at = now
 
     def _deliverable(self, entries: list[dict], now: float) -> list[dict]:
         """What is still within both caps. PURE — no counters, no writes.
@@ -629,6 +695,10 @@ class RelayClient:
         self.spool = Spool(base, cfg.spool_max_bytes, cfg.spool_max_age_seconds)
         self._lock = threading.Lock()
         self._flush_lock = threading.Lock()
+        # When the link first went down, and when we last said so.
+        # See `_note_link`.
+        self._link_down_since: float | None = None
+        self._link_logged_at = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -646,8 +716,13 @@ class RelayClient:
         return min(cap, _MAX_RECORDS_PER_KIND) if cap > 0 \
             else _MAX_RECORDS_PER_KIND
 
-    def collect(self) -> tuple:
-        """Everything new since the last successful push."""
+    def collect(self, per_kind: int | None = None) -> tuple:
+        """Everything new since the last successful push.
+
+        `per_kind` overrides the configured cap. `enqueue` lowers it
+        when the record cap alone produces a body the collector would
+        refuse — see `_body_limit`.
+        """
         wm = self.state.watermark
         # EVERY kind honours the configured cap, not just uptime. It
         # was applied to uptime alone while the comment claimed
@@ -656,7 +731,7 @@ class RelayClient:
         # treated that as terminal and dropped the batch, and the
         # watermark had already advanced at enqueue. Permanent, silent,
         # total loss, with flush() returning success.
-        per_kind = self._per_kind()
+        per_kind = self._per_kind() if per_kind is None else max(1, per_kind)
         flows = self.store.flows_since(wm.flow_id, limit=per_kind)
         alerts = self.store.alerts_since(wm.alert_id, limit=per_kind)
         outages = self.store.outages_changed_since(
@@ -745,21 +820,115 @@ class RelayClient:
 
     # ----- pushing -----
 
+    def _body_limit(self) -> int:
+        """Largest body this agent will build, in bytes.
+
+        The record cap alone is not enough to stay under the
+        collector's body cap, and the two are reached by different
+        arithmetic. At STOCK DEFAULTS — 1000 records per kind, 1024
+        characters per string, 2 MiB body cap — a batch of 1000
+        maximal alerts serialises to 2.24 MB and is refused 413. That
+        needs no hostile input and no unusual configuration: a camera
+        segment that generates a thousand alerts between pushes is a
+        bad afternoon, not an attack.
+
+        A 413 is TERMINAL on the agent side (retrying a body that
+        will be exactly as large next time wedges the spool), so the
+        batch is dropped. Discovering the cap by having observations
+        destroyed is the wrong way round; this keeps the agent inside
+        it instead.
+
+        Taken from the agent's own config for the same reason
+        `_per_kind` is: the agent cannot see the collector's setting,
+        so it honours the documented default and the pair has to be
+        configured together. The margin covers `restamp`, which
+        rewrites the timestamp after the size is known.
+        """
+        cap = getattr(self.cfg, "max_body_bytes", 0) or 0
+        if cap <= 0:
+            cap = _DEFAULT_BODY_LIMIT
+        return max(_MIN_BODY_LIMIT, int(cap * _BODY_MARGIN))
+
     def enqueue(self) -> int:
         """Snapshot new records into the spool. Cheap; no network."""
         with self._lock:
-            records, new_wm = self.collect()
-            if not any(records.get(k) for k in
-                       ("devices", "flows", "alerts", "outages", "uptime")):
-                return 0
-            seq = self.state.next_seq
-            body = build_batch(self.cfg.sensor_id, self.state.instance_id,
-                               seq, records, self.now())
+            limit = self._body_limit()
+            per_kind = self._per_kind()
+            while True:
+                records, new_wm = self.collect(per_kind=per_kind)
+                if not any(records.get(k) for k in
+                           ("devices", "flows", "alerts", "outages",
+                            "uptime")):
+                    return 0
+                seq = self.state.next_seq
+                body = build_batch(self.cfg.sensor_id,
+                                   self.state.instance_id, seq, records,
+                                   self.now())
+                if len(body) <= limit or per_kind <= 1:
+                    break
+                # Halve and re-collect. The watermark comes from the
+                # records actually included, so the remainder is not
+                # lost — it goes in the next batch. Flows and alerts
+                # are id-watermarked and strictly resume; devices and
+                # uptime are snapshots keyed on time, so a narrower
+                # batch reports fewer of them this cycle and the rest
+                # on the next change or tick.
+                per_kind = max(1, per_kind // 2)
+                log.warning(
+                    "relay: batch of %d bytes exceeds the %d-byte body "
+                    "limit; retrying with %d records per kind. The "
+                    "remainder follows in the next batch. Raise [relay] "
+                    "max_body_bytes on BOTH ends if this is routine.",
+                    len(body), limit, per_kind)
+            if len(body) > limit:
+                log.warning(
+                    "relay: a single-record batch is %d bytes, over the "
+                    "%d-byte limit; sending it anyway — the collector "
+                    "will refuse it and it will be dropped.",
+                    len(body), limit)
             self.spool.append(seq, body, self.now())
             self.state.next_seq = seq + 1
             self.state.watermark = new_wm
             self.state.save()
             return seq
+
+    def _note_link(self, ok: bool, detail: str = "") -> None:
+        """Say out loud that the agent is spooling, and say it once.
+
+        `docker compose logs` is the first thing the troubleshooting
+        table sends an operator to, and an agent whose collector was
+        unreachable printed NOTHING there: the failure went to
+        `state.last_error`, which only `hound relay` reads. "Nothing
+        relays, no error" was a literal description of the symptom.
+
+        Rate-limited rather than per-cycle. At the 30s default a
+        per-cycle warning is 2,880 identical lines a day, which is how
+        an operator learns to filter the channel alerts arrive on.
+        First failure, then hourly, then recovery.
+        """
+        now = self.now()
+        if ok:
+            if self._link_down_since is not None:
+                log.info("relay: collector reachable again after %.0fs; "
+                         "%d spooled batch(es) remain",
+                         now - self._link_down_since,
+                         self.spool.stats(now).pending)
+                self._link_down_since = None
+                self._link_logged_at = 0.0
+            return
+        first = self._link_down_since is None
+        if first:
+            self._link_down_since = now
+        if first or (now - self._link_logged_at) >= _LINK_LOG_EVERY_S:
+            self._link_logged_at = now
+            st = self.spool.stats(now)
+            log.warning(
+                "relay: collector unreachable for %.0fs — spooling "
+                "(%d batch(es), %d bytes, oldest %.0fs; dropped "
+                "age=%d size=%d). Last error: %s",
+                now - self._link_down_since, st.pending, st.bytes,
+                st.oldest_age, st.dropped_age, st.dropped_size,
+                detail or self.state.last_error or "unknown")
 
     def flush(self, deadline: float | None = None,
               ignore_stop: bool = False) -> bool:
@@ -825,12 +994,14 @@ class RelayClient:
             except (RelayError, OSError, ssl.SSLError) as e:
                 self.state.last_error = str(e)[:300]
                 self.state.save()
+                self._note_link(False, str(e)[:200])
                 return False
             if status == 200:
                 self.spool.ack(seq)
                 self.state.last_push_ts = self.now()
                 self.state.last_error = ""
                 self.state.save()
+                self._note_link(True)
             elif status == 409:
                 # The collector is ahead of us — a wiped volume, or a
                 # duplicate. Fast-forward rather than retrying forever.
