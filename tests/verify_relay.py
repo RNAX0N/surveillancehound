@@ -2563,6 +2563,14 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
         assert _Server.trusted_reserve < _Server.max_workers, (
             "the reserve leaves no capacity for a sensor's first batch"
         )
+        # Generous on purpose: a full batch takes 12s on a 1 Mbit link
+        # and 24s on a bad one, and reaping a real agent's upload over
+        # a slow tunnel is a worse failure than a peer holding a
+        # thread. The reserve above is what protects a working sensor.
+        assert _CONN_BUDGET >= 60, (
+            f"a {_CONN_BUDGET:.0f}s connection budget reaps legitimate "
+            f"agents on slow links mid-upload"
+        )
         assert _CONN_BUDGET > 0, (
             "without an absolute per-connection budget, a peer that "
             "dribbles a byte before each socket timeout holds a slot "

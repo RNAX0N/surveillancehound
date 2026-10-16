@@ -51,9 +51,15 @@ _HANDSHAKE_TIMEOUT = 5.0
 # PER-RECV, so a peer dribbling one byte before each timeout holds a
 # slot for as long as it likes. Caps and counters bound how many
 # REQUESTS a peer may make; this bounds how much TIME it may buy, which
-# is the resource a slow-loris actually spends. A real agent posts a
-# ~1.5 MB batch over a LAN in well under a second.
-_CONN_BUDGET = 15.0
+# is the resource a slow-loris actually spends.
+#
+# Generous on purpose. The reserve for proven sources is what protects
+# a working sensor; this is only a backstop against a connection held
+# indefinitely. Set tight it would reap REAL agents: a full 1.5 MB
+# batch takes 12s on a 1 Mbit link and 24s on a bad one, and a relay
+# that drops its own agent's upload over a slow tunnel is a worse
+# failure than a peer holding a thread.
+_CONN_BUDGET = 120.0
 # How long a source stays "proven" after a signed request. Long enough
 # to span an agent's batch interval many times over, short enough that
 # a decommissioned address does not hold its reservation forever.
@@ -721,6 +727,15 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             if len(body) != length:
                 self._reply(HTTPStatus.BAD_REQUEST, {"error": "short body"})
                 return
+            # The body is in, so this peer has done real work rather
+            # than held a socket open. Restart its budget so queueing
+            # for a CPU slot behind other batches cannot get it reaped
+            # mid-request.
+            if server._httpd is not None:
+                with server._httpd._src_lock:
+                    if self.request in server._httpd._deadlines:
+                        server._httpd._deadlines[self.request] = (
+                            time.monotonic() + _CONN_BUDGET)
             try:
                 with server._cpu_slot:
                     status, payload = server.handle_batch(
