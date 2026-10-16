@@ -86,11 +86,21 @@ to touch `devices`, or widens a query that was scoped by accident rather than
 by intent. A reviewer who does not know the invariant will not see the
 violation, and no test asserts a thing nobody thought to test.
 
-So the isolation is a machine check. The ingest connection installs a
-`sqlite3` authorizer that denies any write to a central table outright. A
-future change that tries one does not produce subtly corrupted state that
-shows up as a camera mysteriously changing role; it fails loudly, in the test
-suite, with the table name in the message.
+So the isolation is a machine check — at BUILD time, which is the part
+this paragraph used to get wrong. The isolation itself is structural: no
+code on the ingest path writes any central table, so there is no rule to
+bypass. What is checked mechanically is that this stays true. The TEST
+SUITE installs a `sqlite3` authorizer that denies any write to a central
+table outright, and drives the ingest path through it. A future change
+that tries one does not produce subtly corrupted state that shows up as a
+camera mysteriously changing role; it fails loudly, in the test suite,
+with the table name in the message.
+
+Say it that way round when you document it. `grep set_authorizer src/`
+is empty and always has been — a reader who takes "the ingest connection
+installs an authorizer" literally will believe there is a control running
+in their collector that would stop a compromised agent at runtime. There
+is not, and `deploy/agent/README.md` is careful to say so.
 
 Two details that matter if you touch this:
 

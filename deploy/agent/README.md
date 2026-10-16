@@ -81,22 +81,32 @@ back.
 
 Measured with the collector pinned to a single core — a 1-vCPU
 firewall VM is the case these plugins exist for — against a flood on
-the ingest port, 4.3M pkt/s unloaded baseline, three runs each,
-median:
+the ingest port, three runs each, median, on three different
+machines. These are PROPORTIONS of each machine's own unloaded
+throughput. The absolute packet rate depends on the capture, the
+link and the hardware, so only the spread is worth reading:
 
-| flood | lost, this machine | lost, second machine |
-|---|---|---|
-| none (4.3M pkt/s baseline) | — | — |
-| 8 fixed addresses, metering off | 70% | 58% |
-| 8 fixed addresses, shipped 60/min | **20%** | 0% |
-| 20,000 rotating addresses, shipped 60/min | **63%** | 19% |
+| flood | packets lost |
+|---|---|
+| none | — |
+| 8 fixed addresses, metering off | 55-70% |
+| 8 fixed addresses, shipped 60/min | **0-20%** |
+| 20,000 rotating addresses, shipped 60/min | **19-75%** |
 
-Two machines, because the spread matters more than any single figure:
-the metering turns a 58-70% loss into 0-20%, and it only bites a
-source that comes back. Against rotating addresses every connection
-is a first offence, nothing is ever in cooldown, and the loss returns
-to 19-63%. Treat the worse column as the planning number — slower
+The metering is what turns a 55-70% loss into 0-20%, and it only
+bites a source that comes back. Against rotating addresses every
+connection is a first offence, nothing is ever in cooldown, and the
+loss returns to 19-75%. Plan for the top of each range — slower
 storage and a busier core both push it that way.
+
+Re-derive these on your own hardware rather than trusting the
+spread: `tools/bench_ingest_flood.py` is the harness that produced
+them, and it prints the method it used. An earlier revision of this
+section quoted an absolute baseline that was ~10-20x high, because
+it came from a loop re-parsing one small capture already in memory;
+two independent reviewers measured real files at 193k and 443k
+pkt/s. The ratios survived that error. A single number would not
+have.
 
 Nothing alerts on this either: packets are still arriving, so
 `capture_stalled` cannot fire, and the loss shows up only as flows

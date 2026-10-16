@@ -95,6 +95,10 @@ _LINK_LOG_EVERY_S = 3600.0
 # above can refer to the real number — it used to quote "~20s", which
 # was not this value or any other in the file.
 _POST_TIMEOUT_S = 10.0
+# How many carry-forward outage ids `store.outages_changed_since` will
+# bind. Mirrored here so the rotation step matches the window; they
+# disagreed and left ids permanently unexamined.
+_OUTAGE_ID_BINDS = 900
 # Longest a deadline-bearing flush will wait for the lock.
 _FLUSH_LOCK_WAIT_S = 5.0
 # Body-size self-limit. Mirrors the collector's documented
@@ -478,22 +482,31 @@ class Spool:
             live = self._enforce_caps(self._read(), self._now_hint)
             self._write([e for e in live if e["seq"] > seq])
 
-    def replace(self, seq: int, parts: list[tuple[int, bytes]],
-                now: float) -> None:
+    def replace(self, seq: int, parts: list[tuple[int, bytes]]) -> None:
         """Swap one batch for smaller ones. NOT a drop.
 
         Deliberately does not touch `dropped_stale`: nothing is being
         discarded, so counting it would make `hound relay` report data
         loss that did not happen — the opposite of the reporting sin
         this spool exists to avoid.
+
+        THE REPLACEMENTS INHERIT THE ORIGINAL'S TIMESTAMP. Stamping
+        them `now` reset `oldest_age` on every replacement, so
+        `spool_max_age_seconds` could never expire an entry that kept
+        being re-split — removing the one bound that would have ended
+        such a loop, and making `hound relay` report a backlog as
+        freshly arrived when it was a day old. These records were
+        observed when the original said they were.
         """
         with self._lock:
-            self._now_hint = max(self._now_hint, now)
-            live = [e for e in self._read() if e["seq"] != seq]
+            live = self._read()
+            at = next((e["at"] for e in live if e["seq"] == seq),
+                      self._now_hint)
+            kept = [e for e in live if e["seq"] != seq]
             for new_seq, body in parts:
-                live.append({"seq": int(new_seq), "at": float(now),
+                kept.append({"seq": int(new_seq), "at": float(at),
                              "body": body.decode("utf-8")})
-            self._write(self._enforce_caps(live, now))
+            self._write(self._enforce_caps(kept, self._now_hint))
 
     def drop(self, seq: int, reason: str) -> None:
         """Discard one batch the collector will never accept."""
@@ -760,6 +773,9 @@ class RelayClient:
         # Where the open-outage re-send sweep is up to. See
         # `_rotate_open`.
         self._open_cursor = 0
+        # Limit pairs already reported, so a collector cannot buy a
+        # log line per batch by alternating them.
+        self._limits_logged: set[tuple[int, int]] = set()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -786,7 +802,15 @@ class RelayClient:
             return []
         n = len(ids)
         off = self._open_cursor % n
-        self._open_cursor = (off + max(1, self._per_kind())) % n
+        # Step by the window the STORE will bind, not by `_per_kind()`.
+        # `outages_changed_since` clamps to 900 binds, and `enqueue`'s
+        # halving loop can lower `_per_kind` below that — so the two
+        # disagreed, and when the step exceeded the window the ids in
+        # between were never examined. Measured: 2,000 carry-forward
+        # ids with a step of 1,000 reached 2 of 2,000 offsets in 400
+        # cycles. Stepping by exactly the window tiles the list.
+        window = max(1, min(self._per_kind(), _OUTAGE_ID_BINDS))
+        self._open_cursor = (off + window) % n
         return ids[off:] + ids[:off]
 
     def _per_kind(self) -> int:
@@ -1020,6 +1044,18 @@ class RelayClient:
                 self._learned_body = body
                 moved = True
         if moved:
+            # Throttled on the pair of values, not on each change. A
+            # collector alternating two settings would otherwise buy
+            # one WARNING per batch — the same remote-controlled log
+            # flood the collector's own instance-reset branch is
+            # throttled for.
+            seen = (self._learned_records, self._learned_body)
+            if seen in self._limits_logged:
+                return moved
+            self._limits_logged.add(seen)
+            if len(self._limits_logged) > 32:
+                self._limits_logged.clear()
+                self._limits_logged.add(seen)
             log.warning(
                 "relay: collector enforces max_records_per_batch=%s "
                 "max_body_bytes=%s, lower than this agent was using. "
@@ -1044,12 +1080,36 @@ class RelayClient:
 
         Permanent for the batch as sent is not the same as permanent
         for its CONTENTS. Splitting it makes the mismatch cost a cycle
-        instead of a day of observations, and each half is strictly
-        smaller so the recursion terminates at one record per batch.
-        A single record that is still refused is genuinely undeliverable
-        and falls through to the drop.
+        instead of a day of observations.
+
+        THREE THINGS GUARD AGAINST AN IMMORTAL BATCH, and the first
+        version of this had none of them.
+
+        1. It only runs for a rejection that SIZE could explain.
+           `limits` is in the body only for the per-kind 400 and the
+           413; a 400 for clock skew, a bad instance id, a header
+           mismatch or an implausible sequence carries none, and no
+           amount of splitting will ever help those. Splitting them
+           anyway re-posted the same batch forever.
+        2. It requires PROGRESS. Halving each kind at
+           `(len+1)//2` moves nothing when every kind already holds a
+           single record: the first half takes them all, the second is
+           empty, and the replacement is byte-identical to what was
+           just refused. Measured on the most ordinary batch a
+           one-camera agent sends — one device plus one uptime row —
+           that looped every cycle forever. So a batch whose kinds
+           cannot be halved is split ACROSS kinds instead, and if even
+           that cannot reduce it, this returns False and the caller
+           drops it.
+        3. The replacement keeps the ORIGINAL spool timestamp. Stamping
+           it `now` reset `oldest_age` every cycle, so
+           `spool_max_age_seconds` could never expire it and the one
+           bound that would have ended the loop was defeated.
         """
         self._learn_limits(payload)
+        if not isinstance(payload.get("limits"), dict):
+            # Not a size rejection. See guard 1 above.
+            return False
         try:
             doc = json.loads(body)
             records = doc["records"]
@@ -1057,35 +1117,64 @@ class RelayClient:
                 return False
         except (ValueError, KeyError, TypeError):
             return False
-        total = sum(len(v) for v in records.values()
-                    if isinstance(v, list))
+        lists = {k: v for k, v in records.items() if isinstance(v, list)}
+        scalars = {k: v for k, v in records.items()
+                   if not isinstance(v, list)}
+        total = sum(len(v) for v in lists.values())
         if total < 2:
-            return False          # nothing left to split
+            return False          # one record; nothing to divide
         halves: list[dict] = [{}, {}]
-        for kind, items in records.items():
-            if not isinstance(items, list):
-                # Scalars like `monitor` ride with the first half; they
-                # are a snapshot, not a list, and duplicating them
-                # would double-count.
-                halves[0][kind] = items
-                continue
-            mid = (len(items) + 1) // 2
-            halves[0][kind] = items[:mid]
-            halves[1][kind] = items[mid:]
+        if any(len(v) > 1 for v in lists.values()):
+            for kind, items in lists.items():
+                mid = (len(items) + 1) // 2
+                halves[0][kind] = items[:mid]
+                halves[1][kind] = items[mid:]
+        else:
+            # Every kind holds exactly one record, so halving within a
+            # kind cannot move anything. Deal the kinds out instead.
+            for i, (kind, items) in enumerate(sorted(lists.items())):
+                halves[i % 2][kind] = items
+        # `monitor` goes in EVERY part, not just the first.
+        #
+        # It is a snapshot upserted onto the sensor row, not a counted
+        # record, so repeating it is idempotent. Sending it with only
+        # the first half meant the second half arrived with no monitor
+        # block — and the collector writes `mon_blind` unconditionally
+        # from `records.get("monitor") or {}`, so that CLEARED it. A
+        # sensor that had reported itself blind then rendered as
+        # reporting, with its camera rows and availability shown as
+        # current, on every surface. That is exactly the fabrication
+        # the `blind_sensors` gating exists to prevent.
+        for half in halves:
+            if any(half.get(k) for k in half):
+                half.update(scalars)
+        shaped = [h for h in halves
+                  if any(isinstance(v, list) and v for v in h.values())]
+        if len(shaped) < 2:
+            # No progress: one part holding everything is the batch we
+            # were just refused. Let the caller drop it rather than
+            # re-posting it forever.
+            #
+            # DEFENSIVE, and currently unreachable — no mutation test
+            # can cover it, which is why this says so. Above, the
+            # halving branch runs only when some kind holds 2+ records
+            # (so the second half is always non-empty), and the
+            # cross-kind branch runs only when every kind holds 1 and
+            # `total >= 2` guarantees at least two kinds. A future
+            # record shape that breaks both assumptions lands here
+            # instead of looping forever, which is the whole point.
+            return False
         parts = []
         with self._lock:
-            for half in halves:
-                if not any(isinstance(v, list) and v for v in half.values()):
-                    continue
+            for half in shaped:
                 new_seq = self.state.next_seq
                 self.state.next_seq = new_seq + 1
                 parts.append((new_seq, build_batch(
                     self.cfg.sensor_id, self.state.instance_id, new_seq,
                     half, self.now())))
             self.state.save()
-        if not parts:
-            return False
-        self.spool.replace(seq, parts, self.now())
+        # Original timestamp, not now. See guard 3.
+        self.spool.replace(seq, parts)
         log.warning(
             "relay: collector refused batch seq=%s with %s; split into "
             "%d smaller batch(es) and requeued rather than discarding "
@@ -1248,7 +1337,33 @@ class RelayClient:
                                                         status):
                 # Re-spooled smaller rather than discarded. Keep going;
                 # the replacements are at the tail of the spool.
+                #
+                # The collector ANSWERED, so the link is up: record
+                # that, or `_link_down_since` is never cleared and the
+                # agent keeps logging "collector unreachable" hourly
+                # while every request is being served. And keep the
+                # reason in `last_error`, which `hound relay` prints —
+                # skipping it left the operator with "nothing relays,
+                # no error", the symptom `_note_link` was added to
+                # remove.
+                self.state.last_error = (
+                    f"{status}: {str(payload.get('error', ''))[:160]} "
+                    f"(batch split and requeued)")[:300]
+                self.state.save()
+                self._note_link(True)
                 continue
+            elif status == 400 and payload.get("retryable"):
+                # The collector says this one may succeed unchanged —
+                # only the clock-skew refusal does. Keep the batch
+                # spooled and stop the cycle, exactly as a transport
+                # failure would. Dropping it would make a missing NTP
+                # server into permanent data loss.
+                err = f"400: {str(payload.get('error', ''))[:200]}"
+                self.state.last_error = err[:300]
+                self.state.save()
+                self._note_link(False, err)
+                ok = False
+                break
             elif status in (400, 401, 413):
                 # 413 belongs here, not in the retry branch. It is
                 # permanent — the body is too large and will be exactly

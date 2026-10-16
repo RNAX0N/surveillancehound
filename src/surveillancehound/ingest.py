@@ -90,7 +90,12 @@ _DRAIN_MAX = 8 * 1024 * 1024
 # reads like a capture-starvation vector, and a first measurement
 # seemed to confirm it: collector pinned to one core, 8
 # unauthenticated addresses flooding the 413 path, local packet
-# parsing down to 29.9% of its 4.25M pkt/s unloaded baseline.
+# parsing down to 29.9% of its unloaded baseline. (That baseline was
+# a tight loop re-parsing one small synthetic capture already in
+# memory, so its absolute pkt/s is far above anything a real capture
+# reaches — an independent run against a 34 MB file on disk measured
+# 443k pkt/s. Only the RATIOS below are meaningful; do not quote the
+# absolute figure, which is why it is no longer written down.)
 #
 # Two things were wrong with reading it that way.
 #
@@ -115,7 +120,7 @@ _DRAIN_MAX = 8 * 1024 * 1024
 # And that run had `max_batches_per_minute = 10000`, which disables
 # the metering in `process_request`. At the SHIPPED default of 60 the
 # same flood from the same 8 addresses retains 80.4% of baseline
-# (3.42M pkt/s, 53,017 connections refused at accept); the
+# (53,017 connections refused at accept); the
 # independent run measured 100% at the shipped default. The ~70% loss
 # is what an UNMETERED collector costs — which is what the metering
 # was added for. It is not what this drain costs, and not what an
@@ -476,6 +481,16 @@ class IngestServer:
                 "error": f"sent_at is {skew:+.0f}s from collector time, "
                          f"outside the +/-{self.cfg.clock_skew_seconds:.0f}s window",
                 "server_time": now,
+                # TRANSIENT, unlike every other 400 here. The agent
+                # treats 400 as permanent and discards the batch,
+                # which for a clock problem means an NVR with no NTP
+                # destroys everything it observes until someone
+                # notices. Fixing the clock makes the identical batch
+                # acceptable, so tell the agent to keep it: it spools,
+                # and if the clock is never fixed the data ages out
+                # through the normal cap where it is COUNTED and
+                # logged rather than silently dropped.
+                "retryable": True,
             }
 
         try:

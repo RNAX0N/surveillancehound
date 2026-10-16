@@ -659,6 +659,419 @@ def _check_listener(tmp: Path) -> None:
         store.close()
 
 
+def _check_clock_skew_does_not_destroy_data(tmp: Path) -> None:
+    """A wrong clock is not a reason to throw observations away.
+
+    The agent treats 400 as permanent and drops the batch, after the
+    watermark advanced at enqueue. For a clock-skew refusal that means
+    an NVR with no NTP destroys everything it observes until somebody
+    notices — and fixing the clock makes the IDENTICAL batch
+    acceptable, so permanent is simply the wrong verdict. The
+    collector marks that one refusal `retryable` and the agent keeps
+    the batch spooled.
+    """
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.ingest import IngestServer
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import AlertRow, HoundStore
+
+    port = _free_port()
+    collector = HoundStore(path=tmp / "skew-c.sqlite")
+    srv = IngestServer(_collector_cfg(port), collector, now=lambda: T0)
+    assert srv.start()
+    home = tmp / "skew-a"
+    home.mkdir()
+    agent = HoundStore(path=home / "agent.sqlite")
+    for i in range(5):
+        agent.insert_alert(AlertRow(
+            id=None, ts=T0 + i, device_ip="192.168.10.11",
+            kind="new_device", severity="low", summary="x", detail="",
+            dedup_key=f"skew{i}"))
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url=f"https://127.0.0.1:{port}/ingest/v1",
+        tls_fingerprint=_pin(), batch_seconds=1.0,
+    )
+    try:
+        # An hour ahead of the collector.
+        client = RelayClient(cfg, agent, now=lambda: T0 + 3600)
+        client.enqueue()
+        assert client.flush() is False, "a skewed batch must not report success"
+        st = client.spool.stats(T0 + 3600)
+        assert st.pending == 1, (
+            f"the batch was discarded over a clock problem; spool holds "
+            f"{st.pending}. Fixing the clock makes the same batch valid, "
+            f"so dropping it is permanent loss for a transient fault")
+        assert st.dropped_stale == 0, st.dropped_stale
+        assert "sent_at" in client.state.last_error, client.state.last_error
+
+        # Clock corrected: the same batch lands, nothing lost.
+        client.now = lambda: T0
+        client.spool._now_hint = T0
+        assert client.flush() is True, client.state.last_error
+        got = collector._conn.execute(
+            "SELECT COUNT(*) c FROM remote_alerts").fetchone()["c"]
+        assert got == 5, f"{got} of 5 alerts survived the clock problem"
+    finally:
+        srv.stop()
+        agent.close()
+        collector.close()
+    print("  clock skew: the batch is kept, not dropped, and lands once "
+          "the clock is fixed")
+
+
+def _check_resplit_always_makes_progress(tmp: Path) -> None:
+    """A rejected batch must shrink, or be dropped. Never neither.
+
+    `_resplit` halves each kind at `(len+1)//2`. When every kind holds
+    exactly ONE record the first half takes them all and the second is
+    empty — so the "replacement" is byte-identical to the batch just
+    refused, and it is re-posted every cycle forever. The trigger is
+    the most ordinary batch a one-camera agent sends: one device plus
+    one uptime row.
+
+    Three things made that unbounded rather than merely wasteful:
+    the replacement was re-stamped `now`, so `spool_max_age_seconds`
+    could never expire it; the `continue` skipped `last_error` and
+    `_note_link`, so `hound relay` showed no error at all; and it ran
+    on ANY 400, including ones no split can fix.
+    """
+    import json as _json
+    from surveillancehound import relay as _R
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import HoundStore
+
+    home = tmp / "progress"
+    home.mkdir()
+    store = HoundStore(path=home / "agent.sqlite")
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url="https://127.0.0.1:1/ingest/v1",
+        tls_fingerprint=["sha256:" + "ab" * 32],
+    )
+    client = RelayClient(cfg, store, now=lambda: T0 + 10_000)
+    limits = {"max_records_per_batch": 1, "max_body_bytes": 1024}
+
+    def spool_one(records):
+        body = _R.build_batch("frigate", client.state.instance_id,
+                              client.state.next_seq, records, T0)
+        seq = client.state.next_seq
+        client.state.next_seq += 1
+        client.spool.append(seq, body, T0)
+        return seq, body
+
+    # 1. One record per kind: halving cannot move anything, so it must
+    #    split ACROSS kinds and shrink.
+    recs = {"devices": [{"ip": "10.0.0.1", "role": "camera",
+                         "first_seen": T0, "last_seen": T0,
+                         "packet_count": 1, "byte_count": 1}],
+            "flows": [], "alerts": [], "outages": [],
+            "uptime": [{"ip": "10.0.0.1", "role": "camera", "state": "up",
+                        "last_seen": T0, "first_seen": T0,
+                        "down_since": None, "current_downtime": 0.0,
+                        "outage_count": 0, "downtime_seconds": 0.0,
+                        "monitored_seconds": 60.0, "availability": 1.0}],
+            "monitor": {"alive": True, "blind": True,
+                        "last_activity_ts": T0}}
+    seq, body = spool_one(recs)
+    assert client._resplit(seq, body, {"error": "too big",
+                                       "limits": limits}, 400) is True
+    parts = client.spool.pending(T0 + 10_000)
+    assert len(parts) == 2, (
+        f"a two-record batch with one record per kind produced "
+        f"{len(parts)} part(s); if it cannot be divided it must be "
+        f"dropped, not re-spooled identical and re-posted forever")
+    kinds = []
+    for _, b in parts:
+        r = _json.loads(b)["records"]
+        kinds.append({k: len(v) for k, v in r.items()
+                      if isinstance(v, list) and v})
+        # EVERY part carries monitor: the collector writes mon_blind
+        # unconditionally from it, so a part without one CLEARS the
+        # blind flag and the sensor renders healthy.
+        assert r.get("monitor", {}).get("blind") is True, (
+            f"a split part lost the monitor block: {r.get('monitor')!r}. "
+            f"The collector writes mon_blind from it unconditionally, so "
+            f"the half without one marks a blind sensor as seeing")
+    assert all(sum(k.values()) == 1 for k in kinds), kinds
+    # CONSERVATION: the parts together hold exactly the original
+    # records, once each. A split that loses or duplicates is worse
+    # than the drop it replaced, and "it got smaller" does not imply
+    # either.
+    seen_ips = []
+    for _, b in parts:
+        r = _json.loads(b)["records"]
+        seen_ips += [d["ip"] for d in r.get("devices", [])]
+        seen_ips += [u["ip"] for u in r.get("uptime", [])]
+    assert sorted(seen_ips) == ["10.0.0.1", "10.0.0.1"], (
+        f"the split did not conserve records: {seen_ips}")
+
+    # 2. Genuinely indivisible: one record. Must refuse to split so the
+    #    caller drops it.
+    client.spool.ack(10**9)                   # clear
+    seq, body = spool_one({"devices": recs["devices"], "flows": [],
+                           "alerts": [], "outages": [], "uptime": [],
+                           "monitor": None})
+    assert client._resplit(seq, body, {"error": "too big",
+                                       "limits": limits}, 400) is False, (
+        "a single-record batch was 'split'; there is nothing to divide, "
+        "so it must fall through to the drop")
+
+    # 3. A 400 that size cannot explain must not be split at all.
+    client.spool.ack(10**9)
+    seq, body = spool_one(recs)
+    assert client._resplit(seq, body,
+                           {"error": "sent_at is +4000s from collector "
+                                     "time"}, 400) is False, (
+        "a clock-skew 400 was split. It carries no `limits`, splitting "
+        "cannot help, and doing it anyway re-posts forever while minting "
+        "fresh sequence numbers")
+
+    # 4. The replacement must NOT reset the spool age, or the one bound
+    #    that ends such a loop is gone.
+    client.spool.ack(10**9)
+    seq, body = spool_one(recs)
+    import time as _t
+    old_at = client.spool._read()[0]["at"]
+    client.now = lambda: T0 + 99_999
+    assert client._resplit(seq, body, {"error": "x", "limits": limits},
+                           400) is True
+    ats = [e["at"] for e in client.spool._read()]
+    assert all(a == old_at for a in ats), (
+        f"replacements were stamped {ats} instead of the original "
+        f"{old_at}. Re-stamping resets oldest_age every cycle, so "
+        f"spool_max_age_seconds can never expire a batch that keeps "
+        f"being split — removing the only bound on the loop")
+    store.close()
+    print("  resplit: splits across kinds when halving cannot, refuses "
+          "the indivisible and the unexplained, and keeps the batch age")
+
+
+def _check_prune_relay_days_returns_bytes(tmp: Path) -> None:
+    """`hound prune --relay-days` must actually free filesystem space.
+
+    `store.vacuum()` shipped with NO caller: `cmd_prune` called only
+    `prune_remote`, which the same change had deliberately stripped of
+    its VACUUM. Four places asserted the call that did not exist,
+    including the README telling operators it "gives the bytes back".
+    Measured: 40,000 relayed flows deleted, 6,324,224 bytes before and
+    6,324,224 after.
+
+    It matters because the disk guard refuses ingest below a hard
+    32 MiB floor, so this command is the documented way out of a
+    collector wedged at 507 — and a plain VACUUM needs twice the file
+    size free, which is exactly false on a full disk. `vacuum()` uses
+    `VACUUM INTO`, which needs room for the live data only.
+    """
+    import json as _json
+    import subprocess as _sp
+    import sys as _sys
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "reclaim.sqlite")
+    n = 8000
+    for b in range(5):
+        recs = V.validate_records({"flows": [
+            {"remote_id": b * n + i + 1, "src_ip": "192.168.10.11",
+             "src_port": 554, "dst_ip": "203.0.113.9", "dst_port": 8443,
+             "proto": "tcp", "first_seen": T0, "last_seen": T0 + 1,
+             "packets": 10, "bytes": 1000, "bytes_to_camera": 500,
+             "bytes_from_camera": 500, "tcp_flags_seen": "SA",
+             "classification": "external_other"} for i in range(n)]},
+            10**6)
+        store.ingest_remote_batch("frigate", "inst-aaaa1111", b + 1, recs,
+                                  T0 + b)
+    store.close()
+    before = (tmp / "reclaim.sqlite").stat().st_size
+    assert before > 2_000_000, before
+
+    cfg_path = tmp / "reclaim.toml"
+    cfg_path.write_text(
+        f"[capture]\npcap_file = '/nonexistent.pcap'\n"
+        f"[network]\ncamera_ips = ['192.168.10.11']\n"
+        f"[store]\npath = {str(tmp / 'reclaim.sqlite')!r}\n")
+    out = _sp.run([_sys.executable, "-m", "surveillancehound.cli",
+                   "prune", str(cfg_path), "--relay-days", "0.0001"],
+                  capture_output=True, text=True,
+                  env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    assert out.returncode == 0, out.stderr[-400:]
+    after = (tmp / "reclaim.sqlite").stat().st_size
+    assert after < before // 2, (
+        f"`hound prune --relay-days` left the store at {after:,} bytes, "
+        f"was {before:,}. Its own help and the agent README both promise "
+        f"the space back, and it is the documented recovery for a "
+        f"collector refusing every sensor at 507")
+    assert "reclaimed" in out.stdout, out.stdout
+    print(f"  prune --relay-days: {before:,} -> {after:,} bytes returned "
+          f"to the filesystem")
+
+
+def _check_blind_sensor_is_never_rendered_current(tmp: Path) -> None:
+    """A sensor that says its capture is blind must not read healthy.
+
+    This gate had ZERO test coverage. Both halves could be mutated
+    away with every suite still green: the collector's write of
+    `mon_blind`, and the `blind_sensors` gating in
+    `remote_uptime_report`. A previous round's commit message claimed
+    a test for it; there was none.
+
+    And the export document's `monitor.blind` must be a BOOLEAN. It
+    was briefly a list of blind sensor ids, from a rebound local name
+    — `Boolean([])` is true in JavaScript, so the OPNsense dashboard
+    (whose only data source this document is) rendered "capture
+    stalled" for every healthy daemon and could never show a real
+    one.
+    """
+    import json as _json
+    import subprocess as _sp
+    import sys as _sys
+    from surveillancehound.store import HoundStore
+
+    store = HoundStore(path=tmp / "blind.sqlite")
+    recs = V.validate_records({
+        "uptime": [{"ip": "192.168.10.11", "role": "camera", "state": "up",
+                    "last_seen": T0, "first_seen": T0 - 100,
+                    "down_since": None, "current_downtime": 0.0,
+                    "outage_count": 0, "downtime_seconds": 0.0,
+                    "monitored_seconds": 9000.0, "availability": 1.0}],
+        "monitor": {"alive": True, "blind": False,
+                    "last_activity_ts": T0},
+    }, 1000)
+    store.ingest_remote_batch("frigate", "inst-aaaa1111", 1, recs, T0)
+
+    # Healthy: the row is current.
+    rows = store.remote_uptime_report(T0 + 10, 600.0, blind_sensors=[])
+    assert rows and rows[0]["state"] == "up" and not rows[0]["stale"], rows
+    assert rows[0]["availability"] == 1.0, rows
+
+    # The sensor now says its own capture is blind. The LINK is fine.
+    recs = V.validate_records({
+        "monitor": {"alive": True, "blind": True, "last_activity_ts": T0},
+    }, 1000)
+    store.ingest_remote_batch("frigate", "inst-aaaa1111", 2, recs, T0 + 1)
+    sensor = store.get_remote_sensor("frigate")
+    assert sensor.mon_blind is True, (
+        "the collector did not record the sensor's own blind flag; "
+        "every surface downstream then renders it as healthy")
+
+    rows = store.remote_uptime_report(
+        T0 + 10, 600.0, blind_sensors=["frigate"])
+    assert rows[0]["state"] == "unknown", (
+        f"a blind sensor's camera still reads {rows[0]['state']!r}. Its "
+        f"last snapshot is not a current observation, and showing it as "
+        f"one is the same fabrication as inventing a figure from no "
+        f"observation at all")
+    assert rows[0]["stale"] is True, rows[0]
+    assert rows[0]["availability"] is None, (
+        f"availability {rows[0]['availability']!r} from a sensor that "
+        f"cannot see")
+    assert "blind" in rows[0].get("stale_reason", ""), rows[0]
+    store.close()
+
+    # And the export document the OPNsense dashboard reads.
+    cfg_path = tmp / "blind.toml"
+    cfg_path.write_text(
+        f"[capture]\npcap_file = '/nonexistent.pcap'\n"
+        f"[network]\ncamera_ips = ['192.168.10.11']\n"
+        f"[store]\npath = {str(tmp / 'blind.sqlite')!r}\n"
+        f"[relay]\nmode = 'collector'\nlisten_host = '127.0.0.1'\n"
+        f"[[relay.sensor]]\nid = 'frigate'\n"
+        f"key = 'shared-secret-abcdef'\n")
+    out = _sp.run([_sys.executable, "-m", "surveillancehound.cli",
+                   "export", str(cfg_path)],
+                  capture_output=True, text=True,
+                  env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    assert out.returncode == 0, out.stderr[-400:]
+    doc = _json.loads(out.stdout)
+    for field in ("alive", "blind", "stalled"):
+        if field in doc["monitor"]:
+            assert isinstance(doc["monitor"][field], bool), (
+                f"export's monitor.{field} is "
+                f"{type(doc['monitor'][field]).__name__}, not bool: "
+                f"{doc['monitor'][field]!r}. The OPNsense view tests it "
+                f"for truthiness, and a non-empty container is always "
+                f"true there — a permanent false alarm that also hides "
+                f"the real signal")
+    print("  blind sensors: recorded, camera rows go unknown with no "
+          "availability, and export's monitor flags stay boolean")
+
+
+def _check_relayed_alerts_count_in_the_tile(tmp: Path) -> None:
+    """`alerts_24h` must count RELAYED alerts too, on a collector.
+
+    The existing test ran with `relay.mode = off`, so only the local
+    half was covered and `count_remote_alerts_since` could be zeroed
+    silently — which is exactly the under-reporting the counter was
+    added to fix, on the platform where the collector is often the
+    only thing with alerts to show.
+    """
+    import json as _json
+    import subprocess as _sp
+    import sys as _sys
+    from surveillancehound.store import AlertRow, HoundStore
+    import time as _t
+
+    now = _t.time()
+    store = HoundStore(path=tmp / "tile.sqlite")
+    for i in range(7):
+        store.insert_alert(AlertRow(
+            id=None, ts=now - i, device_ip="10.0.0.1", kind="new_device",
+            severity="low", summary="x", detail="", dedup_key=f"loc{i}"))
+    recs = V.validate_records({"alerts": [
+        {"remote_id": i + 1, "ts": now - i, "device_ip": "192.168.10.11",
+         "kind": "new_device", "severity": "low", "summary": "x",
+         "detail": "", "dedup_key": f"rem{i}"} for i in range(11)]}, 1000)
+    store.ingest_remote_batch("frigate", "inst-aaaa1111", 1, recs, now)
+    store.close()
+
+    cfg_path = tmp / "tile.toml"
+    cfg_path.write_text(
+        f"[capture]\npcap_file = '/nonexistent.pcap'\n"
+        f"[network]\ncamera_ips = ['192.168.10.11']\n"
+        f"[store]\npath = {str(tmp / 'tile.sqlite')!r}\n"
+        f"[relay]\nmode = 'collector'\nlisten_host = '127.0.0.1'\n"
+        f"[[relay.sensor]]\nid = 'frigate'\n"
+        f"key = 'shared-secret-abcdef'\n")
+    out = _sp.run([_sys.executable, "-m", "surveillancehound.cli",
+                   "export", str(cfg_path), "--limit", "3"],
+                  capture_output=True, text=True,
+                  env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    assert out.returncode == 0, out.stderr[-400:]
+    got = _json.loads(out.stdout)["counts"]["alerts_24h"]
+    assert got == 18, (
+        f"alerts_24h is {got}; 7 local + 11 relayed alerts are inside "
+        f"the window and the tile sits above a table that lists both. "
+        f"--limit 3 is set deliberately: the count must come from a "
+        f"COUNT, not from the page fetched for the table")
+    print("  alerts_24h: 7 local + 11 relayed counted at --limit 3")
+
+
+def _check_shutdown_flushes_the_relay(tmp: Path) -> None:
+    """The daemon must actually CALL final_flush on shutdown.
+
+    `final_flush` was tested as a method while nothing asserted the
+    wiring, so deleting the call from `daemon.run()`'s shutdown path
+    left every suite green. CLAUDE.md lists draining in-RAM state on
+    clean shutdown as a hard constraint, and for an agent the spool
+    tail is part of that state.
+    """
+    import inspect
+    from surveillancehound import daemon as _d
+
+    src = inspect.getsource(_d.Hound.run)
+    assert "final_flush" in src, (
+        "daemon.Hound.run() never calls relay.final_flush(). The last "
+        "window of observations is then left spooled on every clean "
+        "shutdown, and `stop()` alone does not send it")
+    # And it must come AFTER the in-RAM flow drain, or the records the
+    # drain produces miss the final batch entirely.
+    assert src.index("drain") < src.index("final_flush"), (
+        "final_flush runs before the in-RAM flows are drained, so the "
+        "flows that drain produces are not in the last batch")
+    print("  shutdown: run() drains in-RAM flows, then flushes the relay")
+
+
 def _check_disk_guard_needs_real_space(tmp: Path) -> None:
     """Reusable pages are not a substitute for filesystem space.
 
@@ -1249,7 +1662,12 @@ def _check_drain_deadline_is_total(tmp: Path) -> None:
     ctx.verify_mode = _ssl.CERT_NONE
     try:
         raw = _sock.socket()
-        raw.settimeout(60)
+        # SHORTER than the assertion bound below, so a broken budget
+        # FAILS instead of hanging. With a 60s client timeout and the
+        # constant mutated upward, this test ran until the harness was
+        # killed — a 20-minute hang is a bad failure mode for the only
+        # test runner this project has.
+        raw.settimeout(6)
         raw.connect(("127.0.0.1", port))
         w = ctx.wrap_socket(raw)
         w.sendall(f"POST /ingest/v1 HTTP/1.1\r\nHost: x\r\n"
@@ -1280,10 +1698,24 @@ def _check_drain_deadline_is_total(tmp: Path) -> None:
             pass
         # Generous: the point is that it does not scale with how long
         # the peer keeps dribbling. The pre-fix measurement was 1.92x.
-        assert held < _DRAIN_BUDGET_S * 1.6, (
-            f"a dribbling peer held the drain {held:.2f}s against a "
-            f"stated {_DRAIN_BUDGET_S}s total budget; the per-iteration "
-            f"timeout must come from the REMAINING budget")
+        # ABSOLUTE, not a multiple of the constant being tested.
+        #
+        # This asserted `held < _DRAIN_BUDGET_S * 1.6`, reading the
+        # value from the module — so raising the constant could never
+        # fail it. Proven: setting `_DRAIN_BUDGET_S = 1e9` made this
+        # test PASS while printing 60.14s, with the real ceiling being
+        # `_CONN_BUDGET` (120s) per unauthenticated connection. That is
+        # the slow-loris the budget exists to stop, and the test for it
+        # was blind to the only mutation that mattered.
+        assert held < 4.0, (
+            f"a dribbling peer held the drain {held:.2f}s; the stated "
+            f"bound is {_DRAIN_BUDGET_S}s and the per-iteration timeout "
+            f"must come from the REMAINING budget")
+        assert _DRAIN_BUDGET_S <= 2.5, (
+            f"_DRAIN_BUDGET_S is {_DRAIN_BUDGET_S}s. An unauthenticated "
+            f"peer can hold a worker for this long per refusal; at 16 "
+            f"workers it has to stay small, and the absolute bound "
+            f"above assumes it")
     finally:
         srv.stop()
         store.close()
@@ -4337,7 +4769,9 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
         _t0 = _t.time()
         _h._drain_unread_body()
         _held = _t.time() - _t0
-        assert _held < _ding._DRAIN_BUDGET_S + 1.0, (
+        # Absolute, for the same reason as the other drain test: a
+        # bound read from the module cannot catch the module changing.
+        assert _held < 4.0 and _ding._DRAIN_BUDGET_S <= 2.5, (
             f"the body drain held {_held:.1f}s against a stated "
             f"{_ding._DRAIN_BUDGET_S}s budget; a dribbling peer owns the "
             f"handler for as long as it likes"
@@ -4438,6 +4872,12 @@ def main() -> int:
         _check_damaged_spool_line(Path(td))
         _check_guards_at_their_call_sites(Path(td))
         _check_disk_guard_needs_real_space(Path(td))
+        _check_blind_sensor_is_never_rendered_current(Path(td))
+        _check_resplit_always_makes_progress(Path(td))
+        _check_clock_skew_does_not_destroy_data(Path(td))
+        _check_prune_relay_days_returns_bytes(Path(td))
+        _check_relayed_alerts_count_in_the_tile(Path(td))
+        _check_shutdown_flushes_the_relay(Path(td))
         _check_instance_reset_log_is_throttled(Path(td))
         _check_relayed_outages_have_a_reader(Path(td))
         _check_retention_does_not_block_capture(Path(td))

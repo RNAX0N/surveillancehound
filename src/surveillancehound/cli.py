@@ -162,7 +162,11 @@ def _dur(seconds: float) -> str:
     """Compact duration for table cells — '3d 4h', '12m', '45s'."""
     s = int(max(0.0, seconds))
     if s == 0:
-        return "-"
+        # "<1s", not "-". `hound sensors` prints `_dur(age) + " ago"`,
+        # so a sensor that reported half a second ago read "- ago",
+        # which looks like missing data rather than the freshest
+        # possible contact.
+        return "<1s" if seconds > 0 else "-"
     if s < 60:
         return f"{s}s"
     if s < 3600:
@@ -258,9 +262,13 @@ def cmd_uptime(args: argparse.Namespace) -> int:
                   f"{'to':19s} {'duration':>10s}  cause")
             rows = [("local", o.camera_ip, o.down_since, o.up_at,
                      o.duration(now), o.cause) for o in local]
+            # max(0, ...): `down_since` is sensor-supplied and
+            # validated only up to the year 2100, so a future value
+            # made this negative and `_dur` printed a bare "-" — a
+            # nonsense row rendered as a tidy one.
             rows += [(r["sensor_id"], r["camera_ip"], r["down_since"],
                       r["up_at"],
-                      ((r["up_at"] or now) - r["down_since"]),
+                      max(0.0, (r["up_at"] or now) - r["down_since"]),
                       r["cause"]) for r in relayed]
             rows.sort(key=lambda r: r[2], reverse=True)
             for sensor, ip, down, up, dur, cause in rows:
@@ -481,10 +489,20 @@ def _export_body(args, cfg, store, window, now) -> int:
         # sent one is indistinguishable from one reporting its capture is
         # down — and treating 0 as "down" marked healthy sensors blind.
         # `mon_blind` is only ever set by a sensor that actually said so.
-        blind = [x.sensor_id for x in sensors if x.mon_blind]
+        #
+        # NAMED `blind_sensor_ids`, not `blind`. This was `blind`, which
+        # shadowed the LOCAL monitor's boolean bound from
+        # `_monitor_health` twenty lines above — so the document shipped
+        # `monitor.blind` as a LIST. `Boolean([])` is true in
+        # JavaScript, so the OPNsense dashboard, whose only data source
+        # this is, rendered "Capture stalled — the monitor is running
+        # but seeing no packets" for every healthy daemon, and the real
+        # stall signal could never show. A permanent false alarm and a
+        # destroyed real one, from a rebound name.
+        blind_sensor_ids = [x.sensor_id for x in sensors if x.mon_blind]
         remote_up = (
             store.remote_uptime_report(now, cfg.relay.sensor_timeout_seconds,
-                                       blind_sensors=blind)
+                                       blind_sensors=blind_sensor_ids)
             if is_collector else []
         )
         remote_alerts = (store.list_remote_alerts(limit=args.limit)
@@ -776,16 +794,29 @@ def cmd_prune(args: argparse.Namespace) -> int:
                 "--alerts-days, --notifications-days, --outages-days, "
                 "--sessions-days, --relay-days",
             )
-        deleted = store.prune(**kwargs) if kwargs else {}
+        # RELAYED ROWS FIRST, then one reclaim covering everything.
+        #
+        # `store.prune()` runs its own VACUUM, so doing it first
+        # rebuilt the file while the relayed pages were still live and
+        # they were never in the rebuild. And `prune_remote` does NOT
+        # vacuum — deliberately, because the daemon calls it from the
+        # tick — so `--relay-days` returned no bytes at all despite
+        # this command's own help saying it would. Measured: 40,000
+        # relayed flows deleted, 6,324,224 bytes before and after.
+        deleted = {}
         if args.relay_days is not None:
-            # The relayed tables had no manual cutoff at all: only the
-            # daemon's own sweep touched them, so an operator whose
-            # store a sensor had inflated could not reclaim it without
-            # the daemon running — and while it is inflated the
-            # collector answers 507 to EVERY sensor. `prune_remote`
-            # also VACUUMs, so this gives bytes back and not just rows.
             deleted.update(
                 store.prune_remote(now - args.relay_days * 86400.0))
+        if kwargs:
+            deleted.update(store.prune(**kwargs))
+        if args.relay_days is not None and any(deleted.values()):
+            before, after = store.vacuum()
+            if after < before:
+                print(f"reclaimed {(before - after) / 1e6:,.1f} MB "
+                      f"({before:,} -> {after:,} bytes)")
+            else:
+                print(f"store is {before:,} bytes; no space reclaimed "
+                      f"(not enough free disk to rebuild it)")
         if not any(deleted.values()):
             print("nothing to prune")
         else:
@@ -990,8 +1021,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="delete ENDED monitor session rows older than N days")
     p_p.add_argument("--relay-days", type=float,
                      help="delete relayed (remote_*) rows older than N days, "
-                          "by when this collector received them, and reclaim "
-                          "the space")
+                          "by when this collector received them, then "
+                          "rebuild the store to return the space to the "
+                          "filesystem")
     p_p.set_defaults(func=cmd_prune)
 
     p_w = sub.add_parser("web", help="serve the local dashboard")

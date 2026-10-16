@@ -558,15 +558,27 @@ class HoundStore:
             self._lock = threading.RLock()
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._connect()
+        with self._conn:
+            self._drop_prerelease_relay_tables()
+            self._conn.executescript(_DDL)
+        self._lock = threading.RLock()
+
+    def _connect(self) -> None:
+        """Open the writable connection and set its PRAGMAs.
+
+        Extracted so `vacuum()` can reopen after swapping the file in.
+        Does NOT run the schema or the migration: callers that need
+        those do them once, and a reopen after a rebuild must not
+        re-run a destructive migration.
+        """
+        self._conn = sqlite3.connect(str(self.path),
+                                     check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._conn:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
-            self._drop_prerelease_relay_tables()
-            self._conn.executescript(_DDL)
-        self._lock = threading.RLock()
 
     # Relay tables created before the instance_id key existed. They are
     # not upgradable in place: the project forbids ALTER TABLE, and
@@ -1527,19 +1539,42 @@ class HoundStore:
         surface reporting something it cannot back, a view that omits
         the only data a collector HAS is the sin in its purest form.
 
-        Filtered on `down_since` so it reads like the local view, but
-        bounded by `ingested_at` too: a sensor controls `down_since`
-        and could otherwise backdate rows out of every window or
-        forward-date them to the top of every one.
+        Two things keep one sensor from owning this view, and the
+        first revision had neither despite its docstring claiming
+        both.
+
+        ORDERED ON `ingested_at`, our clock, never the sensor-supplied
+        `down_since`. `validate_outage` accepts `down_since` up to the
+        year 2100, so ordering by it let one key holder put 500
+        future-dated rows at the top of every query.
+
+        FAIR SHARE per sensor. Even ordered honestly, a sensor inside
+        its `max_rows_per_sensor` quota can fill any flat limit.
+        Measured on the first revision: 600 hostile rows left 0 of 5
+        honest rows visible, and this is the ONLY reader of relayed
+        outages, so that blinded the operator to every other sensor.
+        Same reasoning as the daemon's round-robin alert queue.
         """
         with self._lock:
-            rows = self._conn.execute(
-                """SELECT * FROM remote_outages
-                   WHERE down_since >= ? OR up_at IS NULL
-                   ORDER BY down_since DESC LIMIT ?""",
-                (float(since), int(limit)),
-            ).fetchall()
-        return [dict(r) for r in rows]
+            sensors = [r["sensor_id"] for r in self._conn.execute(
+                "SELECT DISTINCT sensor_id FROM remote_outages"
+            ).fetchall()]
+            if not sensors:
+                return []
+            share = max(1, int(limit) // len(sensors))
+            out: list[dict] = []
+            for sid in sensors:
+                rows = self._conn.execute(
+                    """SELECT * FROM remote_outages
+                       WHERE sensor_id = ?
+                         AND (down_since >= ? OR up_at IS NULL)
+                       ORDER BY ingested_at DESC, id DESC
+                       LIMIT ?""",
+                    (sid, float(since), share),
+                ).fetchall()
+                out.extend(dict(r) for r in rows)
+        out.sort(key=lambda r: r["ingested_at"], reverse=True)
+        return out[:int(limit)]
 
     def remote_quota_usage(self, sensor_id: str) -> dict[str, int]:
         with self._lock:
@@ -1649,15 +1684,75 @@ class HoundStore:
         fine in a one-shot CLI process and unacceptable inside the
         packet loop.
 
-        Returns (before, after) file sizes. `after` will usually still
-        be the pre-VACUUM size in-process; the shrink lands on close.
+        Prefers `VACUUM INTO`, which needs room for the LIVE data
+        only — a few MB after retention has deleted most of the rows.
+        A plain `VACUUM` needs roughly twice the CURRENT file size
+        free, which is exactly false on the full disk this command is
+        the documented recovery for: the collector answers 507 below
+        `min_free_disk_mb`, so the one state an operator needs to
+        reclaim from was the one state the reclaim refused to run in.
+
+        Returns (before, after) file sizes.
         """
         before = self.path.stat().st_size
+        if self.readonly:
+            return before, before
+        live = self._live_bytes()
+        free = self._fs_free()
+        tmp = self.path.with_name(self.path.name + ".vacuum.tmp")
+        # 1.15x the live data: VACUUM INTO writes a fresh compact
+        # database and nothing else.
+        if live and free is not None and free > live * 1.15:
+            try:
+                with self._lock:
+                    tmp.unlink(missing_ok=True)
+                    self._conn.execute("VACUUM INTO ?", (str(tmp),))
+                    # Close before replacing so the WAL is
+                    # checkpointed and removed; a stale -wal beside a
+                    # swapped-in main file is a corrupt store.
+                    self._conn.close()
+                    os.replace(tmp, self.path)
+                    for suffix in ("-wal", "-shm"):
+                        Path(str(self.path) + suffix).unlink(
+                            missing_ok=True)
+                    self._connect()
+                return before, self.path.stat().st_size
+            except (sqlite3.Error, OSError) as e:
+                # VACUUM INTO needs SQLite 3.27; fall through to the
+                # in-place rebuild rather than leaving this unreclaimed.
+                log.warning("store: VACUUM INTO failed (%s); trying an "
+                            "in-place VACUUM", e)
+                tmp.unlink(missing_ok=True)
+                try:
+                    self._conn.execute("SELECT 1")
+                except sqlite3.Error:
+                    self._connect()
         if not self._vacuum_is_safe():
             return before, before
         with self._lock:
             self._conn.execute("VACUUM")
         return before, self.path.stat().st_size
+
+    def _live_bytes(self) -> int:
+        """Bytes of pages actually in use. 0 if it cannot be read."""
+        try:
+            with self._lock:
+                pages = self._conn.execute(
+                    "PRAGMA page_count").fetchone()[0]
+                free = self._conn.execute(
+                    "PRAGMA freelist_count").fetchone()[0]
+                size = self._conn.execute(
+                    "PRAGMA page_size").fetchone()[0]
+            return max(0, (int(pages) - int(free))) * int(size)
+        except (sqlite3.Error, TypeError, IndexError):
+            return 0
+
+    def _fs_free(self) -> "int | None":
+        try:
+            st = os.statvfs(self.path.parent)
+        except (OSError, AttributeError):
+            return None
+        return st.f_bavail * st.f_frsize
 
     def reusable_bytes(self) -> int:
         """Free pages inside the store, in bytes.
