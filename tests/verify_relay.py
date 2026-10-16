@@ -2013,8 +2013,79 @@ def _check_instance_reset(tmp: Path) -> None:
         assert first["camera_ip"] == "10.0.0.5" and first["up_at"] is None, (
             f"the pre-wipe outage was corrupted: {first}"
         )
+        # instance_id is now part of the key, so it is as untrusted as
+        # any other wire string. An EMPTY one collapses the key straight
+        # back to (sensor, remote_id) and reinstates the cross-instance
+        # clobbering the key exists to stop.
+        for bad, why in (
+            ("", "empty"),
+            ("x" * 200, "over-long"),
+            ("INST\x07\x1b[31m", "control characters"),
+            (None, "missing"),
+        ):
+            try:
+                V.clean_instance_id(bad)
+                raise AssertionError(
+                    f"an {why} instance_id was accepted; it is persisted on "
+                    f"every relayed row, echoed by the API and logged"
+                )
+            except V.ValidationError:
+                pass
+        assert V.clean_instance_id("a1b2c3d4e5f6a7b8") == "a1b2c3d4e5f6a7b8"
+
         print("  instance reset: post-wipe records stored, acked honestly, "
-              "and outage history not rewritten")
+              "outage history intact, instance_id validated")
+    finally:
+        store.close()
+
+
+def _check_prerelease_schema_upgrade(tmp: Path) -> None:
+    """A store from before the instance-scoped key must still work.
+
+    The project forbids ALTER TABLE and uses CREATE TABLE IF NOT EXISTS,
+    so an older relay table survives untouched and every INSERT then
+    fails with "no column named instance_id". Ingest answers 500, the
+    agent treats 500 as retryable, and the collector silently ingests
+    NOTHING for the rest of its life while the agent's spool ages out —
+    loud in one log, invisible in the other.
+    """
+    import sqlite3
+
+    from surveillancehound.store import HoundStore
+
+    db = tmp / "prerelease.sqlite"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """CREATE TABLE remote_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, sensor_id TEXT NOT NULL,
+            remote_id INTEGER NOT NULL, ts REAL NOT NULL,
+            device_ip TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
+            severity TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '', dedup_key TEXT NOT NULL,
+            ingested_at REAL NOT NULL, UNIQUE (sensor_id, remote_id));"""
+    )
+    con.execute("INSERT INTO remote_alerts VALUES "
+                "(1,'s',1,0,'','k','low','old','','d',0)")
+    con.commit()
+    con.close()
+
+    store = HoundStore(path=db)
+    try:
+        recs = V.validate_records({"alerts": [{
+            "remote_id": 1, "ts": T0, "device_ip": "10.0.0.1",
+            "kind": "new_device", "severity": "low", "summary": "new",
+            "detail": "", "dedup_key": "k",
+        }]}, 10)
+        counts = store.ingest_remote_batch("s", "inst-aaaa1111", 1, recs, T0)
+        assert counts["alerts"] == 1, (
+            f"ingest against a pre-release store inserted nothing "
+            f"({counts}); an in-place upgrade would 500 forever"
+        )
+        cols = {r[1] for r in
+                store._conn.execute("PRAGMA table_info(remote_alerts)")}
+        assert "instance_id" in cols, cols
+        print("  schema: a pre-release relay table is recreated rather than "
+              "failing every insert")
     finally:
         store.close()
 
@@ -2037,6 +2108,7 @@ def main() -> int:
         _check_quarantine(Path(td))
         _check_resource_bounds(Path(td))
         _check_instance_reset(Path(td))
+        _check_prerelease_schema_upgrade(Path(td))
         _check_relayed_dispatch_is_quarantined(Path(td))
         _check_sensor_offline_alerts(Path(td))
         _check_relayed_api_surface(Path(td))

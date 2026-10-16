@@ -528,8 +528,50 @@ class HoundStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
+            self._drop_prerelease_relay_tables()
             self._conn.executescript(_DDL)
         self._lock = threading.RLock()
+
+    # Relay tables created before the instance_id key existed. They are
+    # not upgradable in place: the project forbids ALTER TABLE, and
+    # CREATE TABLE IF NOT EXISTS leaves the old definition alone — so
+    # every relayed INSERT fails with "no column named instance_id",
+    # ingest answers 500, the agent treats that as retryable, and the
+    # collector silently ingests nothing for the rest of its life while
+    # the agent's spool ages out. Loud in one log, invisible in the other.
+    _RELAY_TABLES_V2 = ("remote_flows", "remote_alerts", "remote_outages")
+
+    def _drop_prerelease_relay_tables(self) -> None:
+        """Recreate pre-release relay tables rather than fail every insert.
+
+        This is a one-time discard of RELAYED rows only — another host's
+        observations, which that host still holds and will resend what it
+        has spooled. Nothing this sensor observed is touched. It is safe
+        precisely because the relay has never shipped; if it had, this
+        would need a real migration instead.
+        """
+        for table in self._RELAY_TABLES_V2:
+            row = self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if row is None:
+                continue
+            cols = {r[1] for r in
+                    self._conn.execute(f"PRAGMA table_info({table})")}
+            if "instance_id" in cols:
+                continue
+            n = self._conn.execute(
+                f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            log.warning(
+                "store: %s predates the instance-scoped relay key and "
+                "cannot be upgraded in place; dropping it and its %d "
+                "relayed row(s). Only data relayed FROM OTHER SENSORS is "
+                "affected — nothing this sensor observed. Agents resend "
+                "what they still have spooled.",
+                table, n,
+            )
+            self._conn.execute(f"DROP TABLE {table}")
 
     def close(self) -> None:
         with self._lock:

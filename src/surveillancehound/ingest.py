@@ -232,7 +232,10 @@ class IngestServer:
                 "server_time": now,
             }
 
-        instance_id = str(doc.get("instance_id", ""))
+        try:
+            instance_id = validate.clean_instance_id(doc.get("instance_id"))
+        except validate.ValidationError as e:
+            return HTTPStatus.BAD_REQUEST, {"error": str(e)}
         seq = doc.get("seq")
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
             return HTTPStatus.BAD_REQUEST, {"error": "seq must be a positive integer"}
@@ -254,7 +257,7 @@ class IngestServer:
                 }
         elif known is not None:
             log.warning(
-                "relay: sensor %r presented a new instance id (%s -> %s); "
+                "relay: sensor %r presented a new instance id (%r -> %r); "
                 "accepting and resetting its sequence. If two agents share "
                 "this sensor_id, give them separate ids.",
                 sensor_id, known.instance_id, instance_id,
@@ -293,16 +296,14 @@ class IngestServer:
         if self.on_alerts and records.get("alerts"):
             try:
                 self.on_alerts(sensor_id, records["alerts"], instance_id)
-            except TypeError:
-                # A signature mismatch here is a programming error, and
-                # swallowing it reads as "the callback never fired" —
-                # which is how a broken dispatch hook looked like a
-                # broken relay for an entire test run.
+            except Exception:   # noqa: BLE001 - never fail ingest on dispatch
+                # The batch is already stored, so the ingest itself
+                # succeeded; say plainly that the NOTIFICATION did not,
+                # because the previous wording ("queuing failed") read
+                # as a transient and hid a hook that never fired at all.
                 log.exception(
-                    "relay: on_alerts has the wrong signature; relayed "
-                    "alerts are NOT being dispatched")
-            except Exception:       # noqa: BLE001 - never fail ingest on dispatch
-                log.exception("relay: queuing relayed alerts failed")
+                    "relay: relayed alerts from %r were stored but NOT "
+                    "dispatched — the on_alerts hook raised", sensor_id)
 
         return HTTPStatus.OK, {
             "status": "ok", "ack_seq": seq,

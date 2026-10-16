@@ -669,7 +669,16 @@ class Hound:
         share = self._relay_queue_share()
         over_batch = max(0, len(alerts) - _RELAY_ALERTS_PER_BATCH)
 
+        window = self.cfg.alerts.dedup_window_seconds
         for raw in alerts[:_RELAY_ALERTS_PER_BATCH]:
+            # Cheap dedup pre-check BEFORE spending budget. An alert the
+            # dispatcher would suppress for free should not consume the
+            # sensor's allowance, or a flood of duplicates lets a sensor
+            # silence its own real pages.
+            seen = self._relay_last_dispatch.get(
+                ("k", sensor_id, raw["dedup_key"]))
+            if seen is not None and (now - seen) < window:
+                continue
             if not self._relay_notify_budget(sensor_id, now):
                 self.stats.relayed_dropped_budget += 1
                 continue

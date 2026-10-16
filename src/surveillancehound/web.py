@@ -998,7 +998,6 @@ async function refresh() {
   // 24h count and makes "last seen" read 0s ago forever. Relayed rows
   // carry ingested_at; local rows are authored here, so their ts IS our
   // clock.
-  const atime = (a) => num(a.ingested_at || a.ts);
   const allAlerts = (alerts.alerts || [])
     .concat(alerts.remote_alerts || [])
     .sort((a, b) => atime(b) - atime(a));
@@ -1027,11 +1026,14 @@ function renderStatus(s, alerts, snapshots) {
   setStatus(s.alive, s.alive ? "daemon live" : "no recent traffic");
   $("s-cameras").textContent = s.camera_count;
   $("s-nvrs").textContent = `${num(s.nvr_count)} NVR · ${num(s.device_count) - num(s.camera_count) - num(s.nvr_count)} other`;
+  // Both of these read OUR clock. Fixing only the sort left a relayed
+  // alert dated 2099 inflating the 24h count and making "last" read as
+  // a future time — two thirds of the symptom still present.
   const dayAgo = Date.now() / 1000 - 86400;
-  const last24 = alerts.filter(a => a.ts >= dayAgo).length;
+  const last24 = alerts.filter(a => atime(a) >= dayAgo).length;
   $("s-alerts").textContent = last24;
   $("s-alerts-sub").textContent = alerts[0]
-    ? `last: ${fmtAgo(alerts[0].ts)}` : "no alerts yet";
+    ? `last: ${fmtAgo(atime(alerts[0]))}` : "no alerts yet";
   $("s-baselines").textContent = s.baseline_bucket_count;
   $("s-baselines-sub").textContent = s.baseline_enabled
     ? "engine: enabled" : "engine: disabled";
@@ -1046,6 +1048,10 @@ function renderStatus(s, alerts, snapshots) {
    today, but SQLite is dynamically typed and relayed rows originate on
    another host — a string here would be markup in the operator's browser. */
 const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+// Collector-side time for an alert: relayed rows carry ingested_at, local
+// rows are authored here so their ts already IS our clock. Anything that
+// orders, counts or ages alerts must use this, never the raw ts.
+const atime = (a) => num(a.ingested_at || a.ts);
 
 const fmtDur = (s) => {
   s = Math.max(0, Math.floor(s || 0));
@@ -1128,7 +1134,7 @@ function renderAlerts(alerts) {
       <div class="sev-bar sev-${escapeHTML(a.severity)}"></div>
       <div class="row-main">
         <div class="row-top">
-          <span class="ts">${fmtHM(a.ts)}</span>
+          <span class="ts">${fmtHM(atime(a))}</span>
           <span class="kind">${escapeHTML(a.kind)}</span>
           <span style="color:var(--fg-mute)">${escapeHTML(a.device_ip)}</span>
           <span class="dim">${escapeHTML(a.sensor || a.sensor_id || "local")}</span>

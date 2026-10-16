@@ -213,7 +213,7 @@ $(document).ready(function() {
                 .sort(function (x, y) { return atime(y) - atime(x); });
             $.each(alerts, function (i, a) {
                 rows += '<tr>' +
-                    '<td>' + esc(new Date(num(a.ts) * 1000).toLocaleString()) + '</td>' +
+                    '<td>' + esc(new Date(atime(a) * 1000).toLocaleString()) + '</td>' +
                     '<td>' + severityLabel(a.severity) + '</td>' +
                     '<td><code>' + esc(a.kind) + '</code></td>' +
                     '<td>' + esc(a.sensor || a.sensor_id || 'local') + '</td>' +

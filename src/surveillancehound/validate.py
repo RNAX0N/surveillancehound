@@ -289,6 +289,41 @@ _KINDS = {
 _ID_KINDS = ("flows", "alerts", "outages")
 
 
+# The agent's identity for one run. It is now part of the primary key of
+# every relayed row, so it has to be as strictly handled as any other wire
+# string — and strictly non-empty, because an empty value collapses the
+# (sensor, instance, row) key back to (sensor, row) and reinstates the
+# cross-instance clobbering that key exists to prevent.
+_INSTANCE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+)
+MAX_INSTANCE_LEN = 64
+
+
+def clean_instance_id(value: Any, field: str = "instance_id") -> str:
+    """Validate an agent instance id.
+
+    Restricted to an opaque token charset rather than merely stripped:
+    this value is persisted on every relayed row, echoed by the API, and
+    interpolated into log lines, and the agent only ever generates
+    `secrets.token_hex(8)`. Nothing legitimate needs anything else.
+    """
+    v = clean_str(value, field, MAX_INSTANCE_LEN)
+    if not v:
+        raise ValidationError(
+            f"{field} must not be empty: an empty instance id collapses "
+            f"the per-record key and lets one run's records overwrite "
+            f"another's"
+        )
+    bad = sorted(set(v) - _INSTANCE_CHARS)
+    if bad:
+        raise ValidationError(
+            f"{field}: unexpected character(s) {bad!r}; expected an opaque "
+            f"token of letters, digits, dash, dot or underscore"
+        )
+    return v
+
+
 def validate_records(raw: Any, max_per_kind: int) -> dict:
     """Validate a whole `records` object. Raises on the first bad record.
 
