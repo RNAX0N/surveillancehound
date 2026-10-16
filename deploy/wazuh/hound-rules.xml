@@ -147,6 +147,37 @@
         <group>availability,</group>
     </rule>
 
+    <rule id="100225" level="4">
+        <if_sid>100200</if_sid>
+        <field name="kind">^camera_to_camera$</field>
+        <description>SurveillanceHound: camera talking directly to another camera</description>
+        <mitre>
+            <id>T1021</id>
+        </mitre>
+        <group>lateral_movement,</group>
+    </rule>
+
+    <!-- A relay sensor going quiet. Not a camera alert: the collector
+         cannot see that segment at all, so its cameras are UNMONITORED
+         rather than fine. Stopping the agent is also the first thing an
+         intruder on the camera segment would do, hence level 10. -->
+    <rule id="100223" level="10">
+        <if_sid>100200</if_sid>
+        <field name="kind">^sensor_offline$</field>
+        <description>SurveillanceHound: relay sensor stopped reporting — its segment is unmonitored</description>
+        <mitre>
+            <id>T1562</id>
+        </mitre>
+        <group>availability,</group>
+    </rule>
+
+    <rule id="100224" level="3">
+        <if_sid>100200</if_sid>
+        <field name="kind">^sensor_recovered$</field>
+        <description>SurveillanceHound: relay sensor is reporting again</description>
+        <group>availability,</group>
+    </rule>
+
     <rule id="100217" level="3">
         <if_sid>100200</if_sid>
         <field name="kind">^camera_recovered$</field>

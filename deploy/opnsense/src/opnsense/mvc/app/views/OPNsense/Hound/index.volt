@@ -139,24 +139,55 @@ $(document).ready(function() {
                       " — {{ lang._('last packet') }} " + fmtAgo(m.last_activity_ts) +
                       " {{ lang._('ago') }}";
             }
+            // Relay sensors, if any. A sensor that has gone quiet means
+            // its whole segment is unmonitored — and this box cannot see
+            // that segment itself, which is why the agent exists. Saying
+            // so here matters more than any row it last reported.
+            var sensors = d.sensors || [];
+            if (sensors.length) {
+                var parts = [];
+                $.each(sensors, function (i, x) {
+                    parts.push('<strong>' + esc(x.sensor_id) + '</strong>: ' +
+                        (x.reporting
+                            ? "<span class='text-success'>" +
+                              "{{ lang._('reporting') }}</span>"
+                            : "<span class='text-danger'>" +
+                              "{{ lang._('NOT reporting') }}</span> (" +
+                              fmtAgo(x.last_seen) + " {{ lang._('ago') }})"));
+                });
+                txt += "<br/><small>{{ lang._('Relay sensors') }} — " +
+                       parts.join(' &nbsp; ') + "</small>";
+            }
             $("#hound-monitor").attr('class', 'alert ' + cls).html(txt);
 
+            // Local rows and rows relayed by an agent are shown in one
+            // table but never merged: each keeps its own sensor, because
+            // their availability is computed over different monitored
+            // windows. Without the relayed rows this box — which is the
+            // collector — cannot see the segment it exists to watch.
+            var cams = (d.uptime || []).concat(d.remote_uptime || []);
             var rows = '';
-            $.each(d.uptime, function (i, c) {
+            $.each(cams, function (i, c) {
+                // A sensor that has stopped reporting tells us nothing
+                // current, so its cameras read unknown and its
+                // availability reads n/a rather than the figure it last
+                // claimed — that number is as stale as the contact.
+                var stale = (c.stale === true);
                 rows += '<tr>' +
                     '<td>' + stateLabel(c.state) + '</td>' +
                     '<td>' + esc(c.ip) + '</td>' +
+                    '<td>' + esc(c.sensor || 'local') + '</td>' +
                     '<td>' + esc(c.role) + '</td>' +
                     '<td>' + (c.last_seen ? fmtAgo(c.last_seen) : "{{ lang._('never') }}") + '</td>' +
                     '<td>' + fmtDur(c.current_downtime) + '</td>' +
                     '<td>' + c.outage_count + '</td>' +
-                    '<td>' + (c.availability === null
+                    '<td>' + ((stale || c.availability === null)
                         ? 'n/a'
-                        : (c.availability * 100).toFixed(2) + '%') + '</td>' +
+                        : (Number(c.availability) * 100).toFixed(2) + '%') + '</td>' +
                     '</tr>';
             });
             $("#tbl-uptime tbody").html(rows ||
-                '<tr><td colspan="7">' +
+                '<tr><td colspan="8">' +
                 "{{ lang._('No cameras known yet — set Camera IPs under Settings.') }}" +
                 '</td></tr>');
 
@@ -282,6 +313,7 @@ $(document).ready(function() {
                         <tr>
                             <th>{{ lang._('State') }}</th>
                             <th>{{ lang._('Address') }}</th>
+                            <th>{{ lang._('Sensor') }}</th>
                             <th>{{ lang._('Role') }}</th>
                             <th>{{ lang._('Last seen') }}</th>
                             <th>{{ lang._('Down for') }}</th>

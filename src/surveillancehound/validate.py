@@ -284,6 +284,11 @@ _KINDS = {
 }
 
 
+# Kinds whose records carry the sensor's own row id. The collector keys
+# storage on (sensor_id, remote_id), so these must be unique per batch.
+_ID_KINDS = ("flows", "alerts", "outages")
+
+
 def validate_records(raw: Any, max_per_kind: int) -> dict:
     """Validate a whole `records` object. Raises on the first bad record.
 
@@ -306,6 +311,25 @@ def validate_records(raw: Any, max_per_kind: int) -> dict:
                 f"per-kind cap of {max_per_kind}"
             )
         out[kind] = [validator(item) for item in items]
+
+        # `remote_id` is the sensor's own primary key for the record, and
+        # the collector stores one row per (sensor_id, remote_id). Repeats
+        # within a batch therefore collapse to a single stored row while
+        # still being processed individually downstream — which defeated
+        # relayed-alert dedup entirely: 200 copies of one alert sharing a
+        # remote_id produced 200 notifications from one stored row. A
+        # well-formed agent never emits a duplicate, so refuse the batch
+        # rather than silently keeping whichever copy happens to win.
+        if kind in _ID_KINDS:
+            seen: set[int] = set()
+            for item in out[kind]:
+                rid = item["remote_id"]
+                if rid in seen:
+                    raise ValidationError(
+                        f"records.{kind}: duplicate remote_id {rid} in one "
+                        f"batch; each record needs its own id"
+                    )
+                seen.add(rid)
 
     monitor = r.get("monitor")
     out["monitor"] = validate_monitor(monitor) if monitor is not None else None

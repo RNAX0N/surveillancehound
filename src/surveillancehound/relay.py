@@ -196,9 +196,24 @@ class Spool:
             self.dropped_size += 1
         return entries
 
+    def _load(self, now: float) -> list[dict]:
+        """Read, apply both caps, and PERSIST the result.
+
+        Persisting matters: `_enforce_caps` increments the drop counters,
+        and `pending()` is called every push cycle. Without writing the
+        filtered list back, one expired batch was re-counted as a fresh
+        drop on every cycle, so `hound relay` reported a drop total that
+        climbed forever. Caller holds `self._lock`.
+        """
+        before = self._read()
+        entries = self._enforce_caps(before, now)
+        if len(entries) != len(before):
+            self._write(entries)
+        return entries
+
     def pending(self, now: float) -> list[tuple[int, bytes]]:
         with self._lock:
-            entries = self._enforce_caps(self._read(), now)
+            entries = self._load(now)
             return [(e["seq"], e["body"].encode("utf-8")) for e in entries]
 
     def ack(self, seq: int) -> None:
@@ -214,8 +229,12 @@ class Spool:
             self._write([e for e in self._read() if e["seq"] != seq])
 
     def stats(self, now: float) -> SpoolStats:
+        # The same view `pending()` would send, not the raw file. These
+        # numbers are what `hound relay` shows an operator diagnosing a
+        # dead link, and reporting a backlog that will never be
+        # delivered is the project's own cardinal sin.
         with self._lock:
-            entries = self._read()
+            entries = self._load(now)
             return SpoolStats(
                 pending=len(entries),
                 bytes=sum(len(e["body"]) for e in entries),

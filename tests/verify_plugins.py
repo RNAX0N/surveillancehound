@@ -1037,6 +1037,36 @@ def _check_opnsense_form_ids() -> None:
           f"in the model XML, and rendered by a compatible widget")
 
 
+def _check_every_alert_kind_has_a_wazuh_rule() -> None:
+    """Every kind the daemon can emit must reach the SIEM as an alert.
+
+    A kind with no child rule still matches the level-0 anchor, so it is
+    parsed and then silently discarded — it never fires. That is worse
+    than no integration at all: the operator sees Hound events arriving
+    in Wazuh and reasonably concludes all of them do. Three kinds had
+    quietly drifted out of coverage this way.
+    """
+    import re
+
+    rules = (ROOT / "deploy/wazuh/hound-rules.xml").read_text()
+    covered = set(re.findall(r'name="kind">\^([a-z_]+)\$<', rules))
+
+    src = (ROOT / "src/surveillancehound/alerts.py").read_text()
+    emitted = set(re.findall(r'^KIND_[A-Z_]+ = "([a-z_]+)"', src, re.M))
+
+    missing = sorted(emitted - covered)
+    assert not missing, (
+        f"alert kind(s) with no Wazuh rule: {missing}. They match the "
+        f"level-0 anchor and are then dropped, so they never fire while "
+        f"looking integrated. Add a rule in deploy/wazuh/hound-rules.xml."
+    )
+    stale = sorted(covered - emitted)
+    assert not stale, (
+        f"Wazuh rule(s) for kind(s) the code no longer emits: {stale}"
+    )
+    print(f"  wazuh coverage: all {len(emitted)} alert kinds have a rule")
+
+
 def main() -> int:
     print("=== Plugin static checks ===")
     _check_xml_wellformed()
@@ -1060,6 +1090,7 @@ def main() -> int:
     print()
     print("=== Wazuh integration ===")
     _check_wazuh_artifacts()
+    _check_every_alert_kind_has_a_wazuh_rule()
     print()
     print("PLUGINS VERIFICATION PASSED")
     return 0

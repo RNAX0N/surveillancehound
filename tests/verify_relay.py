@@ -1251,6 +1251,41 @@ def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
         print("  relayed dispatch: fresh alerts notify, repeats suppress, "
               "backdating cannot bypass the window")
 
+        # A repeated remote_id must NOT multiply notifications.
+        # `remote_id` is chosen by the sensor and the collector stores one
+        # row per (sensor_id, remote_id), so N copies sharing an id
+        # collapse to one row while still being dispatched N times. That
+        # turned the dedup window — the only bound on relayed
+        # notification volume — into one integer the attacker picks.
+        _Count.n = 0
+        dup = {
+            "remote_id": 900, "ts": real_now, "device_ip": "10.9.0.8",
+            "kind": "camera_offline", "severity": "critical",
+            "summary": "flood", "detail": "",
+            "dedup_key": "camera_offline:10.9.0.8",
+        }
+        store.ingest_remote_batch(
+            "frigate", "inst", 900,
+            V.validate_records({"alerts": [dict(dup)]}, 10), real_now)
+        for _ in range(100):
+            hound._dispatch_relayed_alert("frigate", dict(dup))
+        assert _Count.n == 1, (
+            f"100 copies of one alert sharing a remote_id produced "
+            f"{_Count.n} notifications; the dedup window must not depend "
+            f"on a number the sensor chooses"
+        )
+
+        # And such a batch is refused outright at validation, since a
+        # well-formed agent never emits a duplicate id.
+        try:
+            V.validate_records({"alerts": [dict(dup), dict(dup)]}, 10)
+            raise AssertionError(
+                "a batch with a duplicate remote_id must be refused")
+        except V.ValidationError as e:
+            assert "duplicate remote_id" in str(e), e
+        print("  relayed dispatch: a repeated remote_id cannot multiply "
+              "notifications, and such a batch is refused")
+
         # The ingest thread must only ENQUEUE. Dispatching inline would let
         # one authenticated batch hold an ingest thread for as long as its
         # slowest channel takes.
@@ -1348,6 +1383,211 @@ def _check_sensor_offline_alerts(tmp: Path) -> None:
         hound.store.close()
 
 
+def _check_relayed_api_surface(tmp: Path) -> None:
+    """Relayed rows must reach /api/uptime and `hound export` correctly.
+
+    These two are the stale-gating path. Its entire purpose is that a
+    dead sensor's cameras do not read `up`, so leaving it unasserted at
+    the boundary means the one guarantee it exists to provide is the one
+    nobody checks. A reader that silently stops emitting `remote_cameras`
+    would turn the collector's dashboard back into a local-only view.
+    """
+    import json
+    import threading
+    import time
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from surveillancehound.config import load_from_dict
+    from surveillancehound.store import HoundStore
+    from surveillancehound.web import _Handler
+
+    now = time.time()
+    db = tmp / "api.sqlite"
+    store = HoundStore(path=db)
+    store.upsert_device("10.9.0.5", "camera", now - 5, 10, 1000,
+                        first_seen=now - 9000)
+    store.start_monitor_session(now - 9000, "live")
+    store.set_heartbeat(now - 2, now)
+
+    def _rec(ip, state, avail):
+        return {"ip": ip, "role": "camera", "state": state,
+                "last_seen": now - 10, "first_seen": now - 9000,
+                "down_since": None, "current_downtime": 0.0,
+                "outage_count": 0, "downtime_seconds": 0.0,
+                "monitored_seconds": 9000.0, "availability": avail}
+
+    store.ingest_remote_batch(
+        "live-one", "i1", 1,
+        V.validate_records({"uptime": [_rec("10.1.1.2", "up", 1.0)]}, 100),
+        now - 20)
+    # three hours silent, far past the 180s default timeout
+    store.ingest_remote_batch(
+        "dead-one", "i2", 1,
+        V.validate_records({"uptime": [_rec("10.2.2.2", "up", 1.0)]}, 100),
+        now - 10800)
+    store.close()
+
+    cfg = load_from_dict({
+        "capture": {"interface": "test0"},
+        "network": {"camera_ips": ["10.9.0.5"]},
+        "store": {"path": str(db)},
+        "web": {"enabled": True, "host": "127.0.0.1", "port": 0},
+    })
+    _Handler.cfg = cfg
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        with urllib.request.urlopen(base + "/api/uptime") as r:
+            up = json.loads(r.read())
+
+        for key in ("cameras", "remote_cameras", "sensors"):
+            assert key in up, f"/api/uptime must carry {key!r}: {list(up)}"
+
+        by_ip = {c["ip"]: c for c in up["remote_cameras"]}
+        assert set(by_ip) == {"10.1.1.2", "10.2.2.2"}, list(by_ip)
+
+        live = by_ip["10.1.1.2"]
+        assert live["sensor"] == "live-one" and live["state"] == "up", live
+        assert live["stale"] is False, live
+
+        dead = by_ip["10.2.2.2"]
+        assert dead["state"] == "unknown", (
+            f"a camera behind a sensor that stopped reporting must read "
+            f"unknown, not the {dead['state']!r} it last claimed"
+        )
+        assert dead["stale"] is True, dead
+        assert dead["availability"] is None, (
+            f"its availability is as stale as its state; got "
+            f"{dead['availability']!r}"
+        )
+
+        # Local rows must stay distinguishable from relayed ones.
+        assert all(c.get("sensor") == "local" for c in up["cameras"]), up["cameras"]
+
+        rep = {x["sensor_id"]: x["reporting"] for x in up["sensors"]}
+        assert rep == {"live-one": True, "dead-one": False}, rep
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    # And the same data through `hound export`, which is what the OPNsense
+    # plugin dashboard renders — it cannot reach /api/uptime at all.
+    import argparse
+    import io
+    from contextlib import redirect_stdout
+
+    from surveillancehound import cli as cli_mod
+    buf = io.StringIO()
+    toml = tmp / "api.toml"
+    toml.write_text(
+        '[capture]\ninterface = "test0"\n'
+        '[network]\ncamera_ips = ["10.9.0.5"]\n'
+        f'[store]\npath = "{db}"\n'
+    )
+    with redirect_stdout(buf):
+        rc = cli_mod.cmd_export(argparse.Namespace(config=str(toml), limit=100, window=86400.0))
+    assert rc == 0, rc
+    doc = json.loads(buf.getvalue())
+    assert "remote_uptime" in doc and "sensors" in doc, list(doc)
+    exported = {c["ip"]: c for c in doc["remote_uptime"]}
+    assert exported["10.2.2.2"]["state"] == "unknown", exported["10.2.2.2"]
+    assert exported["10.2.2.2"]["availability"] is None
+    assert {x["sensor_id"]: x["reporting"] for x in doc["sensors"]} == {
+        "live-one": True, "dead-one": False}
+    print("  api surface: /api/uptime and `hound export` both carry relayed "
+          "rows; a dead sensor reads unknown with no availability")
+
+
+def _check_replay_opens_no_listener(tmp: Path) -> None:
+    """A forensic replay must not open a network port.
+
+    `run()` starts the listener only on the live path, but the rebind
+    retry ran from the replay tick too — so analysing a pcap silently
+    bound the ingest port and accepted authenticated remote writes into
+    the replay store, with no dispatch worker to consume them.
+    """
+    import socket
+
+    from surveillancehound import daemon as daemon_mod
+    from surveillancehound.config import load_from_dict
+    from surveillancehound.pcap import write_pcap
+
+    pcap = tmp / "empty.pcap"
+    write_pcap(pcap, iter([]))
+    port = 18991
+    cfg = load_from_dict({
+        "capture": {"pcap_file": str(pcap)},
+        "network": {"camera_ips": ["10.9.0.5"]},
+        "store": {"path": str(tmp / "replay.sqlite")},
+        "relay": {
+            "mode": "collector", "listen_host": "127.0.0.1",
+            "listen_port": port,
+            "cert_file": str(FIXTURES / "ingest-test.crt"),
+            "key_file": str(FIXTURES / "ingest-test.key"),
+            "sensor": [{"id": "frigate", "key": "shared-secret-abcdef"}],
+        },
+    })
+    hound = daemon_mod.Hound(cfg)
+    assert hound._replay, "fixture must be a replay"
+    hound.run()
+    sock = socket.socket()
+    try:
+        sock.settimeout(2)
+        sock.connect(("127.0.0.1", port))
+        raise AssertionError(
+            "replay opened the ingest port; a pcap analysis must not "
+            "start a listener or accept remote writes"
+        )
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    print("  replay: no ingest listener, no sensor alerts from packet time")
+
+
+def _check_spool_counters(tmp: Path) -> None:
+    """`hound relay` must not report numbers it cannot stand behind.
+
+    This is the command specified to work with the link DOWN, which is
+    exactly when an operator trusts it. `_enforce_caps` bumps the drop
+    counters, and `pending()` runs every push cycle, so without writing
+    the filtered list back one expired batch was re-counted as a fresh
+    drop forever; `stats()` skipped the age cap entirely and reported a
+    backlog that would never be sent.
+    """
+    from surveillancehound.relay import Spool
+
+    sp = Spool(tmp / "spool", 10 * 1024 * 1024, 10.0)
+    sp.append(1, b'{"a":1}', 0.0)
+    sp.append(2, b'{"a":2}', 0.0)
+    for _ in range(5):
+        assert sp.pending(100.0) == [], "expired batches must never be sent"
+    assert sp.dropped_age == 2, (
+        f"each expired batch must be counted once, not once per cycle; "
+        f"counter says {sp.dropped_age}"
+    )
+    st = sp.stats(100.0)
+    assert st.pending == 0, (
+        f"stats() must report what pending() would actually send; it "
+        f"claims {st.pending} batches are spooled"
+    )
+    assert st.bytes == 0, st.bytes
+
+    # Live entries survive, and the byte cap evicts oldest-first.
+    sp2 = Spool(tmp / "spool2", 200, 3600.0)
+    for i in range(20):
+        sp2.append(i, b'{"padpadpadpadpad":%d}' % i, 0.0)
+    got = [seq for seq, _ in sp2.pending(1.0)]
+    assert got, "the byte cap must not empty the spool"
+    assert got == sorted(got) and got[-1] == 19, (
+        f"the newest batch must survive and order must hold: {got}"
+    )
+    assert sp2.dropped_size > 0
+    print("  spool: drop counters count once; stats() matches pending()")
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -1367,6 +1607,9 @@ def main() -> int:
         _check_resource_bounds(Path(td))
         _check_relayed_dispatch_is_quarantined(Path(td))
         _check_sensor_offline_alerts(Path(td))
+        _check_relayed_api_surface(Path(td))
+        _check_replay_opens_no_listener(Path(td))
+        _check_spool_counters(Path(td))
     print("=== listener ===")
     with tempfile.TemporaryDirectory() as td:
         _check_listener(Path(td))

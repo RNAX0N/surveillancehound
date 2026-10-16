@@ -54,6 +54,30 @@ def _passes_level(alert_sev: str, channel_level: str) -> bool:
     return _SEVERITY_RANK.get(alert_sev, 0) >= _SEVERITY_RANK.get(channel_level, 0)
 
 
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(path: Path) -> threading.Lock:
+    """One lock per output FILE, shared across channels and dispatchers.
+
+    Rotation is a check-then-rename and appends must not interleave
+    mid-line, so writers to the same file have to serialise. Locking the
+    whole Dispatcher instead was too coarse: local alerts dispatch from
+    the tick thread while it holds `_loop_lock`, so a relayed alert whose
+    channel was mid-timeout would stall the packet loop behind it — the
+    very "a remote host delays capture" property ingest is designed to
+    avoid. Scoping it to the file keeps the race fixed without coupling
+    the two paths.
+    """
+    key = str(path.resolve() if path.is_absolute() else path)
+    with _PATH_LOCKS_GUARD:
+        lk = _PATH_LOCKS.get(key)
+        if lk is None:
+            lk = _PATH_LOCKS[key] = threading.Lock()
+        return lk
+
+
 def _maybe_rotate(path: Path, max_bytes: int, keep: int) -> None:
     """Size-based log rotation. If the file exists and is ≥ max_bytes, shift:
     `path.<keep-1>` → drop, `path.<keep-2>` → `path.<keep-1>`, ..., `path` →
@@ -124,17 +148,18 @@ class LogfileChannel(NotifyChannel):
     def dispatch(self, alert: Alert) -> None:
         p = Path(self.path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        _maybe_rotate(p, self.max_bytes, self.keep)
-        with p.open("a") as f:
-            # One alert must be exactly one line. A newline inside summary
+        with _path_lock(p):
+            _maybe_rotate(p, self.max_bytes, self.keep)
+            with p.open("a") as f:
+                # One alert must be exactly one line. A newline inside summary
             # would otherwise forge additional records in a file that SIEMs
             # tail — and with relayed alerts the summary is not necessarily
             # produced by this host.
-            f.write(
-                f"{int(alert.ts)} [{alert.severity}] {alert.kind} "
-                f"{alert.sensor} {alert.device_ip} — "
-                f"{_oneline(alert.summary)}\n"
-            )
+                f.write(
+                    f"{int(alert.ts)} [{alert.severity}] {alert.kind} "
+                    f"{alert.sensor} {alert.device_ip} — "
+                    f"{_oneline(alert.summary)}\n"
+                )
 
 
 @dataclass
@@ -148,9 +173,10 @@ class JsonLinesChannel(NotifyChannel):
     def dispatch(self, alert: Alert) -> None:
         p = Path(self.path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        _maybe_rotate(p, self.max_bytes, self.keep)
-        with p.open("a") as f:
-            f.write(json.dumps(alert.as_dict()) + "\n")
+        with _path_lock(p):
+            _maybe_rotate(p, self.max_bytes, self.keep)
+            with p.open("a") as f:
+                f.write(json.dumps(alert.as_dict()) + "\n")
 
 
 @dataclass
@@ -227,9 +253,14 @@ class SyslogChannel(NotifyChannel):
         # escape STRUCTURED-DATA values per RFC 5424 §6.3.3
         def _esc(s: str) -> str:
             return s.replace("\\", "\\\\").replace('"', '\\"').replace("]", "\\]")
+        # `sensor` is carried explicitly as well as in the hostname: a
+        # SIEM rule that wants "alerts from the frigate segment" should
+        # not have to parse the host field, and the jsonlines path has
+        # had the field all along. Without it the two ingestion routes
+        # disagree about what an alert contains.
         sd = (
             f'[{_SD_ID} kind="{_esc(alert.kind)}" severity="{_esc(alert.severity)}" '
-            f'device="{_esc(alert.device_ip)}"]'
+            f'device="{_esc(alert.device_ip)}" sensor="{_esc(alert.sensor)}"]'
         )
         # MSG body: BOM (per RFC 5424 §6.4 for UTF-8) + summary
         msg_body = f"﻿{alert.summary}"
@@ -447,13 +478,6 @@ class Dispatcher:
     ) -> None:
         self.channels = channels
         self.store = store
-        # Local alerts dispatch from the packet/tick path; relayed alerts
-        # dispatch from the relay worker thread. The channels were written
-        # when only one caller existed: `_maybe_rotate` is a check-then-
-        # rename, so two threads crossing max_bytes together both rotate
-        # and one clobbers the other's .1 file, losing the alert lines a
-        # SIEM tails. Appends can interleave mid-line for the same reason.
-        self._lock = threading.Lock()
 
     def dispatch(self, alert: Alert, alert_id: int | None,
                  on_attempt=None) -> list[str]:
@@ -470,11 +494,11 @@ class Dispatcher:
         audit row could only ever say "delivered", making the ok/error
         columns decorative.
         """
+        # No dispatcher-wide lock on purpose. Writers to the same file
+        # serialise on that file's lock (see `_path_lock`); locking here
+        # would let a relayed alert's slow channel stall the local tick
+        # path, which holds `_loop_lock` while it dispatches.
         delivered: list[str] = []
-        with self._lock:
-            return self._dispatch_locked(alert, alert_id, on_attempt, delivered)
-
-    def _dispatch_locked(self, alert, alert_id, on_attempt, delivered):
         for ch in self.channels:
             if not _passes_level(alert.severity, ch.level):
                 continue

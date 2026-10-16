@@ -81,6 +81,9 @@ _RELAY_ALERTS_PER_BATCH = 200
 # How often to retry a listener that could not bind. The address may come
 # up after the daemon does; a first failure is not a permanent one.
 _INGEST_REBIND_EVERY_S = 60.0
+# Bound on the relayed-alert dedup map. dedup_key is sensor-controlled, so
+# the keyspace has to be capped like any other remote-driven structure.
+_RELAY_DEDUP_MAX = 4096
 
 
 @dataclass
@@ -176,12 +179,15 @@ class Hound:
         self._last_ingest_bind_try = 0.0
         # sensor_id -> last_seen at the moment we declared it down
         self._sensors_down: dict[str, float] = {}
+        # (sensor_id, dedup_key) -> when we last DISPATCHED it
+        self._relay_last_dispatch: dict[tuple[str, str], float] = {}
         # Bounded hand-off from the ingest threads to one dispatch worker.
         self._relay_alertq: queue.Queue | None = (
             queue.Queue(maxsize=_RELAY_ALERT_QUEUE)
             if cfg.relay.is_collector else None
         )
         self._relay_worker: threading.Thread | None = None
+        self._relay_stop = threading.Event()
         self.stats = RunStats()
         self._stop_flag = False
         # guards everything the watchdog tick and the packet path share
@@ -437,24 +443,38 @@ class Hound:
         dashboard. The collector cannot see that segment itself, so a
         quiet agent means those cameras are unmonitored, not fine.
         """
-        if self.ingest is None:
+        # Replay's clock is packet time, so a months-old capture would
+        # compute silence against a months-old `now` and invent outages.
+        if self._replay or self.ingest is None:
             return
         timeout = self.cfg.relay.sensor_timeout_seconds
         if timeout <= 0:
             return
-        for sensor in self.store.list_remote_sensors():
-            silent = now - sensor.last_seen
-            was_down = sensor.sensor_id in self._sensors_down
+        # Reconcile against the CONFIGURED list, not just rows that exist.
+        # `remote_sensors` only gains a row after a first successful
+        # batch, so a sensor that has never connected — or one whose row
+        # was removed with `hound sensors --forget` — produced no row, no
+        # alert, and `hound sensors` saying "none have reported yet".
+        # That is the same hole `uptime.py` has a `never_seen` transition
+        # for: a thing that was dead before we started still has to be
+        # reported.
+        seen = {x.sensor_id: x.last_seen
+                for x in self.store.list_remote_sensors()}
+        for cfg_sensor in self.cfg.relay.sensors:
+            seen.setdefault(cfg_sensor.id, self.stats.started_at or now)
+
+        for sensor_id, last_seen in sorted(seen.items()):
+            silent = now - last_seen
+            was_down = sensor_id in self._sensors_down
             if silent > timeout and not was_down:
-                self._sensors_down[sensor.sensor_id] = sensor.last_seen
-                alert = self.alerts.sensor_offline(
-                    sensor.sensor_id, silent, now)
+                self._sensors_down[sensor_id] = last_seen
+                alert = self.alerts.sensor_offline(sensor_id, silent, now)
                 if alert is not None:
                     self._emit(alert)
             elif silent <= timeout and was_down:
-                down_since = self._sensors_down.pop(sensor.sensor_id)
+                down_since = self._sensors_down.pop(sensor_id)
                 alert = self.alerts.sensor_recovered(
-                    sensor.sensor_id, max(0.0, now - down_since), now)
+                    sensor_id, max(0.0, now - down_since), now)
                 if alert is not None:
                     self._emit(alert)
 
@@ -467,7 +487,12 @@ class Hound:
         silently never listened for the life of the process, which is the
         worst outcome: the UI says collector, and nothing arrives.
         """
-        if self.ingest is None or self.ingest.started:
+        # Replay must never open a listener. `run()` starts ingest only on
+        # the live path, but this retry ran from the replay tick too, so
+        # analysing a pcap silently bound a port and accepted remote
+        # writes into the replay store — and with no dispatch worker
+        # started, anything received filled the queue and was dropped.
+        if self._replay or self.ingest is None or self.ingest.started:
             return
         if (now - self._last_ingest_bind_try) < _INGEST_REBIND_EVERY_S:
             return
@@ -641,8 +666,13 @@ class Hound:
 
         def _run() -> None:
             while True:
-                item = self._relay_alertq.get()
-                if item is None:            # shutdown sentinel
+                try:
+                    item = self._relay_alertq.get(timeout=0.5)
+                except queue.Empty:
+                    if self._relay_stop.is_set():
+                        return
+                    continue
+                if item is None:
                     return
                 try:
                     self._dispatch_relayed_alert(*item)
@@ -658,6 +688,11 @@ class Hound:
         handle. Bounded wait: a wedged channel must not block shutdown."""
         if self._relay_alertq is None or self._relay_worker is None:
             return
+        # An in-band sentinel is dropped exactly when the queue is full —
+        # the hostile case the queue exists for — so the worker would
+        # never see it and would still be running when the store closed.
+        # The flag is out of band and cannot be crowded out.
+        self._relay_stop.set()
         try:
             self._relay_alertq.put_nowait(None)
         except queue.Full:
@@ -685,15 +720,38 @@ class Hound:
         now = time.time()
         window = self.cfg.alerts.dedup_window_seconds
         key = f"{sensor_id}/{raw['dedup_key']}"
-        # Exclude this alert: the listener already stored the batch, so
-        # without the exclusion it is compared against itself and nothing
-        # is ever notified. The window is measured against when WE
-        # received the previous one, never against the sensor-supplied ts.
-        last = self.store.remote_alert_last_at(
-            sensor_id, raw["dedup_key"], exclude_remote_id=raw["remote_id"],
-        )
-        if last is not None and (now - last) < window:
+        # Two gates, because the first one alone trusted a number the
+        # sensor chooses.
+        #
+        # 1) What we have actually DISPATCHED, held in memory. The stored
+        #    row cannot answer this: the listener writes the batch before
+        #    dispatch, and several queued copies can map to one row, so a
+        #    row-based check either suppresses everything or nothing.
+        key = (sensor_id, raw["dedup_key"])
+        sent = self._relay_last_dispatch.get(key)
+        if sent is not None and (now - sent) < window:
             return
+        # 2) What we RECEIVED before this process started, so a restart
+        #    does not re-notify the backlog. Measured on ingested_at —
+        #    collector time — never the sensor-supplied ts, which would
+        #    let a backdated alert walk past the window.
+        if sent is None:
+            last = self.store.remote_alert_last_at(
+                sensor_id, raw["dedup_key"],
+                exclude_remote_id=raw["remote_id"],
+            )
+            if last is not None and (now - last) < window:
+                return
+
+        self._relay_last_dispatch[key] = now
+        if len(self._relay_last_dispatch) > _RELAY_DEDUP_MAX:
+            # Bounded: the keyspace is sensor-controlled via dedup_key.
+            # Dropping the oldest can at worst re-notify something, never
+            # suppress something new.
+            for k in sorted(self._relay_last_dispatch,
+                            key=self._relay_last_dispatch.get,
+                            )[:_RELAY_DEDUP_MAX // 2]:
+                del self._relay_last_dispatch[k]
         alert = Alert(
             ts=raw["ts"], device_ip=raw["device_ip"], kind=raw["kind"],
             severity=raw["severity"], summary=raw["summary"],

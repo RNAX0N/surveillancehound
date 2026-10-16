@@ -331,9 +331,31 @@ class _Server(ThreadingHTTPServer):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self._slots = threading.BoundedSemaphore(self.max_workers)
+        self._per_source: dict[str, int] = {}
+        self._src_lock = threading.Lock()
         self.rejected_overload = 0
 
+    # Per-source ceiling, enforced at ACCEPT time. The token-bucket rate
+    # limiter lives inside do_POST, which a peer only reaches after a
+    # completed TLS handshake — so a single address could hold every
+    # worker slot indefinitely by connecting and never finishing, and
+    # legitimate sensors were refused ~90% of the time. The global
+    # ceiling bounds resources; this one keeps one host from owning them.
+    max_per_source = 6
+
     def process_request(self, request, client_address):
+        source = client_address[0] if client_address else "?"
+        with self._src_lock:
+            if self._per_source.get(source, 0) >= self.max_per_source:
+                self.rejected_overload += 1
+                log.warning(
+                    "relay: refusing a connection from %s — it already "
+                    "holds %d of %d ingest workers. One host must not be "
+                    "able to lock out the others.",
+                    source, self.max_per_source, self.max_workers,
+                )
+                self.shutdown_request(request)
+                return
         if not self._slots.acquire(blocking=False):
             self.rejected_overload += 1
             log.warning(
@@ -344,13 +366,22 @@ class _Server(ThreadingHTTPServer):
             )
             self.shutdown_request(request)
             return
+        with self._src_lock:
+            self._per_source[source] = self._per_source.get(source, 0) + 1
         super().process_request(request, client_address)
 
     def process_request_thread(self, request, client_address):
+        source = client_address[0] if client_address else "?"
         try:
             super().process_request_thread(request, client_address)
         finally:
             self._slots.release()
+            with self._src_lock:
+                n = self._per_source.get(source, 1) - 1
+                if n > 0:
+                    self._per_source[source] = n
+                else:
+                    self._per_source.pop(source, None)
 
 
 def _make_handler(server: IngestServer, ctx: ssl.SSLContext):

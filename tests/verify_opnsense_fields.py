@@ -515,6 +515,53 @@ def _check_relay_agent_round_trip() -> None:
           "drops malformed and duplicate entries")
 
 
+def _check_volt_renders_relayed_data() -> None:
+    """The plugin view must render relayed sensors, not just local rows.
+
+    On OPNsense the plugin page is NOT an iframe of `hound web` — the
+    firewall serves its UI under `default-src 'self'`, so a frame on
+    another port is cross-origin and blocked. That means this view is the
+    only dashboard a collector's operator sees, and if it ignores
+    `remote_uptime` the box that IS the collector cannot see the segment
+    the relay exists to watch. It would look healthy while showing
+    nothing.
+    """
+    volt = PLUGIN / "views/OPNsense/Hound/index.volt"
+    text = volt.read_text()
+
+    for key in ("remote_uptime", "sensors"):
+        assert key in text, (
+            f"index.volt never reads d.{key}; `hound export` emits it and "
+            f"the plugin dashboard is the only view a collector operator "
+            f"has, so relayed data would be invisible on its own platform"
+        )
+    assert "c.sensor" in text, (
+        "relayed rows must show which sensor reported them, or a local "
+        "camera and a relayed one are indistinguishable"
+    )
+    assert "c.stale" in text, (
+        "a stale sensor's availability must render n/a, not the figure it "
+        "last claimed"
+    )
+
+    # Column counts must agree, or the table silently misaligns.
+    head = text[text.index('id="tbl-uptime"'):]
+    head = head[:head.index("</thead>")]
+    n_head = head.count("<th>")
+    body = text[text.index("$.each(cams"):]
+    body = body[:body.index("$(\"#tbl-uptime")]
+    n_body = body.count("'<td>")
+    assert n_head == n_body, (
+        f"uptime table has {n_head} header cells but rows emit {n_body} "
+        f"cells — the columns would not line up"
+    )
+    assert f'colspan="{n_head}"' in text, (
+        f"the empty-table placeholder must span all {n_head} columns"
+    )
+    print(f"  volt: renders relayed rows + sensor health; "
+          f"{n_head} columns line up")
+
+
 def main() -> int:
     print("=== OPNsense field wiring ===")
     _check_inventories()
@@ -522,6 +569,7 @@ def main() -> int:
     _check_relay_agent_round_trip()
     _check_interface_is_resolved()
     _check_ui_endpoints_exist()
+    _check_volt_renders_relayed_data()
     _check_enable_is_wired()
     print("\nOPNSENSE FIELD VERIFICATION PASSED")
     return 0

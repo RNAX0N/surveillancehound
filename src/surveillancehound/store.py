@@ -1230,6 +1230,12 @@ class HoundStore:
         out = []
         for r in rows:
             d = dict(r)
+            # Local rows are tagged `sensor="local"`; relayed rows carry
+            # `sensor_id`. Consumers that read only one of those names
+            # silently mislabel the other set — the OPNsense view did
+            # exactly that and showed every relayed camera as "local".
+            # One key, set here, so every reader agrees.
+            d["sensor"] = d["sensor_id"]
             if (now - d["reported_at"]) > stale_after:
                 d["state"] = "unknown"
                 d["stale"] = True
@@ -1253,21 +1259,41 @@ class HoundStore:
         return rows
 
     def prune_remote(self, older_than: float) -> dict[str, int]:
+        """Age out relayed rows.
+
+        Every cutoff is on `ingested_at` — when WE received the row —
+        never on the sensor-supplied `ts`/`last_seen`. A sensor that
+        stamps its alerts for the year 2099 would otherwise never be
+        pruned at all, and those rows also sort to the top of
+        `list_remote_alerts ORDER BY ts DESC`, pushing real alerts off
+        the dashboard. Retention has to be measured on a clock the
+        sender does not control.
+        """
         deleted: dict[str, int] = {}
         with self._lock, self._conn:
             deleted["remote_flows"] = self._conn.execute(
-                "DELETE FROM remote_flows WHERE last_seen < ?", (older_than,)
+                "DELETE FROM remote_flows WHERE ingested_at < ?", (older_than,)
             ).rowcount
             deleted["remote_alerts"] = self._conn.execute(
-                "DELETE FROM remote_alerts WHERE ts < ?", (older_than,)
+                "DELETE FROM remote_alerts WHERE ingested_at < ?", (older_than,)
             ).rowcount
             deleted["remote_outages"] = self._conn.execute(
                 """DELETE FROM remote_outages
-                   WHERE up_at IS NOT NULL AND up_at < ?""", (older_than,)
+                   WHERE up_at IS NOT NULL AND ingested_at < ?""", (older_than,)
             ).rowcount
             deleted["remote_notifications"] = self._conn.execute(
                 "DELETE FROM remote_notifications WHERE attempted_at < ?",
                 (older_than,),
+            ).rowcount
+            # These two were never pruned at all. They are upserts keyed
+            # by (sensor_id, ip), so they do not grow per batch — but a
+            # sensor that cycles through addresses still accumulates, and
+            # a retired sensor left rows behind forever.
+            deleted["remote_devices"] = self._conn.execute(
+                "DELETE FROM remote_devices WHERE ingested_at < ?", (older_than,)
+            ).rowcount
+            deleted["remote_uptime"] = self._conn.execute(
+                "DELETE FROM remote_uptime WHERE reported_at < ?", (older_than,)
             ).rowcount
         return deleted
 
