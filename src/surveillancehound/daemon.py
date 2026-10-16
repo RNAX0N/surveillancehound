@@ -764,6 +764,12 @@ class Hound:
             # the next genuine critical was refused against an empty
             # queue. That is the same defect as budget-dropped alerts
             # poisoning the dedup map, moved one gate downstream.
+            # Check and spend are individually atomic but not atomic as
+            # a pair, so concurrent ingest threads can over-admit by at
+            # most one per thread. Deliberate: holding the budget lock
+            # across the enqueue would serialise every sensor behind
+            # one mutex, and for a monitor the safe direction to err is
+            # paging slightly too much, never suppressing.
             if not self._relay_notify_budget(sensor_id, now, spend=False):
                 self.stats.relayed_dropped_budget += 1
                 continue
