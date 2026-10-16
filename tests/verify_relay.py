@@ -1542,6 +1542,17 @@ def _check_relayed_api_surface(tmp: Path) -> None:
         "network": {"camera_ips": ["10.9.0.5"]},
         "store": {"path": str(db)},
         "web": {"enabled": True, "host": "127.0.0.1", "port": 0},
+        # Must be a collector: the API withholds relayed rows otherwise,
+        # which is correct — a non-collector has no business reporting
+        # them — and is itself worth asserting below.
+        "relay": {
+            "mode": "collector", "listen_host": "127.0.0.1",
+            "listen_port": 0,
+            "cert_file": str(FIXTURES / "ingest-test.crt"),
+            "key_file": str(FIXTURES / "ingest-test.key"),
+            "sensor": [{"id": "live-one", "key": "shared-secret-abcdef"},
+                       {"id": "dead-one", "key": "shared-secret-abcdef"}],
+        },
     })
     _Handler.cfg = cfg
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
@@ -1586,6 +1597,31 @@ def _check_relayed_api_surface(tmp: Path) -> None:
         assert "remote_flows" in fl, list(fl)
 
         rep = {x["sensor_id"]: x["reporting"] for x in up["sensors"]}
+        assert rep == {"live-one": True, "dead-one": False}, rep
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    # A NON-collector must report no relayed rows at all, even against a
+    # store that has them. Reporting another host's observations when
+    # this instance is not configured to receive any would be claiming
+    # something it has no basis for.
+    plain = load_from_dict({
+        "capture": {"interface": "test0"},
+        "network": {"camera_ips": ["10.9.0.5"]},
+        "store": {"path": str(db)},
+        "web": {"enabled": True, "host": "127.0.0.1", "port": 0},
+    })
+    _Handler.cfg = plain
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        with urllib.request.urlopen(base + "/api/uptime") as r:
+            off = json.loads(r.read())
+        assert off["remote_cameras"] == [] and off["sensors"] == [], (
+            "a non-collector reported relayed rows"
+        )
         assert rep == {"live-one": True, "dead-one": False}, rep
     finally:
         srv.shutdown()

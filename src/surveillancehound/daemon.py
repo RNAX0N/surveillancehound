@@ -93,6 +93,7 @@ class RunStats:
     flows_flushed: int = 0
     alerts_emitted: int = 0
     uptime_transitions: int = 0
+    relayed_alerts_dispatched: int = 0  # observed elsewhere, paged by us
     relayed_dropped_batch: int = 0      # over the per-batch cap
     relayed_dropped_budget: int = 0     # over the per-sensor notify budget
     relayed_dropped_share: int = 0      # over this sensor's queue share
@@ -871,7 +872,10 @@ class Hound:
             self.store.record_remote_notification(_sid, _rid, channel, ok, err)
 
         self.dispatcher.dispatch(alert, None, on_attempt=_audit)
-        self.stats.alerts_emitted += 1
+        # Counted separately: mixing relayed dispatches into
+        # alerts_emitted made the shutdown line claim this sensor had
+        # observed things another host did.
+        self.stats.relayed_alerts_dispatched += 1
 
     def _relay_notify_budget(self, sensor_id: str, now: float) -> bool:
         """Per-sensor cap on NOTIFICATIONS, not on storage.

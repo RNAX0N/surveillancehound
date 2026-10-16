@@ -202,13 +202,20 @@ class _Handler(BaseHTTPRequestHandler):
             )
             # Relayed rows are kept separate all the way to the client, so
             # the Sensor column is always truthful about provenance.
-            remote_cameras = store.remote_uptime_report(
-                now, self.cfg.relay.sensor_timeout_seconds)
+            # Gated like /api/alerts and /api/flows: a non-collector
+            # has no relay tables worth querying, and the inconsistency
+            # invited the next reader to pick the wrong pattern.
+            remote_cameras = (
+                store.remote_uptime_report(
+                    now, self.cfg.relay.sensor_timeout_seconds)
+                if self.cfg.relay.is_collector else []
+            )
             sensors = [
                 dict(x.__dict__,
                      reporting=(now - x.last_seen)
                      <= self.cfg.relay.sensor_timeout_seconds)
-                for x in store.list_remote_sensors()
+                for x in (store.list_remote_sensors()
+                          if self.cfg.relay.is_collector else [])
             ]
         finally:
             store.close()
