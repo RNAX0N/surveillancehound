@@ -136,10 +136,13 @@ no error on either side.
 
 Two things not to do:
 
-- **Do not delete `<store>.writer`.** It is how one process can tell
-  another is running. Removing it while the daemon holds it lets the next
-  compaction conclude nothing is running and swap the database out from
-  under it.
+- **Do not delete `<store>.writer`,** and treat the store's directory
+  as part of the lock's trust boundary. The lock binds the file, not
+  the name, and the name is only checked when it is taken — so
+  removing or replacing `.writer` while the daemon holds it lets the
+  next compaction conclude nothing is running and swap the database
+  out from under it. Anything that can write that directory can do
+  this; the same thing can already corrupt the store directly.
 - **Do not put `[store].path` on NFS.** The lock depends on `flock`, which
   is not guaranteed there; SQLite over NFS is unsupported anyway.
 

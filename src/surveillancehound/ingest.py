@@ -59,6 +59,9 @@ _ABSOLUTE_DISK_FLOOR = 32 * 1024 * 1024
 # another WARNING. The first always does; see the branch in
 # `_handle_batch`.
 _INSTANCE_RESET_EVERY = 100
+# How often a sensor whose batches keep failing validation earns
+# another WARNING. The first always does.
+_REJECT_LOG_EVERY = 100
 _DRAIN_LIMIT = 65536      # default lingering-close absorption
 # Ceiling for the one refusal that MUST be understood exactly.
 #
@@ -260,6 +263,10 @@ class IngestServer:
         # is not an unbounded-growth vector the way a source-address
         # key would be.
         self._instance_resets: dict[str, int] = {}
+        # Per-sensor count of validation rejections, for log
+        # throttling. Bounded by the configured sensor list, like
+        # `_instance_resets`.
+        self._reject_log: dict[str, int] = {}
         self._reset_lock = threading.Lock()
         # Capture outranks relayed work; see relay.CaptureGate.
         self.gate = gate or relay.CaptureGate()
@@ -572,7 +579,21 @@ class IngestServer:
                 doc.get("records", {}), self.cfg.max_records_per_batch,
             )
         except validate.ValidationError as e:
-            log.warning("relay: rejected batch from %s: %s", sensor_id, e)
+            # Throttled per sensor, like the instance-reset branch and
+            # for the same reason: a VALID key holder sets the rate
+            # here, at 60 requests/minute per source address with no
+            # limit on addresses. The neighbouring 401 is already
+            # `log.debug` on this reasoning; this one was missed.
+            with self._reset_lock:
+                self._reject_log[sensor_id] = n = (
+                    self._reject_log.get(sensor_id, 0) + 1)
+            if n == 1 or n % _REJECT_LOG_EVERY == 0:
+                log.warning("relay: rejected batch from %s: %s "
+                            "(%d rejection(s) from this sensor)",
+                            sensor_id, e, n)
+            else:
+                log.debug("relay: rejected batch from %s: %s",
+                          sensor_id, e)
             # Advertise the limits. The agent sizes batches from its OWN
             # config because it cannot see this one, so a collector
             # configured lower refused every batch — and 400 is terminal

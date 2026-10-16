@@ -1234,6 +1234,69 @@ def _check_lock_is_held_across_the_swap(tmp: Path) -> None:
           f"rebuild ({samples} samples, no unguarded moment)")
 
 
+def _check_blocked_checkpoint_refuses_the_swap(tmp: Path) -> None:
+    """A checkpoint that could not run must stop the swap.
+
+    `PRAGMA wal_checkpoint(TRUNCATE)` reports failure in its RESULT
+    ROW — `(busy, log_frames, checkpointed_frames)` — and returns
+    SQLITE_OK. It does NOT raise when a reader's snapshot blocks it.
+    A guard that only caught `sqlite3.Error` therefore never ran for
+    the one case it was written for, and the `-wal` unlink that
+    follows then discarded every frame the checkpoint had failed to
+    write. Measured with a reader holding a pre-WAL snapshot:
+    `(1, 18, 0)`, no exception, 0 of 7000 rows surviving, and
+    `integrity_check` still `ok`.
+
+    Silent loss that passes its own audit is the worst shape this
+    project has, so the swap refuses instead.
+    """
+    import sqlite3 as _sq
+    from surveillancehound.store import AlertRow, HoundStore
+
+    path = tmp / "ckpt.sqlite"
+    store = HoundStore(path=path, exclusive=True, lock_wait=0.0)
+    store.insert_alert(AlertRow(
+        id=None, ts=T0, device_ip="10.0.0.1", kind="new_device",
+        severity="low", summary="seed", detail="", dedup_key="seed"))
+
+    # A reader holding a real snapshot of the table, taken before the
+    # WAL grows. It is what keeps the checkpoint from completing.
+    reader = _sq.connect(str(path))
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM alerts").fetchall()
+    total = 3000
+    for i in range(total):
+        store.insert_alert(AlertRow(
+            id=None, ts=T0 + i, device_ip="10.0.0.1",
+            kind="new_device", severity="low", summary="x" * 64,
+            detail="", dedup_key=f"ck{i}"))
+    try:
+        try:
+            store.vacuum(offline=True)
+            raise AssertionError(
+                "the compaction swapped the file after a checkpoint "
+                "that could not run. Everything still in the WAL is "
+                "then discarded by the unlink, and `integrity_check` "
+                "reports `ok` afterwards")
+        except RuntimeError as e:
+            assert "checkpoint" in str(e), e
+        rows = store._conn.execute(
+            "SELECT COUNT(*) c FROM alerts").fetchone()["c"]
+        assert rows == total + 1, (
+            f"{rows} of {total + 1} rows survived a refused "
+            f"compaction; refusing must cost nothing")
+        assert store._conn.execute(
+            "PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert not Path(str(path) + ".vacuum.tmp").exists(), (
+            "the refused compaction left its temp file behind")
+    finally:
+        reader.close()
+        store.close()
+    print(f"  blocked checkpoint: the swap refuses and all "
+          f"{total + 1} rows survive, rather than being discarded "
+          f"with integrity_check reporting ok")
+
+
 def _check_compaction_preserves_mode_and_tidies_up(tmp: Path) -> None:
     """The swapped-in file must keep the original's mode, and no
     temp file may survive a failure.
@@ -6130,6 +6193,7 @@ def main() -> int:
         _check_writer_lock_guards_the_swap(Path(td))
         _check_lock_is_held_across_the_swap(Path(td))
         _check_compaction_preserves_mode_and_tidies_up(Path(td))
+        _check_blocked_checkpoint_refuses_the_swap(Path(td))
         _check_heartbeat_does_not_depend_on_uptime(Path(td))
         _check_no_realert_on_restart(Path(td))
         _check_writer_lock_survives_a_restart(Path(td))

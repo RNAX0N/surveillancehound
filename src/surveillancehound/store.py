@@ -1891,6 +1891,20 @@ class HoundStore:
         # "13.1 MB free, needs 10.8" into "4.3 MB free, needs 10.4",
         # and the refusal never mentioned the file.
         tmp.unlink(missing_ok=True)
+        try:
+            mode = self.path.stat().st_mode & 0o7777
+            st = self.path.stat()
+        except OSError:
+            mode, st = 0o600, None
+        # Normalise the sidecar HERE, before the early return below.
+        # `_take_writer_lock` has just created `<store>.writer` under
+        # this process's umask, and the low-disk refusal used to
+        # return without touching it — in the full-disk case this
+        # command exists for. Under root's default umask that leaves
+        # 0644 root:root, which the read-only fallback survives; under
+        # the umask 027 configd uses it leaves 0640 root:root, which
+        # the daemon cannot even read, and it will not start.
+        self._match_store_ownership(self._writer_lock_path(), mode, st)
         live = self._live_bytes()
         free = self._fs_free()
         if live and free is not None and free < live * 1.15:
@@ -1899,11 +1913,6 @@ class HoundStore:
                 "only %.0f MB is available.", live * 1.15 / 1e6,
                 free / 1e6)
             return before
-        try:
-            mode = self.path.stat().st_mode & 0o7777
-            st = self.path.stat()
-        except OSError:
-            mode, st = 0o600, None
         try:
             return self._compact_into(tmp, mode, st)
         except Exception:
@@ -1949,13 +1958,32 @@ class HoundStore:
             # Do NOT reorder the unlink after the replace instead:
             # that turns silent loss into a stale journal beside a
             # different database, which is a corrupt store.
+            # CHECK THE ROW, not just for an exception.
+            #
+            # `PRAGMA wal_checkpoint` returns (busy, log_frames,
+            # checkpointed_frames) and SQLITE_OK even when it did
+            # nothing — it does NOT raise when a reader's snapshot
+            # blocks it. The first version of this guard caught
+            # `sqlite3.Error` only, so the branch never ran for the
+            # one case its own comment named, and the unlink below
+            # then discarded every frame the checkpoint had failed to
+            # write. Measured with a reader holding a pre-WAL
+            # snapshot: `(1, 18, 0)`, no exception, 0 of 7000 rows
+            # surviving the swap, and `integrity_check` still `ok`.
             try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                row = self._conn.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                err = None if (row and row[0] == 0) else (
+                    f"blocked (busy={row[0] if row else '?'}, "
+                    f"{row[2] if row else '?'} of "
+                    f"{row[1] if row else '?'} frames written)")
             except sqlite3.Error as e:
+                err = str(e)
+            if err:
                 raise RuntimeError(
                     f"cannot checkpoint the write-ahead log before "
-                    f"swapping {self.path}: {e}. Something else still "
-                    f"has the store open; close it and re-run."
+                    f"swapping {self.path}: {err}. Something else "
+                    f"still has the store open; close it and re-run."
                 ) from None
             self._conn.close()
             for suffix in ("-wal", "-shm"):
@@ -1984,13 +2012,13 @@ class HoundStore:
             # rc script chowns the whole state dir on every start.
             try:
                 return open(lock, "rb")
-            except OSError:
-                pass
-            raise RuntimeError(
-                f"cannot open the writer lock {lock}: permission "
-                f"denied, even read-only. It must be readable by the "
-                f"user running the daemon; the store itself is fine."
-            ) from None
+            except OSError as inner:
+                raise RuntimeError(
+                    f"cannot open the writer lock {lock}: {inner}. It "
+                    f"must be readable by the user running the "
+                    f"daemon, in a directory that user can reach; the "
+                    f"store itself is fine."
+                ) from None
         except OSError as e:
             # A `.writer` the daemon cannot open — wrong owner or
             # mode — raised a bare PermissionError out of the

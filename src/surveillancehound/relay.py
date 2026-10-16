@@ -741,7 +741,16 @@ def post_batch(
                 # forever. The collector never sends these; a buggy
                 # proxy or a hostile pinned collector could.
                 payload = {}
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except Exception:                    # noqa: BLE001
+            # Not just JSONDecodeError/UnicodeDecodeError: a body of
+            # 65,536 open brackets — inside the read cap — raises
+            # RecursionError out of `json.loads`, which escaped
+            # `_flush_locked`'s (RelayError, OSError, SSLError)
+            # envelope entirely. The batch was then neither acked nor
+            # dropped, `last_error` never set and `_note_link` never
+            # called: the identical response every cycle forever,
+            # with `hound relay` reporting health. A response we
+            # cannot parse is simply a response we cannot parse.
             payload = {}
         return resp.status, payload
     finally:
@@ -1368,9 +1377,12 @@ class RelayClient:
                 # into state.json where it decides what gets sent
                 # next.
                 raw_last = payload.get("last_seq", seq)
+                # STRICTLY below the ceiling: accepting the maximum
+                # sets next_seq one past it, which the collector then
+                # rejects 400 forever.
                 last = (raw_last if isinstance(raw_last, int)
                         and not isinstance(raw_last, bool)
-                        and 0 < raw_last <= _MAX_SAFE_SEQ else seq)
+                        and 0 < raw_last < _MAX_SAFE_SEQ else seq)
                 self.spool.drop(seq, f"collector already has seq {last}")
                 with self._lock:
                     if self.state.next_seq <= last:
