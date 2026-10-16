@@ -1341,9 +1341,9 @@ def _check_compaction_preserves_mode_and_tidies_up(tmp: Path) -> None:
     # N2: a lock file the process cannot open must be a message, not
     # a bare PermissionError out of the constructor — the database
     # itself is perfectly writable.
+    lock = Path(str(path) + ".writer")
+    lock.touch()
     if _os.geteuid() != 0:          # root can open anything
-        lock = Path(str(path) + ".writer")
-        lock.touch()
         _os.chmod(lock, 0o000)
         try:
             try:
@@ -1361,6 +1361,31 @@ def _check_compaction_preserves_mode_and_tidies_up(tmp: Path) -> None:
                     "new way for a healthy daemon to refuse to start, "
                     "and it names the lock file rather than the "
                     "remedy") from None
+        finally:
+            _os.chmod(lock, 0o600)
+
+        # READ-ONLY IS STILL EXCLUSIVE. The daemon falls back to
+        # opening the lock `rb` when it cannot write it — a root-run
+        # prune leaves `<store>.writer` root-owned, and under systemd
+        # `DynamicUser` the daemon then could not start at all while
+        # its database was perfectly writable. `flock` needs no write
+        # access, but that is only safe if a lock taken on an
+        # O_RDONLY descriptor still excludes everyone else.
+        _os.chmod(lock, 0o444)
+        try:
+            first = HoundStore(path=path, exclusive=True, lock_wait=0.0)
+            try:
+                try:
+                    HoundStore(path=path, exclusive=True, lock_wait=0.0)
+                    raise AssertionError(
+                        "a second daemon started while the first held "
+                        "a READ-ONLY lock descriptor. The fallback "
+                        "that lets a daemon start against a root-owned "
+                        "lock file must not cost mutual exclusion")
+                except RuntimeError as e:
+                    assert "open as a writer" in str(e), e
+            finally:
+                first.close()
         finally:
             _os.chmod(lock, 0o600)
 
