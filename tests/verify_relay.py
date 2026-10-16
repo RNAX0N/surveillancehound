@@ -2533,6 +2533,27 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
             f"pipe fills in milliseconds — this is the collector going "
             f"blind because a remote host sent data"
         )
+        # A hostile sensor must not lock out a legitimate one. Bounding
+        # CPU by shrinking the CONNECTION pool did exactly that: with
+        # four slots, six hostile source addresses took every one and a
+        # real sensor got 0 of 20 batches in. The two limits are
+        # separate for this reason, and both halves need asserting —
+        # fixing the stall by denying service is not a fix.
+        from surveillancehound.ingest import _CPU_SLOTS, _Server
+        assert _Server.max_workers >= 4 * _CPU_SLOTS, (
+            f"the connection pool ({_Server.max_workers}) is too close "
+            f"to the CPU limit ({_CPU_SLOTS}); a few hostile sources "
+            f"will fill it and legitimate sensors get refused at accept"
+        )
+        assert _Server.max_per_source < _Server.max_workers, (
+            "one source may take the entire connection pool"
+        )
+        assert _CPU_SLOTS <= 4, (
+            f"{_CPU_SLOTS} concurrent batches through the pure-Python "
+            f"stages takes the GIL away from the pcap parser; this is "
+            f"the number that protects capture"
+        )
+
         # The gate itself, asserted directly. The timing loop above
         # exercises the one-writer slot; at this fixture's load the
         # slot alone keeps contention low, so removing the gate does
