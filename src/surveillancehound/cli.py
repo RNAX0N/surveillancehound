@@ -436,7 +436,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
     # agent: read the spool, never the network
     from surveillancehound.relay import AgentState, Spool
     base = Path(cfg.store.path).parent / "relay"
-    state = AgentState.load(base)
+    state = AgentState.load(base, readonly=True)
     spool = Spool(base, r.spool_max_bytes, r.spool_max_age_seconds)
     st = spool.stats(time.time())
     print(f"relay: agent {r.sensor_id!r} -> {r.url}")

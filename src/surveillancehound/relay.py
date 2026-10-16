@@ -136,6 +136,11 @@ class Spool:
         # in here at once, so the serialisation has to live in the spool
         # rather than in its callers.
         self._lock = threading.RLock()
+        # ack()/drop() are called from the push loop and have no `now` of
+        # their own; this tracks the most recent one a caller supplied so
+        # their compaction uses a real clock rather than wall time, which
+        # keeps replay deterministic.
+        self._now_hint = 0.0
 
     def _read(self) -> list[dict]:
         if not self.path.is_file():
@@ -151,7 +156,11 @@ class Spool:
         return out
 
     def _write(self, entries: list[dict]) -> None:
-        tmp = self.path.with_suffix(".tmp")
+        # Unique per writer, for the same reason AgentState.save is: the
+        # daemon and `hound relay` are different processes sharing this
+        # directory, and a fixed name lets one truncate the other's
+        # half-written file.
+        tmp = self.path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(
             "".join(json.dumps(e, separators=(",", ":")) + "\n" for e in entries),
             encoding="utf-8",
@@ -171,6 +180,7 @@ class Spool:
             separators=(",", ":"),
         ) + "\n"
         with self._lock:
+            self._now_hint = max(self._now_hint, now)
             with self.path.open("a", encoding="utf-8") as fh:
                 fh.write(line)
             # Compact only when the file has actually grown past the byte
@@ -183,50 +193,68 @@ class Spool:
             if oversized:
                 self._write(self._enforce_caps(self._read(), now))
 
-    def _enforce_caps(self, entries: list[dict], now: float) -> list[dict]:
-        before = len(entries)
-        entries = [e for e in entries if (now - e["at"]) <= self.max_age]
-        self.dropped_age += before - len(entries)
+    def _deliverable(self, entries: list[dict], now: float) -> list[dict]:
+        """What is still within both caps. PURE — no counters, no writes.
 
-        def size(es):
-            return sum(len(e["body"]) for e in es)
-
-        while entries and size(entries) > self.max_bytes:
-            entries.pop(0)        # oldest first
-            self.dropped_size += 1
-        return entries
-
-    def _load(self, now: float) -> list[dict]:
-        """Read, apply both caps, and PERSIST the result.
-
-        Persisting matters: `_enforce_caps` increments the drop counters,
-        and `pending()` is called every push cycle. Without writing the
-        filtered list back, one expired batch was re-counted as a fresh
-        drop on every cycle, so `hound relay` reported a drop total that
-        climbed forever. Caller holds `self._lock`.
+        Readers use this. They must not mutate: `hound relay` builds its
+        own Spool over the live directory in a DIFFERENT PROCESS from the
+        daemon, and `_lock` is a thread lock, so a reader that wrote back
+        could clobber a batch the daemon appended in between. That is the
+        data loss the spool exists to prevent, caused by the diagnostic
+        command for it.
         """
-        before = self._read()
-        entries = self._enforce_caps(before, now)
-        if len(entries) != len(before):
-            self._write(entries)
-        return entries
+        kept = [e for e in entries if (now - e["at"]) <= self.max_age]
+        total = sum(len(e["body"]) for e in kept)
+        i = 0
+        while i < len(kept) and total > self.max_bytes:
+            total -= len(kept[i]["body"])        # oldest first
+            i += 1
+        return kept[i:]
+
+    def _enforce_caps(self, entries: list[dict], now: float) -> list[dict]:
+        """`_deliverable`, plus the drop counters. MUTATING PATHS ONLY.
+
+        Counting here rather than in the reader is what keeps the totals
+        honest: `pending()` runs every push cycle, so counting on read
+        made one expired batch register a fresh drop forever.
+        """
+        kept = self._deliverable(entries, now)
+        if len(kept) != len(entries):
+            dropped = entries[:len(entries) - len(kept)]
+            aged = sum(1 for e in dropped if (now - e["at"]) > self.max_age)
+            self.dropped_age += aged
+            self.dropped_size += len(dropped) - aged
+        return kept
 
     def pending(self, now: float) -> list[tuple[int, bytes]]:
         with self._lock:
-            entries = self._load(now)
+            self._now_hint = max(self._now_hint, now)
+            entries = self._deliverable(self._read(), now)
             return [(e["seq"], e["body"].encode("utf-8")) for e in entries]
 
     def ack(self, seq: int) -> None:
-        """Drop everything up to and including `seq` — it is now durable."""
+        """Drop everything up to and including `seq` — it is now durable.
+
+        Also compacts, since this already rewrites the file. That is
+        where aged-out batches get counted: readers must not count (they
+        run every cycle and would re-count forever) and appends only
+        compact when oversized, so without this `dropped_age` would stay
+        at zero while batches silently expired.
+        """
         with self._lock:
-            self._write([e for e in self._read() if e["seq"] > seq])
+            # Count expiries BEFORE removing the acked range, or a batch
+            # that aged out unsent is swept away as though it had been
+            # delivered and never appears in the drop total.
+            live = self._enforce_caps(self._read(), self._now_hint)
+            self._write([e for e in live if e["seq"] > seq])
 
     def drop(self, seq: int, reason: str) -> None:
         """Discard one batch the collector will never accept."""
         with self._lock:
             self.dropped_stale += 1
             log.warning("relay: dropping spooled batch seq=%s (%s)", seq, reason)
-            self._write([e for e in self._read() if e["seq"] != seq])
+            live = self._enforce_caps(self._read(), self._now_hint)
+            self._write([e for e in live if e["seq"] != seq])
 
     def stats(self, now: float) -> SpoolStats:
         # The same view `pending()` would send, not the raw file. These
@@ -234,7 +262,7 @@ class Spool:
         # dead link, and reporting a backlog that will never be
         # delivered is the project's own cardinal sin.
         with self._lock:
-            entries = self._load(now)
+            entries = self._deliverable(self._read(), now)
             return SpoolStats(
                 pending=len(entries),
                 bytes=sum(len(e["body"]) for e in entries),
@@ -288,9 +316,19 @@ class AgentState:
     last_error: str = ""
 
     @classmethod
-    def load(cls, directory: Path) -> "AgentState":
+    def load(cls, directory: Path, *, readonly: bool = False) -> "AgentState":
+        """Load agent identity and progress.
+
+        `readonly=True` is for diagnostics (`hound relay`). Without it a
+        read-only-looking command mkdirs the state directory and mints
+        AND SAVES a new instance_id whenever the file is missing or
+        torn — so running it as a different user, or against a damaged
+        file, silently rewrites the agent's identity and resets the
+        collector's sequence expectations.
+        """
         directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
+        if not readonly:
+            directory.mkdir(parents=True, exist_ok=True)
         path = directory / "state.json"
         st = cls(path=path)
         if path.is_file():
@@ -303,7 +341,7 @@ class AgentState:
                 st.last_error = str(d.get("last_error", ""))
             except (json.JSONDecodeError, ValueError, TypeError):
                 log.warning("relay: unreadable state file, starting fresh")
-        if not st.instance_id:
+        if not st.instance_id and not readonly:
             st.instance_id = secrets.token_hex(8)
             st.save()
         return st

@@ -59,6 +59,16 @@ $(document).ready(function() {
         return $('<div/>').text(s === null || s === undefined ? '' : s).html();
     }
 
+    /* Numeric coercion for values interpolated into innerHTML. These
+       fields are numbers by schema, and validate.py coerces relayed ones
+       on arrival — but this view now renders rows produced on another
+       host, and a single layer of validation between a remote sensor and
+       innerHTML is one layer. A non-number becomes 0 rather than markup. */
+    function num(v) {
+        var n = Number(v);
+        return isFinite(n) ? n : 0;
+    }
+
     function fmtAgo(ts) {
         if (!ts) { return "{{ lang._('never') }}"; }
         var s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
@@ -180,10 +190,10 @@ $(document).ready(function() {
                     '<td>' + esc(c.role) + '</td>' +
                     '<td>' + (c.last_seen ? fmtAgo(c.last_seen) : "{{ lang._('never') }}") + '</td>' +
                     '<td>' + fmtDur(c.current_downtime) + '</td>' +
-                    '<td>' + c.outage_count + '</td>' +
+                    '<td>' + num(c.outage_count) + '</td>' +
                     '<td>' + ((stale || c.availability === null)
                         ? 'n/a'
-                        : (Number(c.availability) * 100).toFixed(2) + '%') + '</td>' +
+                        : (num(c.availability) * 100).toFixed(2) + '%') + '</td>' +
                     '</tr>';
             });
             $("#tbl-uptime tbody").html(rows ||
@@ -192,17 +202,23 @@ $(document).ready(function() {
                 '</td></tr>');
 
             rows = '';
-            $.each(d.alerts, function (i, a) {
+            // Local and relayed alerts together, newest first, each
+            // tagged with the sensor that observed it. Showing only
+            // local alerts hid the segment the relay exists to watch.
+            var alerts = (d.alerts || []).concat(d.remote_alerts || [])
+                .sort(function (x, y) { return num(y.ts) - num(x.ts); });
+            $.each(alerts, function (i, a) {
                 rows += '<tr>' +
-                    '<td>' + new Date(a.ts * 1000).toLocaleString() + '</td>' +
+                    '<td>' + esc(new Date(num(a.ts) * 1000).toLocaleString()) + '</td>' +
                     '<td>' + severityLabel(a.severity) + '</td>' +
                     '<td><code>' + esc(a.kind) + '</code></td>' +
+                    '<td>' + esc(a.sensor || a.sensor_id || 'local') + '</td>' +
                     '<td>' + esc(a.device_ip) + '</td>' +
                     '<td>' + esc(a.summary) + '</td>' +
                     '</tr>';
             });
             $("#tbl-alerts tbody").html(rows ||
-                '<tr><td colspan="5">' + "{{ lang._('No alerts yet.') }}" + '</td></tr>');
+                '<tr><td colspan="6">' + "{{ lang._('No alerts yet.') }}" + '</td></tr>');
 
             rows = '';
             $.each(d.flows, function (i, f) {
@@ -211,7 +227,7 @@ $(document).ready(function() {
                     '<td>' + esc(f.src_ip) + ':' + esc(f.src_port) + '</td>' +
                     '<td>' + esc(f.dst_ip) + ':' + esc(f.dst_port) + '</td>' +
                     '<td>' + esc(f.proto) + '</td>' +
-                    '<td>' + f.packets + '</td>' +
+                    '<td>' + num(f.packets) + '</td>' +
                     '<td>' + fmtBytes(f.bytes) + '</td>' +
                     '<td><code>' + esc(f.classification) + '</code></td>' +
                     '</tr>';
@@ -338,6 +354,7 @@ $(document).ready(function() {
                             <th>{{ lang._('Time') }}</th>
                             <th>{{ lang._('Severity') }}</th>
                             <th>{{ lang._('Kind') }}</th>
+                            <th>{{ lang._('Sensor') }}</th>
                             <th>{{ lang._('Device') }}</th>
                             <th>{{ lang._('Summary') }}</th>
                         </tr>

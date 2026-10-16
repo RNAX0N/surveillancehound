@@ -1251,12 +1251,46 @@ def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
         print("  relayed dispatch: fresh alerts notify, repeats suppress, "
               "backdating cannot bypass the window")
 
+        # A relayed alert's dedup_key must be a STRING, like a local
+        # one. The in-memory dedup map is keyed by a tuple, and reusing
+        # the same variable name for both put the tuple on the Alert —
+        # so jsonlines/webhook/ftp consumers saw a two-element array
+        # where every local alert gives them a string. Different schemas
+        # on the exact output path this feature exists to feed.
+        captured = []
+
+        class _Capture:
+            type, level = "jsonlines", "info"
+
+            def dispatch(self, alert):
+                captured.append(alert.as_dict())
+
+        hound.dispatcher.channels = [_Capture()]
+        shape = {
+            "remote_id": 801, "ts": real_now, "device_ip": "10.9.0.9",
+            "kind": "new_device", "severity": "high", "summary": "s",
+            "detail": "", "dedup_key": "new_device:10.9.0.9",
+        }
+        store.ingest_remote_batch(
+            "frigate", "inst", 801,
+            V.validate_records({"alerts": [dict(shape)]}, 10), real_now)
+        hound._dispatch_relayed_alert("frigate", dict(shape))
+        assert captured, "the capture channel saw nothing"
+        emitted = captured[0]["dedup_key"]
+        assert isinstance(emitted, str), (
+            f"dedup_key reached a notify channel as {type(emitted).__name__} "
+            f"({emitted!r}); local alerts emit a string, and a SIEM parsing "
+            f"both would see two schemas"
+        )
+        assert emitted == "frigate/new_device:10.9.0.9", emitted
+
         # A repeated remote_id must NOT multiply notifications.
         # `remote_id` is chosen by the sensor and the collector stores one
         # row per (sensor_id, remote_id), so N copies sharing an id
         # collapse to one row while still being dispatched N times. That
         # turned the dedup window — the only bound on relayed
         # notification volume — into one integer the attacker picks.
+        hound.dispatcher.channels = [_Count()]
         _Count.n = 0
         dup = {
             "remote_id": 900, "ts": real_now, "device_ip": "10.9.0.8",
@@ -1466,6 +1500,16 @@ def _check_relayed_api_surface(tmp: Path) -> None:
         # Local rows must stay distinguishable from relayed ones.
         assert all(c.get("sensor") == "local" for c in up["cameras"]), up["cameras"]
 
+        # Relayed ALERTS must reach the API too. They were stored,
+        # notified, quota'd and pruned but rendered by neither dashboard.
+        with urllib.request.urlopen(base + "/api/alerts") as r:
+            al = json.loads(r.read())
+        assert "remote_alerts" in al, list(al)
+        assert all(a.get("sensor") == "local" for a in al["alerts"])
+        with urllib.request.urlopen(base + "/api/flows") as r:
+            fl = json.loads(r.read())
+        assert "remote_flows" in fl, list(fl)
+
         rep = {x["sensor_id"]: x["reporting"] for x in up["sensors"]}
         assert rep == {"live-one": True, "dead-one": False}, rep
     finally:
@@ -1564,16 +1608,42 @@ def _check_spool_counters(tmp: Path) -> None:
     sp.append(2, b'{"a":2}', 0.0)
     for _ in range(5):
         assert sp.pending(100.0) == [], "expired batches must never be sent"
-    assert sp.dropped_age == 2, (
-        f"each expired batch must be counted once, not once per cycle; "
-        f"counter says {sp.dropped_age}"
-    )
     st = sp.stats(100.0)
     assert st.pending == 0, (
         f"stats() must report what pending() would actually send; it "
         f"claims {st.pending} batches are spooled"
     )
     assert st.bytes == 0, st.bytes
+
+    # READERS MUST NOT MUTATE. `hound relay` builds its own Spool over the
+    # live directory in a DIFFERENT PROCESS from the daemon, and the lock
+    # is a thread lock, so a reader that wrote back could erase a batch
+    # the daemon appended in between — the diagnostic command for data
+    # loss causing it.
+    spool_file = (tmp / "spool" / "spool.jsonl")
+    on_disk_before = spool_file.read_text()
+    sp.pending(100.0)
+    sp.stats(100.0)
+    assert spool_file.read_text() == on_disk_before, (
+        "pending()/stats() rewrote the spool; a concurrent append from "
+        "the daemon would be lost"
+    )
+
+    # Counting happens on mutation, exactly once, and an entry that aged
+    # out UNSENT must still appear in the drop total rather than being
+    # swept away as though it had been delivered.
+    assert sp.dropped_age == 0, (
+        f"reads must not count drops — pending() runs every push cycle, "
+        f"so counting there inflates the total forever; got {sp.dropped_age}"
+    )
+    sp.append(3, b'{"a":3}', 100.0)
+    sp.ack(3)
+    assert sp.dropped_age == 2, (
+        f"two batches aged out unsent and must be counted; got "
+        f"{sp.dropped_age}"
+    )
+    sp.ack(3)
+    assert sp.dropped_age == 2, "a second ack must not re-count"
 
     # Live entries survive, and the byte cap evicts oldest-first.
     sp2 = Spool(tmp / "spool2", 200, 3600.0)
@@ -1656,8 +1726,23 @@ def _check_agent_state(tmp: Path) -> None:
         "can tell it apart from a sequence replay"
     )
     assert fresh.next_seq == 1, fresh.next_seq
+    # `hound relay` is a diagnostic and must not rewrite identity. A
+    # normal load mints and SAVES an instance_id when the file is
+    # missing or torn, so run as another user — or against a damaged
+    # file — the diagnostic silently reset the agent's identity.
+    import shutil as _sh
+    probe = tmp / "agent-ro"
+    ro = AgentState.load(probe, readonly=True)
+    assert ro.instance_id == "", "readonly must not mint an identity"
+    assert not probe.exists(), "readonly must not create the state directory"
+    live = AgentState.load(probe)
+    assert live.instance_id, "a normal load still mints"
+    assert AgentState.load(probe, readonly=True).instance_id == \
+        live.instance_id, "readonly must read an existing identity"
+    _sh.rmtree(probe)
+
     print("  agent state: instance stable across restart, new on wipe; "
-          "4 watermark cursors persist")
+          "4 watermark cursors persist; diagnostics do not rewrite it")
 
 
 def main() -> int:

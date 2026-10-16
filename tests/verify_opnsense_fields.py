@@ -529,7 +529,7 @@ def _check_volt_renders_relayed_data() -> None:
     volt = PLUGIN / "views/OPNsense/Hound/index.volt"
     text = volt.read_text()
 
-    for key in ("remote_uptime", "sensors"):
+    for key in ("remote_uptime", "remote_alerts", "sensors"):
         assert key in text, (
             f"index.volt never reads d.{key}; `hound export` emits it and "
             f"the plugin dashboard is the only view a collector operator "
@@ -543,6 +543,20 @@ def _check_volt_renders_relayed_data() -> None:
         "a stale sensor's availability must render n/a, not the figure it "
         "last claimed"
     )
+
+    # The alerts table must line up too, now that it carries a Sensor
+    # column. Relayed alerts were stored, notified, quota'd and pruned
+    # but rendered by neither dashboard.
+    ahead = text[text.index('id="tbl-alerts"'):]
+    ahead = ahead[:ahead.index("</thead>")]
+    a_head = ahead.count("<th>")
+    abody = text[text.index("$.each(alerts"):]
+    abody = abody[:abody.index('$("#tbl-alerts')]
+    a_body = abody.count("'<td>")       # also matches the <code> cell
+    assert a_head == a_body, (
+        f"alerts table has {a_head} header cells but rows emit {a_body}"
+    )
+    assert f'colspan="{a_head}"' in text
 
     # Column counts must agree, or the table silently misaligns.
     head = text[text.index('id="tbl-uptime"'):]
@@ -558,8 +572,23 @@ def _check_volt_renders_relayed_data() -> None:
     assert f'colspan="{n_head}"' in text, (
         f"the empty-table placeholder must span all {n_head} columns"
     )
+    # Numerics interpolated into innerHTML must be coerced. This view
+    # renders rows produced on another host now, and the spec names
+    # outage_count/packets as the stored-XSS vector precisely because
+    # validation alone is one layer. web.py has a num() helper; this
+    # view must too.
+    assert "function num(" in text, (
+        "index.volt renders relayed rows but has no numeric coercion "
+        "helper; web.py was hardened and this view was not"
+    )
+    import re
+    raw = re.findall(r"'<td>' \+ ([a-z]\.[a-z_]+)", text)
+    assert not raw, (
+        f"raw field(s) interpolated into innerHTML: {raw}. Wrap numbers "
+        f"in num() and strings in esc()."
+    )
     print(f"  volt: renders relayed rows + sensor health; "
-          f"{n_head} columns line up")
+          f"{n_head} columns line up; numerics coerced")
 
 
 def main() -> int:

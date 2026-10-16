@@ -727,8 +727,8 @@ class Hound:
         #    row cannot answer this: the listener writes the batch before
         #    dispatch, and several queued copies can map to one row, so a
         #    row-based check either suppresses everything or nothing.
-        key = (sensor_id, raw["dedup_key"])
-        sent = self._relay_last_dispatch.get(key)
+        dkey = (sensor_id, raw["dedup_key"])
+        sent = self._relay_last_dispatch.get(dkey)
         if sent is not None and (now - sent) < window:
             return
         # 2) What we RECEIVED before this process started, so a restart
@@ -743,7 +743,7 @@ class Hound:
             if last is not None and (now - last) < window:
                 return
 
-        self._relay_last_dispatch[key] = now
+        self._relay_last_dispatch[dkey] = now
         if len(self._relay_last_dispatch) > _RELAY_DEDUP_MAX:
             # Bounded: the keyspace is sensor-controlled via dedup_key.
             # Dropping the oldest can at worst re-notify something, never

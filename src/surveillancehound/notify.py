@@ -70,7 +70,13 @@ def _path_lock(path: Path) -> threading.Lock:
     avoid. Scoping it to the file keeps the race fixed without coupling
     the two paths.
     """
-    key = str(path.resolve() if path.is_absolute() else path)
+    # Always resolve. `resolve()` is non-strict and handles relative
+    # paths, so the conditional only split `h.log` and `/cwd/h.log` into
+    # two locks for one file — quietly restoring the rotation race.
+    try:
+        key = str(path.resolve())
+    except OSError:
+        key = str(path)
     with _PATH_LOCKS_GUARD:
         lk = _PATH_LOCKS.get(key)
         if lk is None:

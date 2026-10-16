@@ -1203,7 +1203,12 @@ class HoundStore:
     def list_remote_alerts(self, *, limit: int = 100) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM remote_alerts ORDER BY ts DESC LIMIT ?",
+                # ORDER BY ingested_at, not ts: `ts` is supplied by the
+                # sensor, so ordering on it lets one future-dated alert
+                # pin itself to the top of every dashboard and push real
+                # ones off the end of the limit.
+                "SELECT * FROM remote_alerts ORDER BY ingested_at DESC, id DESC "
+                "LIMIT ?",
                 (int(limit),),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -1211,7 +1216,8 @@ class HoundStore:
     def list_remote_flows(self, *, limit: int = 100) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM remote_flows ORDER BY last_seen DESC LIMIT ?",
+                "SELECT * FROM remote_flows ORDER BY ingested_at DESC, id DESC "
+                "LIMIT ?",
                 (int(limit),),
             ).fetchall()
         return [dict(r) for r in rows]

@@ -247,17 +247,36 @@ class _Handler(BaseHTTPRequestHandler):
         store = self._store()
         try:
             rows = store.list_alerts(limit=limit)
+            # Relayed alerts are kept separate rather than merged: they
+            # live in quarantined tables, and a reader that cannot tell
+            # which host observed an alert cannot act on it either.
+            remote = (
+                store.list_remote_alerts(limit=limit)
+                if self.cfg.relay.is_collector else []
+            )
         finally:
             store.close()
-        _json(self, HTTPStatus.OK, {"alerts": [r.__dict__ for r in rows]})
+        _json(self, HTTPStatus.OK, {
+            "alerts": [dict(r.__dict__, sensor="local") for r in rows],
+            "remote_alerts": remote,
+        })
 
     def _api_flows(self, limit: int, classification: str | None) -> None:
         store = self._store()
         try:
             rows = store.recent_flows(limit=limit, classification=classification)
+            remote = (
+                store.list_remote_flows(limit=limit)
+                if self.cfg.relay.is_collector else []
+            )
         finally:
             store.close()
-        _json(self, HTTPStatus.OK, {"flows": [r.__dict__ for r in rows]})
+        if classification:
+            remote = [r for r in remote if r.get("classification") == classification]
+        _json(self, HTTPStatus.OK, {
+            "flows": [dict(r.__dict__, sensor="local") for r in rows],
+            "remote_flows": remote,
+        })
 
     def _api_baselines(self, camera: str | None) -> None:
         store = self._store()
@@ -963,9 +982,15 @@ async function refresh() {
         fetchJSON("/api/baselines"),
         fetchJSON("/api/uptime"),
       ]);
-    renderStatus(status, alerts.alerts, snapshots.snapshots);
+    // Local and relayed alerts in one list, newest first, each tagged
+  // with the sensor that observed it. A collector that showed only its
+  // own alerts would be hiding the segment the relay exists to watch.
+  const allAlerts = (alerts.alerts || [])
+    .concat(alerts.remote_alerts || [])
+    .sort((a, b) => num(b.ts) - num(a.ts));
+  renderStatus(status, allAlerts, snapshots.snapshots);
     renderUptime(uptime);
-    renderAlerts(alerts.alerts);
+    renderAlerts(allAlerts);
     renderDevices(devices.devices);
     renderFlows(flows.flows);
     renderBaselines(baselines.baselines);
@@ -1090,6 +1115,7 @@ function renderAlerts(alerts) {
           <span class="ts">${fmtHM(a.ts)}</span>
           <span class="kind">${escapeHTML(a.kind)}</span>
           <span style="color:var(--fg-mute)">${escapeHTML(a.device_ip)}</span>
+          <span class="dim">${escapeHTML(a.sensor || a.sensor_id || "local")}</span>
         </div>
         <div class="row-summary">${escapeHTML(a.summary)}</div>
         <div class="row-detail">${escapeHTML(a.detail)}</div>
