@@ -877,14 +877,15 @@ def cmd_prune(args: argparse.Namespace) -> int:
                     print(f"store is {before:,} bytes and already "
                           f"compact; nothing to reclaim.")
                 else:
+                    need = max(1, round(before * 2 / 1e6))
                     print(f"store is {before:,} bytes; no space was "
                           f"returned to the filesystem. Any freed "
                           f"pages are reusable in place, so ingest is "
                           f"not blocked by this. To shrink the file, "
-                          f"free about {before * 2 / 1e6:,.0f} MB and "
-                          f"re-run — or stop the daemon and re-run "
-                          f"with --offline-compact, which needs room "
-                          f"only for the live data.")
+                          f"free about {need:,} MB and re-run — or "
+                          f"stop the daemon and re-run with "
+                          f"--offline-compact, which needs room only "
+                          f"for the live data.")
         if not any(deleted.values()):
             print("nothing to prune")
         else:

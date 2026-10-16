@@ -99,6 +99,11 @@ _POST_TIMEOUT_S = 10.0
 # bind. Mirrored here so the rotation step matches the window; they
 # disagreed and left ids permanently unexamined.
 _OUTAGE_ID_BINDS = 900
+# Largest sequence number the agent will adopt from a collector's
+# 409. Mirrors the collector's own `_MAX_SEQ`; a value beyond it
+# could not have come from a sane peer and gets ignored rather than
+# written into state.json.
+_MAX_SAFE_SEQ = 2**63 - 1
 # Longest a deadline-bearing flush will wait for the lock.
 _FLUSH_LOCK_WAIT_S = 5.0
 # Body-size self-limit. Mirrors the collector's documented
@@ -727,6 +732,15 @@ def post_batch(
         raw = resp.read(1024 * 64)
         try:
             payload = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(payload, dict):
+                # A top-level array, string or number is valid JSON
+                # and not a response. Every caller does
+                # `payload.get(...)`, so anything else became an
+                # AttributeError out of the flush — the batch neither
+                # acked nor dropped, the same response next cycle,
+                # forever. The collector never sends these; a buggy
+                # proxy or a hostile pinned collector could.
+                payload = {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             payload = {}
         return resp.status, payload
@@ -1348,7 +1362,15 @@ class RelayClient:
             elif status == 409:
                 # The collector is ahead of us — a wiped volume, or a
                 # duplicate. Fast-forward rather than retrying forever.
-                last = int(payload.get("last_seq", seq))
+                # Type-checked, like `_learn_limits` does for the
+                # same class of value. A bare int() on untrusted JSON
+                # raises out of the flush, and this one is persisted
+                # into state.json where it decides what gets sent
+                # next.
+                raw_last = payload.get("last_seq", seq)
+                last = (raw_last if isinstance(raw_last, int)
+                        and not isinstance(raw_last, bool)
+                        and 0 < raw_last <= _MAX_SAFE_SEQ else seq)
                 self.spool.drop(seq, f"collector already has seq {last}")
                 with self._lock:
                     if self.state.next_seq <= last:
@@ -1395,8 +1417,15 @@ class RelayClient:
                 # independent, so 5000 alerts with long summaries can
                 # exceed 8 MB.
                 # Malformed or unauthorised: retrying cannot help.
+                # str() BEFORE slicing, like its two neighbours. A
+                # collector answering `{"error": null}` or
+                # `{"error": 123}` raised TypeError out of the flush,
+                # so the batch was neither acked nor dropped and the
+                # identical response fired every cycle forever — a
+                # permanent stall with no warning, which is the exact
+                # failure shape this file names three times.
                 self.spool.drop(seq, f"rejected with {status}: "
-                                     f"{payload.get('error', '')[:120]}")
+                                     f"{str(payload.get('error', ''))[:120]}")
                 self.state.last_error = f"{status}: {payload.get('error','')}"[:300]
                 self.state.save()
             else:

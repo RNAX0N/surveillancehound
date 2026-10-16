@@ -1880,6 +1880,17 @@ class HoundStore:
         process dies, so a crash cannot wedge this command.
         """
         self._require_no_writer()
+        tmp = self.path.with_name(self.path.name + ".vacuum.tmp")
+        # Clear any leftover BEFORE the free-space check below, or it
+        # is counted against the very space it is deciding about.
+        # This sat fourteen lines further down, after the check, while
+        # its comment claimed otherwise — so a partial rebuild left by
+        # a kill made the next attempt refuse for lack of room it was
+        # itself occupying, on exactly the full disk this command is
+        # the recovery for. Measured: 9,076,736 stale bytes turned
+        # "13.1 MB free, needs 10.8" into "4.3 MB free, needs 10.4",
+        # and the refusal never mentioned the file.
+        tmp.unlink(missing_ok=True)
         live = self._live_bytes()
         free = self._fs_free()
         if live and free is not None and free < live * 1.15:
@@ -1888,15 +1899,11 @@ class HoundStore:
                 "only %.0f MB is available.", live * 1.15 / 1e6,
                 free / 1e6)
             return before
-        tmp = self.path.with_name(self.path.name + ".vacuum.tmp")
         try:
             mode = self.path.stat().st_mode & 0o7777
             st = self.path.stat()
         except OSError:
             mode, st = 0o600, None
-        # Clear any leftover BEFORE the free-space check above would
-        # have counted it against the space it is checking.
-        tmp.unlink(missing_ok=True)
         try:
             return self._compact_into(tmp, mode, st)
         except Exception:
@@ -1922,10 +1929,34 @@ class HoundStore:
                     os.chown(tmp, st.st_uid, st.st_gid)
                 except (OSError, AttributeError):
                     pass
-            # Close FIRST so the WAL is checkpointed into the OLD file
-            # and removed. Replacing while a -wal survives leaves that
-            # stale journal beside a different database, which is a
-            # corrupt store.
+            # The lock sidecar too. Round 21 taught this method to
+            # carry the store's mode and owner across the swap and
+            # left the file it creates beside it untreated — so the
+            # same root-run prune that no longer breaks the store
+            # could still leave a `.writer` the daemon cannot use.
+            self._match_store_ownership(self._writer_lock_path(), mode, st)
+            # Checkpoint EXPLICITLY before closing. `close()` alone
+            # cannot checkpoint while another process still has the
+            # database open — a reader keeps the WAL alive — so the
+            # unlink below then discarded committed transactions that
+            # had never reached the main file. Measured with a reader
+            # attached and a SIGKILL between the unlink and the
+            # replace: 6,889 of 7,000 rows, three runs, and
+            # `integrity_check` said `ok` every time. Silent loss that
+            # passes its own audit is the worst shape this project
+            # has. After a successful TRUNCATE the unlink is a no-op.
+            #
+            # Do NOT reorder the unlink after the replace instead:
+            # that turns silent loss into a stale journal beside a
+            # different database, which is a corrupt store.
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error as e:
+                raise RuntimeError(
+                    f"cannot checkpoint the write-ahead log before "
+                    f"swapping {self.path}: {e}. Something else still "
+                    f"has the store open; close it and re-run."
+                ) from None
             self._conn.close()
             for suffix in ("-wal", "-shm"):
                 Path(str(self.path) + suffix).unlink(missing_ok=True)
@@ -1937,8 +1968,29 @@ class HoundStore:
         return Path(str(self.path) + ".writer")
 
     def _open_lock_file(self):
+        lock = self._writer_lock_path()
         try:
-            return open(self._writer_lock_path(), "a+b")
+            return open(lock, "a+b")
+        except PermissionError:
+            # `flock` needs no write access, so a lock file we may
+            # only READ is still perfectly usable. This matters
+            # because the documented recovery is "stop the service,
+            # run prune as root, start it again" — and under
+            # `DynamicUser=yes` that root run creates
+            # `<store>.writer` as root:root in the dynamic user's
+            # state directory. The daemon then could not open it and
+            # `Restart=always` looped, with its actual database
+            # perfectly writable. OPNsense is immune only because its
+            # rc script chowns the whole state dir on every start.
+            try:
+                return open(lock, "rb")
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"cannot open the writer lock {lock}: permission "
+                f"denied, even read-only. It must be readable by the "
+                f"user running the daemon; the store itself is fine."
+            ) from None
         except OSError as e:
             # A `.writer` the daemon cannot open — wrong owner or
             # mode — raised a bare PermissionError out of the
@@ -1950,6 +2002,18 @@ class HoundStore:
                 f"{e}. It must be writable by the user running the "
                 f"daemon; the store itself is fine."
             ) from None
+
+    @staticmethod
+    def _match_store_ownership(target: Path, mode: int, st) -> None:
+        """Give `target` the store's mode and owner. Best effort."""
+        try:
+            if not target.exists():
+                return
+            os.chmod(target, mode)
+            if st is not None and hasattr(os, "chown"):
+                os.chown(target, st.st_uid, st.st_gid)
+        except (OSError, AttributeError):
+            pass
 
     def _lock_inode_matches(self, fh) -> bool:
         try:
@@ -1999,8 +2063,20 @@ class HoundStore:
                 # fresh one and conclude no daemon is running.
                 if self._lock_inode_matches(fh):
                     break
+                # Someone replaced the lock file under us. Re-open and
+                # try again — but on the SAME deadline, and with the
+                # same backoff. `continue` straight to the top skipped
+                # both, so a pathological lock file spun a core for as
+                # long as the daemon lived.
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
                 fh.close()
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"the writer lock {self._writer_lock_path()} "
+                        f"keeps being replaced underneath this "
+                        f"process; giving up after {budget:.0f}s."
+                    ) from None
+                time.sleep(0.05)
                 fh = self._open_lock_file()
                 continue
             except OSError:
@@ -2056,9 +2132,12 @@ class HoundStore:
                 "exclusive=True before compacting, so the writer lock "
                 "is held for the whole swap"
             )
-        # Second opinion, for a daemon too old to take the lock. Not
-        # load-bearing, and it never could be: a heartbeat cannot
-        # prove ABSENCE. A daemon that started a moment ago has not
+        # FALLBACK FOR PLATFORMS WITHOUT flock, and nothing else.
+        # The branch above returns or raises whenever `fcntl` is
+        # importable, so on Linux and FreeBSD — the only platforms
+        # this deploys on — nothing below ever runs. It is kept for a
+        # hypothetical port, not as a live guard, and it could never
+        # be one: a heartbeat cannot prove ABSENCE. A daemon that started a moment ago has not
         # written one yet, and before `daemon._tick` wrote it
         # unconditionally a daemon with `[uptime] enabled = false`
         # never wrote one at all.

@@ -659,6 +659,77 @@ def _check_listener(tmp: Path) -> None:
         store.close()
 
 
+def _check_malformed_collector_response(tmp: Path) -> None:
+    """A strange answer from the collector must not stall the agent.
+
+    `payload.get('error','')[:120]` sliced before stringifying, so
+    `{"error": null}` or `{"error": 123}` raised TypeError out of the
+    flush — the batch neither acked nor dropped, the identical
+    response next cycle, forever. A top-level array or string did the
+    same through `payload.get` itself. And `int(payload.get(
+    "last_seq"))` was a bare int() on untrusted JSON that gets
+    persisted into state.json.
+
+    The collector is cert-pinned, so this needs the collector itself
+    to be buggy or compromised rather than a network attacker — but
+    the shapes cost nothing to survive, and "permanent stall, no
+    warning, flush() returns success" is the failure this file names
+    three times.
+    """
+    from surveillancehound import relay as _R
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import AlertRow, HoundStore
+
+    home = tmp / "malformed"
+    home.mkdir()
+    store = HoundStore(path=home / "agent.sqlite")
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url="https://127.0.0.1:1/ingest/v1",
+        tls_fingerprint=["sha256:" + "ab" * 32],
+    )
+    client = RelayClient(cfg, store, now=lambda: T0)
+    real_post = _R.post_batch
+    shapes = [
+        (401, {"error": None}),
+        (400, {"error": 123}),
+        (413, {"error": {"nested": "object"}}),
+        (409, {"last_seq": "not-a-number"}),
+        (409, {"last_seq": None}),
+        (409, {"last_seq": -5}),
+        (409, {"last_seq": True}),
+    ]
+    try:
+        for i, (status, payload) in enumerate(shapes):
+            store.insert_alert(AlertRow(
+                id=None, ts=T0 + i, device_ip="10.0.0.1",
+                kind="new_device", severity="low", summary="x",
+                detail="", dedup_key=f"mal{i}"))
+            client.enqueue()
+            _R.post_batch = (lambda *a, _s=status, _p=payload, **k:
+                             (_s, dict(_p)))
+            try:
+                client.flush()
+            except Exception as e:                       # noqa: BLE001
+                raise AssertionError(
+                    f"a {status} carrying {payload!r} raised "
+                    f"{type(e).__name__}: {e}. The batch is then "
+                    f"neither acked nor dropped, so the identical "
+                    f"response fires every cycle forever with no "
+                    f"warning") from None
+            assert isinstance(client.state.next_seq, int), (
+                f"next_seq is {client.state.next_seq!r} after "
+                f"{payload!r}; a bad last_seq must not be written "
+                f"into the persisted state")
+            assert client.state.next_seq > 0, client.state.next_seq
+    finally:
+        _R.post_batch = real_post
+        store.close()
+    print(f"  malformed responses: {len(shapes)} bad payload shapes "
+          f"handled without stalling or corrupting the sequence")
+
+
 def _check_clock_skew_does_not_destroy_data(tmp: Path) -> None:
     """A wrong clock is not a reason to throw observations away.
 
@@ -1097,49 +1168,82 @@ def _check_lock_is_held_across_the_swap(tmp: Path) -> None:
         "[capture]\npcap_file = '/nonexistent.pcap'\n"
         "[network]\ncamera_ips = []\n"
         f"[store]\npath = {str(path)!r}\n")
-    proc = _sp.Popen([_sys.executable, "-m", "surveillancehound.cli",
-                      "prune", str(cfg_path), "--offline-compact"],
-                     stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
-                     env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
-    try:
+    # THE PROBE CAN STEAL THE LOCK, so a refused child is a bad
+    # measurement and not a failure.
+    #
+    # `lock_is_free` takes LOCK_EX and drops it, in a tight loop, for
+    # the child's whole life — and the child is `hound prune`, which
+    # uses `lock_wait=0.0`: one non-blocking attempt, no retry,
+    # deliberately, so an operator is told to stop the service at
+    # once. If the probe happens to hold the lock at that instant the
+    # child is refused and exits 2, and the old version of this test
+    # then reported "the compaction never held the writer lock" —
+    # asserting the opposite of the truth about the property the
+    # round was about. Measured at 1 run in 60, and 98 of 400 when
+    # the two are deliberately contended.
+    #
+    # So: check the child's exit FIRST, and re-measure when the probe
+    # was the competitor. The probe is the only possible one here.
+    attempts = 0
+    while True:
+        attempts += 1
+        proc = _sp.Popen([_sys.executable, "-m", "surveillancehound.cli",
+                          "prune", str(cfg_path), "--offline-compact"],
+                         stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
+                         env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
         saw_held = False
         unguarded = 0
         samples = 0
         t0 = _t.monotonic()
-        while proc.poll() is None and _t.monotonic() - t0 < 120:
-            free = lock_is_free()
-            try:
-                same_inode = path.stat().st_ino == original_ino
-            except OSError:
-                same_inode = False
-            samples += 1
-            if not free:
-                saw_held = True
-            elif saw_held and same_inode:
-                # Lock free while the doomed inode is still in place:
-                # a daemon starting here writes into the file that is
-                # about to be replaced.
-                unguarded += 1
-        assert saw_held, (
-            f"the compaction never held the writer lock across "
-            f"{samples} samples, so a daemon starting at any point in "
-            f"the rebuild would be swapped out from under it")
-        assert unguarded == 0, (
-            f"the writer lock was free for {unguarded} of {samples} "
-            f"samples while the original file was still in place. The "
-            f"lock has to be HELD across the rebuild, not taken and "
-            f"released as a point-in-time check")
-    finally:
-        out, _ = proc.communicate(timeout=600)
-    assert proc.returncode == 0, out[-300:]
+        try:
+            while proc.poll() is None and _t.monotonic() - t0 < 120:
+                free = lock_is_free()
+                try:
+                    same_inode = path.stat().st_ino == original_ino
+                except OSError:
+                    same_inode = False
+                samples += 1
+                if not free:
+                    saw_held = True
+                elif saw_held and same_inode:
+                    # Lock free while the doomed inode is still in
+                    # place: a daemon starting here writes into the
+                    # file that is about to be replaced.
+                    unguarded += 1
+        finally:
+            out, _ = proc.communicate(timeout=600)
+        if proc.returncode != 0 and "open as a writer" in out:
+            assert attempts < 6, (
+                f"the probe stole the writer lock from the compaction "
+                f"{attempts} times running; that is no longer plausible "
+                f"as contention and something else refuses it: {out[-200:]}")
+            continue               # our fault; measure again
+        assert proc.returncode == 0, out[-300:]
+        break
+    assert saw_held, (
+        f"the compaction never held the writer lock across {samples} "
+        f"samples, so a daemon starting at any point in the rebuild "
+        f"would be swapped out from under it")
+    assert unguarded == 0, (
+        f"the writer lock was free for {unguarded} of {samples} "
+        f"samples while the original file was still in place. The "
+        f"lock has to be HELD across the rebuild, not taken and "
+        f"released as a point-in-time check")
     assert path.stat().st_ino != original_ino, "the swap did not happen"
     print(f"  swap safety: the writer lock stayed held for the whole "
           f"rebuild ({samples} samples, no unguarded moment)")
 
 
-def _check_compaction_preserves_ownership_and_tidies_up(tmp: Path) -> None:
+def _check_compaction_preserves_mode_and_tidies_up(tmp: Path) -> None:
     """The swapped-in file must keep the original's mode, and no
     temp file may survive a failure.
+
+    MODE only, unless run as root. The same code copies uid/gid and
+    that half cannot be exercised here — `os.chown` to a different
+    owner needs privilege — so the ownership assertion below is
+    skipped rather than quietly absent. It is the half that mattered
+    most in the field: on OPNsense the daemon runs as `hound` and the
+    only shell is root's.
 
     Round 21's HIGH had two halves and only one was tested: the
     replacement took the pruning process's umask, so a root-run
@@ -1169,6 +1273,7 @@ def _check_compaction_preserves_ownership_and_tidies_up(tmp: Path) -> None:
     _os.chmod(path, 0o600)
     before_mode = _os.stat(path).st_mode & 0o7777
     before_ino = _os.stat(path).st_ino
+    before_uid, before_gid = _os.stat(path).st_uid, _os.stat(path).st_gid
 
     held = HoundStore(path=path, exclusive=True, lock_wait=0.0)
     try:
@@ -1186,6 +1291,14 @@ def _check_compaction_preserves_ownership_and_tidies_up(tmp: Path) -> None:
         f"restart that would otherwise have fixed it")
     assert not Path(str(path) + ".vacuum.tmp").exists(), \
         "the rebuild left its temp file behind"
+    if _os.geteuid() == 0:
+        st_after = _os.stat(path)
+        assert (st_after.st_uid, st_after.st_gid) == (before_uid,
+                                                      before_gid), (
+            f"the rebuilt store is owned by {st_after.st_uid}:"
+            f"{st_after.st_gid}, was {before_uid}:{before_gid}. A "
+            f"root-run prune then hands the daemon a store it cannot "
+            f"write, and that survives the restart")
 
     # A rebuild that FAILS must also leave nothing behind.
     held = HoundStore(path=path, exclusive=True, lock_wait=0.0)
@@ -1209,8 +1322,51 @@ def _check_compaction_preserves_ownership_and_tidies_up(tmp: Path) -> None:
     finally:
         held._compact_into = real
         held.close()
-    print("  compaction hygiene: mode survives the swap, and neither a "
-          "success nor a failure leaves a temp file")
+    # N1: a leftover temp file from a kill mid-rebuild must be
+    # cleared BEFORE the free-space check, or it is counted against
+    # the space it is deciding about.
+    stale = Path(str(path) + ".vacuum.tmp")
+    stale.write_bytes(b"\0" * 4096)
+    held = HoundStore(path=path, exclusive=True, lock_wait=0.0)
+    try:
+        held.vacuum(offline=True)
+    finally:
+        held.close()
+    assert not stale.exists(), (
+        "a stale temp file from an interrupted rebuild survived the "
+        "next one. It is dead weight on the disk this command exists "
+        "to free, and the free-space precheck counts it against "
+        "itself")
+
+    # N2: a lock file the process cannot open must be a message, not
+    # a bare PermissionError out of the constructor — the database
+    # itself is perfectly writable.
+    if _os.geteuid() != 0:          # root can open anything
+        lock = Path(str(path) + ".writer")
+        lock.touch()
+        _os.chmod(lock, 0o000)
+        try:
+            try:
+                HoundStore(path=path, exclusive=True, lock_wait=0.0)
+                raise AssertionError(
+                    "an unopenable writer lock did not stop the store "
+                    "opening exclusive, so the lock is not actually "
+                    "held")
+            except RuntimeError as e:
+                assert "writer lock" in str(e), e
+            except PermissionError:
+                raise AssertionError(
+                    "an unopenable writer lock raised a bare "
+                    "PermissionError out of the constructor. That is a "
+                    "new way for a healthy daemon to refuse to start, "
+                    "and it names the lock file rather than the "
+                    "remedy") from None
+        finally:
+            _os.chmod(lock, 0o600)
+
+    print("  compaction hygiene: mode survives the swap, neither a "
+          "success nor a failure leaves a temp file, a stale one is "
+          "cleared, and an unopenable lock is a message")
 
 
 def _check_writer_lock_guards_the_swap(tmp: Path) -> None:
@@ -1525,8 +1681,26 @@ def _check_prune_relay_days_returns_bytes(tmp: Path) -> None:
         f"the space back, and it is the documented recovery for a "
         f"collector refusing every sensor at 507")
     assert "reclaimed" in out.stdout, out.stdout
+
+    # N4: the two "nothing came back" messages are path-specific, and
+    # the in-place one tells the operator to stop the daemon and use
+    # --offline-compact. Printing that ON the compacting path tells
+    # them to do what they just did.
+    import sys as _sys2
+    again = _sp.run([_sys2.executable, "-m", "surveillancehound.cli",
+                     "prune", str(cfg_path), "--offline-compact"],
+                    capture_output=True, text=True,
+                    env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    assert again.returncode == 0, again.stderr[-300:]
+    assert "already compact" in again.stdout, (
+        f"--offline-compact on an already-compact store printed the "
+        f"in-place advice: {again.stdout.strip()[:160]!r}")
+    assert "--offline-compact" not in again.stdout, (
+        f"it advised the operator to run the flag they just ran: "
+        f"{again.stdout.strip()[:160]!r}")
     print(f"  prune --relay-days: {before:,} -> {after:,} bytes returned "
-          f"to the filesystem")
+          f"to the filesystem; a second --offline-compact says so "
+          f"instead of repeating itself")
 
 
 def _check_collector_surfaces_show_relayed_rows(tmp: Path) -> None:
@@ -2105,7 +2279,8 @@ def _check_shutdown_flushes_the_relay(tmp: Path) -> None:
     assert src.index("drain") < src.index("final_flush"), (
         "final_flush runs before the in-RAM flows are drained, so the "
         "flows that drain produces are not in the last batch")
-    print("  shutdown: run() drains in-RAM flows, then flushes the relay")
+    print("  shutdown: run()'s source calls final_flush after the "
+          "drain (a wiring check, not a behavioural one)")
 
 
 def _check_disk_guard_needs_real_space(tmp: Path) -> None:
@@ -5924,11 +6099,12 @@ def main() -> int:
         _check_outage_rotation_window(Path(td))
         _check_resplit_always_makes_progress(Path(td))
         _check_clock_skew_does_not_destroy_data(Path(td))
+        _check_malformed_collector_response(Path(td))
         _check_prune_relay_days_returns_bytes(Path(td))
         _check_prune_does_not_outrun_a_live_daemon(Path(td))
         _check_writer_lock_guards_the_swap(Path(td))
         _check_lock_is_held_across_the_swap(Path(td))
-        _check_compaction_preserves_ownership_and_tidies_up(Path(td))
+        _check_compaction_preserves_mode_and_tidies_up(Path(td))
         _check_heartbeat_does_not_depend_on_uptime(Path(td))
         _check_no_realert_on_restart(Path(td))
         _check_writer_lock_survives_a_restart(Path(td))

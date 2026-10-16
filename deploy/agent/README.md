@@ -163,6 +163,27 @@ them here.
 - **An attacker on the agent host itself** can read the shared secret
   out of `hound.toml`. Nothing on the collector helps with that; it is
   the agent host's own security boundary.
+- **`hound prune --offline-compact` is not serialised against the
+  other writing subcommands.** It refuses while the DAEMON holds the
+  store, which is the case that matters. It does not refuse while
+  `sensors --forget`, `baselines --reset` or a plain `prune` is
+  running in another shell — those take no lock, because taking one
+  would mean refusing them whenever the daemon is up, which would be
+  worse. Measured, a concurrent writer across a compaction kept 9,652
+  of 62,750 rows. The failure is lost deletions or a `--forget` that
+  reports success and forgets nothing; it is operator-against-self,
+  both commands are manual, and neither is on the daemon's path.
+  Do not run two of them at once.
+- **Draining a very large spool is CPU- and write-heavy on the AGENT.**
+  `Spool.ack()` rewrites the whole spool file per delivered batch.
+  Measured at the stock 64 MiB `spool_max_bytes` with 2,011 batches
+  queued: about 0.57s of CPU and 70 MB rewritten per acknowledgement,
+  so roughly 19 CPU-minutes and 140 GB written to drain one long
+  outage — around 23% of a core for 84 minutes. Nothing is lost and
+  the collector is unaffected, but the agent runs the full pipeline
+  too, so that CPU competes with its own packet loop, and the writes
+  matter on an SD- or eMMC-booted NVR. Lower `spool_max_bytes` if
+  your agent is on flash and your outages are long.
 
 ## One daemon per store
 

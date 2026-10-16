@@ -104,6 +104,8 @@ hound snapshots <config>
 hound sensors <config>             # relayed sensors: last contact, reporting or not
 hound relay <config>               # relay health; on a collector, prints the cert pin
 hound prune <config> --flows-days 30 --alerts-days 90
+hound prune <config> --relay-days 7            # expire relayed rows, rebuild in place
+hound prune <config> --offline-compact         # STOP THE SERVICE FIRST; see below
 hound export <config>              # everything, including relayed rows
 hound config-check <config>        # validate, and report settings that do nothing
 hound web <config>
@@ -112,6 +114,37 @@ hound web <config>
 `config-check` is worth running after any edit: it reports sections this
 version ignores, so a mistyped `[storage]` surfaces there rather than as a
 daemon that starts, looks healthy, and monitors nothing.
+
+### One daemon per store
+
+The daemon holds an exclusive lock on `<store>.writer`, a zero-byte file
+beside the database, for as long as it runs. A second `hound run` or
+`hound replay` against the same store is refused rather than quietly
+corrupting it.
+
+Everything that only reads — `alerts`, `flows`, `devices`, `uptime`,
+`sensors`, `export`, `web` — ignores the lock entirely and works normally
+while the daemon runs, as do `prune --flows-days` and `prune --relay-days`.
+
+The exception is `prune --offline-compact`, the only command that REPLACES
+the database file. It needs room for the live data rather than roughly the
+whole file again, which is why it exists: on a disk too full for the
+in-place rebuild it is the way out. It refuses while the daemon holds the
+lock, because a file swap is invisible to a process that already has the
+old one open — that daemon would go on writing to an unlinked inode, with
+no error on either side.
+
+Two things not to do:
+
+- **Do not delete `<store>.writer`.** It is how one process can tell
+  another is running. Removing it while the daemon holds it lets the next
+  compaction conclude nothing is running and swap the database out from
+  under it.
+- **Do not put `[store].path` on NFS.** The lock depends on `flock`, which
+  is not guaranteed there; SQLite over NFS is unsupported anyway.
+
+A restart is unaffected: a starting daemon waits up to 60 seconds for its
+predecessor to finish draining.
 
 ## Uptime monitoring
 
