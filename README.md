@@ -101,7 +101,7 @@ hound devices <config>
 hound uptime <config> [--outages]
 hound baselines <config> [--camera IP | --reset IP | --reset-all]
 hound snapshots <config>
-hound sensors <config>             # relayed sensors: last contact, reporting or not
+hound sensors <config> [--forget ID]   # relayed sensors; --forget drops one's rows
 hound relay <config>               # relay health; on a collector, prints the cert pin
 hound prune <config> --flows-days 30 --alerts-days 90
 hound prune <config> --relay-days 7            # expire relayed rows, rebuild in place
@@ -124,7 +124,13 @@ corrupting it.
 
 Everything that only reads — `alerts`, `flows`, `devices`, `uptime`,
 `sensors`, `export`, `web` — ignores the lock entirely and works normally
-while the daemon runs, as do `prune --flows-days` and `prune --relay-days`.
+while the daemon runs, as do `prune --flows-days`, `prune --relay-days`,
+`sensors --forget` and `baselines --reset`.
+
+Those last two do WRITE, and they take no lock either, deliberately:
+locking them would mean refusing them whenever the daemon is up, which
+is worse. Do not run one at the same time as `prune --offline-compact`
+— see the note in `deploy/agent/README.md` about what that costs.
 
 The exception is `prune --offline-compact`, the only command that REPLACES
 the database file. It needs room for the live data rather than roughly the
@@ -145,6 +151,12 @@ Two things not to do:
   this; the same thing can already corrupt the store directly.
 - **Do not put `[store].path` on NFS.** The lock depends on `flock`, which
   is not guaranteed there; SQLite over NFS is unsupported anyway.
+
+`--offline-compact` has one other refusal: if some other connection is
+holding a read snapshot of the store, the write-ahead log cannot be
+checkpointed and the rebuild stops rather than discarding what is still
+in it. Close whatever else has the database open and re-run. It is safe
+and retryable — nothing is deleted and the temporary file is cleaned up.
 
 A restart is unaffected: a starting daemon waits up to 60 seconds for its
 predecessor to finish draining.

@@ -417,6 +417,19 @@ _HELP_TEXT: dict = {
          "what": "When [baseline] is enabled: this camera's flow is >= z_threshold "
                  "standard deviations from its learned per-(weekday, hour) envelope. "
                  "The summary names the feature (bytes, packets, etc.) that drifted."},
+        {"kind": "camera_to_camera",
+         "what": "Two cameras are talking to each other directly. Cameras normally "
+                 "speak only to the NVR, so this is either a misconfiguration or "
+                 "one camera being used to reach another."},
+        {"kind": "sensor_offline",
+         "what": "A relay SENSOR has stopped reporting to this collector. High "
+                 "severity, and it is a statement about the sensor, not its "
+                 "cameras: their rows read `unknown` with no availability figure "
+                 "until it comes back, because nothing is observing that segment."},
+        {"kind": "sensor_recovered",
+         "what": "A relay sensor that had stopped reporting is reporting again. "
+                 "Its camera rows become current from here; anything that happened "
+                 "during the gap was not observed by anyone."},
     ],
     "tips": [
         "If a camera is supposed to talk to a vendor cloud, add the cloud's CIDR to "

@@ -659,6 +659,161 @@ def _check_listener(tmp: Path) -> None:
         store.close()
 
 
+def _check_round25_fixes_are_guarded(tmp: Path) -> None:
+    """Four fixes shipped without a regression test. All four could
+    be reverted with the whole suite green.
+
+    None is a defect today; each is a way for one to come back
+    silently, which is how three of this feature's four worst bugs
+    reached a review in the first place.
+    """
+    import io as _io
+    import json as _json
+    import logging as _logging
+    import os as _os
+    from surveillancehound import ingest as _ing, relay as _R
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import AlertRow, HoundStore
+
+    # 1. `post_batch` must survive a response body it cannot parse.
+    #    `b"["*65536` fits inside the read cap and raises
+    #    RecursionError, which is neither JSONDecodeError nor
+    #    UnicodeDecodeError — it escaped the flush entirely, leaving
+    #    the batch neither acked nor dropped.
+    class _FakeResp:
+        status = 400
+
+        def read(self, n=None):
+            # Nested to the read cap: valid UTF-8, valid-looking
+            # JSON, and `json.loads` raises RecursionError on it.
+            return b"[" * (n or 65536)
+
+    class _FakeSock:
+        def getpeercert(self, binary_form=False):
+            return b"fake-der"
+
+    class _FakeConn:
+        def __init__(self, *a, **kw):
+            self.sock = _FakeSock()
+
+        def connect(self):
+            pass
+
+        def request(self, *a, **kw):
+            pass
+
+        def getresponse(self):
+            return _FakeResp()
+
+        def close(self):
+            pass
+
+    real_pin = _R.fingerprint_of
+    real_https = _R.http.client.HTTPSConnection
+    _R.http.client.HTTPSConnection = _FakeConn
+    _R.fingerprint_of = lambda der: "sha256:" + "ab" * 32
+    try:
+        status, payload = _R.post_batch(
+            "https://127.0.0.1:1/ingest/v1", b"{}", "k" * 20, "s", 1,
+            ["sha256:" + "ab" * 32])
+    except RecursionError:
+        raise AssertionError(
+            "RecursionError escaped post_batch. It is neither "
+            "JSONDecodeError nor UnicodeDecodeError, so it leaves the "
+            "flush with the batch neither acked nor dropped: the same "
+            "response every cycle forever, reported as healthy"
+        ) from None
+    finally:
+        _R.http.client.HTTPSConnection = real_https
+        _R.fingerprint_of = real_pin
+    assert status == 400 and payload == {}, (
+        f"an unparsable body gave {status} {payload!r}; it must "
+        f"degrade to an empty payload so the status still routes")
+
+    # 2. `last_seq` at the ceiling must be refused, not adopted: it
+    #    sets next_seq one past what the collector will accept, which
+    #    it then rejects 400 forever.
+    home = tmp / "r25"
+    home.mkdir()
+    store = HoundStore(path=home / "agent.sqlite")
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url="https://127.0.0.1:1/ingest/v1",
+        tls_fingerprint=["sha256:" + "ab" * 32],
+    )
+    client = RelayClient(cfg, store, now=lambda: T0)
+    store.insert_alert(AlertRow(
+        id=None, ts=T0, device_ip="10.0.0.1", kind="new_device",
+        severity="low", summary="x", detail="", dedup_key="ceil"))
+    client.enqueue()
+    real_post = _R.post_batch
+    _R.post_batch = lambda *a, **k: (409, {"last_seq": _R._MAX_SAFE_SEQ})
+    try:
+        client.flush()
+    finally:
+        _R.post_batch = real_post
+    assert client.state.next_seq < _R._MAX_SAFE_SEQ, (
+        f"next_seq is {client.state.next_seq}, at or past the "
+        f"collector's own ceiling. Every later batch is then refused "
+        f"400 for an implausible sequence, permanently")
+    store.close()
+
+    # 3. The low-disk refusal must still normalise the lock sidecar.
+    #    It is the full-disk case the command exists for, and under
+    #    the umask configd uses the daemon cannot read a root-created
+    #    lock file and will not start.
+    import inspect as _ins
+    compact_src = _ins.getsource(HoundStore._compact_offline)
+    norm = compact_src.index("_match_store_ownership")
+    refuse = compact_src.index("return before")
+    assert norm < refuse, (
+        "the lock sidecar is normalised AFTER the low-disk return, so "
+        "the one path this command exists for leaves `<store>.writer` "
+        "with the pruning shell's umask")
+
+    # 4. The validation-rejection log must be throttled: a valid key
+    #    holder sets its rate.
+    collector = HoundStore(path=tmp / "rej.sqlite")
+    srv = _ing.IngestServer(_collector_cfg(0), collector, now=lambda: T0)
+    seen = []
+
+    class _Grab(_logging.Handler):
+        def emit(self, rec):
+            seen.append(rec.levelno)
+
+    grab = _Grab()
+    lg = _logging.getLogger("surveillancehound.ingest")
+    lg.addHandler(grab)
+    try:
+        for i in range(40):
+            bad = _R.build_batch(
+                "frigate", "inst-aaaa1111", i + 1,
+                {"devices": [{"ip": "not-an-ip", "role": "camera",
+                              "first_seen": T0, "last_seen": T0,
+                              "packet_count": 1, "byte_count": 1}],
+                 "flows": [], "alerts": [], "outages": [], "uptime": [],
+                 "monitor": None}, T0)
+            status, _ = srv.handle_batch(
+                "10.0.0.9", bad,
+                {_R.SENSOR_HEADER: "frigate",
+                 _R.SIG_HEADER: _R.sign("shared-secret-abcdef", bad)})
+            assert status == 400, status
+    finally:
+        lg.removeHandler(grab)
+        collector.close()
+    warns = [lv for lv in seen if lv >= _logging.WARNING]
+    assert len(warns) == 1, (
+        f"40 rejected batches produced {len(warns)} warnings. A valid "
+        f"key holder sets the rate here, at 60 requests/minute per "
+        f"source with no limit on addresses — the 401 and "
+        f"instance-reset branches beside it are throttled for exactly "
+        f"this")
+    print("  round-25 fixes: decode envelope, last_seq ceiling, "
+          "sidecar normalisation order and reject-log throttle all "
+          "guarded")
+
+
 def _check_malformed_collector_response(tmp: Path) -> None:
     """A strange answer from the collector must not stall the agent.
 
@@ -3171,8 +3326,28 @@ def _check_alert_kinds_cannot_drift(tmp: Path) -> None:
     assert V.ALERT_KINDS == emitted, (
         f"ALERT_KINDS accepts kinds nothing emits: "
         f"{sorted(V.ALERT_KINDS - emitted)}")
+
+    # The dashboard's help modal makes the same promise and drifted
+    # the same way. README.md says it "explains every alert kind";
+    # it listed 10 of 13, and the three missing included
+    # `sensor_offline`, which is HIGH severity and lands in the
+    # collector's own alerts table — so a relay operator saw it in
+    # the stream with no explanation on the surface that claims to
+    # have one.
+    from surveillancehound import web as _web
+
+    documented = {e["kind"] for e in _web._HELP_TEXT["alert_kinds"]}
+    missing = emitted - documented
+    assert not missing, (
+        f"the dashboard help modal does not explain {sorted(missing)}. "
+        f"README.md says it explains every alert kind, and an operator "
+        f"reading an alert they cannot look up is the gap that surface "
+        f"exists to close")
+    stale = documented - emitted
+    assert not stale, (
+        f"the help modal explains kinds nothing emits: {sorted(stale)}")
     print(f"  alert kinds: all {len(emitted)} KIND_ constants are "
-          f"relayable, derived not listed")
+          f"relayable AND explained in the dashboard help")
 
 
 def _check_damaged_spool_line(tmp: Path) -> None:
@@ -6188,6 +6363,7 @@ def main() -> int:
         _check_resplit_always_makes_progress(Path(td))
         _check_clock_skew_does_not_destroy_data(Path(td))
         _check_malformed_collector_response(Path(td))
+        _check_round25_fixes_are_guarded(Path(td))
         _check_prune_relay_days_returns_bytes(Path(td))
         _check_prune_does_not_outrun_a_live_daemon(Path(td))
         _check_writer_lock_guards_the_swap(Path(td))

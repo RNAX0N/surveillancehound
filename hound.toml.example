@@ -330,6 +330,24 @@ keep      = 5
 # which costs a cycle instead of the data; configuring both ends costs
 # nothing at all.
 # min_free_disk_mb      = 256.0    # refuse ingest below this; 0 disables
+# max_batches_per_minute = 60      # PER SOURCE ADDRESS, counting both the
+#                                  # connection and the request. A replaying
+#                                  # agent costs 48/min; see the NAT note.
+# clock_skew_seconds    = 300.0    # reject batches stamped outside this window.
+#                                  # The agent keeps a rejected one spooled and
+#                                  # retries, so a wrong clock delays rather
+#                                  # than destroys — fix NTP and it catches up.
+# sensor_timeout_seconds = 180.0   # after this, a sensor reads NOT REPORTING
+#                                  # and its cameras read `unknown`
+#
+# Agent-side keys, shown here because the troubleshooting docs refer to
+# them; set them in the AGENT's config, not this one:
+# batch_seconds         = 30.0     # push cadence
+# spool_max_bytes       = 67108864 # 64 MB. Lower it on an SD/eMMC-booted
+#                                  # NVR: draining a full spool rewrites the
+#                                  # file once per delivered batch.
+# spool_max_age_seconds = 86400.0  # 24h; whichever cap is hit first drops
+#                                  # the oldest, and the drop is counted
 #
 # NOTE on NAT: the ingest limits key on SOURCE ADDRESS, so agents behind
 # one NAT share a connection cap and a batch budget — and it bites
