@@ -964,7 +964,8 @@ class Hound:
                 seen = self._relay_last_dispatch.get(k)
                 if seen is not None and (now - seen) < window:
                     return
-        sent = self._relay_last_dispatch.get(dkey)
+        with self._relay_stats_lock:
+            sent = self._relay_last_dispatch.get(dkey)
         # 2) What we RECEIVED before this process started, so a restart
         #    does not re-notify the backlog. Measured on ingested_at —
         #    collector time — never the sensor-supplied ts, which would

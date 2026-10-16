@@ -41,6 +41,11 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# Matches the collector's default [relay].max_records_per_batch. The
+# agent cannot see the collector's config, so it self-limits to the
+# documented default rather than discovering the cap by rejection.
+_MAX_RECORDS_PER_KIND = 5000
+
 SCHEMA_VERSION = 1
 SIG_HEADER = "X-Hound-Signature"
 SENSOR_HEADER = "X-Hound-Sensor"
@@ -166,7 +171,12 @@ class Spool:
             self.dropped_size = int(d.get("dropped_size", 0))
             self.dropped_age = int(d.get("dropped_age", 0))
             self.dropped_stale = int(d.get("dropped_stale", 0))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, ArithmeticError,
+                AttributeError, json.JSONDecodeError):
+            # ArithmeticError covers OverflowError, which int() raises on
+            # a JSON `1e400` (parsed as inf) and which is NOT a
+            # ValueError — the gap that let a diagnostic file stop the
+            # monitor even after this was supposedly made best-effort.
             log.warning("relay: unreadable spool counters at %s; the "
                         "drop totals restart from zero", self.counters_path)
             self.dropped_size = self.dropped_age = self.dropped_stale = 0
@@ -389,12 +399,15 @@ class AgentState:
         if path.is_file():
             try:
                 d = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(d, dict):
+                    raise TypeError("state file is not an object")
                 st.instance_id = str(d.get("instance_id", ""))
                 st.next_seq = int(d.get("next_seq", 1))
                 st.watermark = Watermark.from_dict(d.get("watermark", {}))
                 st.last_push_ts = float(d.get("last_push_ts", 0.0))
                 st.last_error = str(d.get("last_error", ""))
-            except (json.JSONDecodeError, ValueError, TypeError):
+            except (OSError, json.JSONDecodeError, ValueError, TypeError,
+                    ArithmeticError, AttributeError):
                 log.warning("relay: unreadable state file, starting fresh")
         if not st.instance_id and not readonly:
             st.instance_id = secrets.token_hex(8)
@@ -551,9 +564,20 @@ class RelayClient:
         outages = self.store.outages_changed_since(
             wm.outage_id, open_ids=wm.open_outage_ids)
         devices = self.store.devices_changed_since(wm.reported_at)
+        # Capped like every other collector here. uptime_report returns
+        # one row per camera with no limit, so a sensor with more
+        # cameras than the collector's max_records_per_batch had EVERY
+        # batch rejected 400 and dropped — permanent, silent, total
+        # loss with no backpressure signal. Truncating degrades to
+        # "some cameras reported" instead.
         uptime = self.store.uptime_report(
             self.cfg_report_window(), self.now(),
-        )
+        )[:_MAX_RECORDS_PER_KIND]
+        if len(uptime) == _MAX_RECORDS_PER_KIND:
+            log.warning(
+                "relay: more than %d cameras to report; truncating the "
+                "uptime snapshot. Raise the collector's "
+                "[relay] max_records_per_batch.", _MAX_RECORDS_PER_KIND)
         return {
             "devices": [
                 {"ip": d["ip"], "role": d["role"], "first_seen": d["first_seen"],
@@ -662,7 +686,15 @@ class RelayClient:
                     if self.state.next_seq <= last:
                         self.state.next_seq = last + 1
                         self.state.save()
-            elif status in (400, 401):
+            elif status in (400, 401, 413):
+                # 413 belongs here, not in the retry branch. It is
+                # permanent — the body is too large and will be exactly
+                # as large next cycle — so retrying wedges the head of
+                # the spool forever and nothing behind it moves until
+                # the age cap discards a day of data. Reachable without
+                # malice: max_body_bytes and max_records_per_batch are
+                # independent, so 5000 alerts with long summaries can
+                # exceed 8 MB.
                 # Malformed or unauthorised: retrying cannot help.
                 self.spool.drop(seq, f"rejected with {status}: "
                                      f"{payload.get('error', '')[:120]}")

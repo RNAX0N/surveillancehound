@@ -333,7 +333,13 @@ class IngestServer:
 
         return HTTPStatus.OK, {
             "status": "ok", "ack_seq": seq,
-            "accepted": counts.get("total", 0), "server_time": now,
+            "accepted": counts.get("total", 0),
+            # Housekeeping that ran in the same transaction. Separate
+            # from `accepted` because they measure different things,
+            # and on the wire because an agent that only sees
+            # `accepted` cannot tell a quota from a quiet collector.
+            "trimmed": counts.get("trimmed", 0),
+            "server_time": now,
         }
 
 

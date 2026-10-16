@@ -2178,28 +2178,41 @@ def _check_outage_close_is_relayed(tmp: Path) -> None:
                 "last_seen_before, cause) VALUES ('10.0.0.5',?,NULL,"
                 "0.0,'silence')", (T0,))
 
-        wm = Watermark()
+        # Drive the REAL RelayClient: collect() + _advance(), not a
+        # re-implementation of them. A test that reproduces the
+        # watermark logic inline passes just as happily when the
+        # production code is reverted, which is how this project has
+        # twice shipped a "fix" that never landed.
+        from surveillancehound.relay import RelayClient
+        from surveillancehound.config import load_from_dict as _lfd
+
+        acfg = _lfd({
+            "capture": {"interface": "test0"},
+            "network": {"camera_ips": ["10.0.0.5"]},
+            "store": {"path": str(tmp / "agent-out.sqlite")},
+            "relay": {
+                "mode": "agent", "sensor_id": "frigate",
+                "url": "https://10.0.0.250:18443/ingest/v1",
+                "key": "shared-secret-abcdef",
+                "tls_fingerprint": ["sha256:" + "ab" * 32],
+            },
+        })
+        client = RelayClient(acfg.relay, agent, now=lambda: T0)
         seq = 0
 
         def cycle() -> None:
-            nonlocal wm, seq
+            """One real collect+advance, then hand the records over."""
+            nonlocal seq
             seq += 1
-            rows = agent.outages_changed_since(
-                wm.outage_id, open_ids=wm.open_outage_ids)
-            if rows:
-                recs = V.validate_records({"outages": [{
-                    "remote_id": r["id"], "camera_ip": r["camera_ip"],
-                    "down_since": r["down_since"], "up_at": r["up_at"],
-                    "last_seen_before": r["last_seen_before"],
-                    "cause": r["cause"],
-                } for r in rows]}, 100)
+            records, new_wm = client.collect()
+            outs = records.get("outages", [])
+            if outs:
+                recs = V.validate_records({"outages": outs}, 100)
                 collector.ingest_remote_batch(
                     "frigate", "inst-aaaa1111", seq, recs, T0 + seq)
-            wm = Watermark(
-                outage_id=max([wm.outage_id] + [r["id"] for r in rows]),
-                open_outage_ids=[r["id"] for r in rows
-                                 if r["up_at"] is None],
-            )
+            client.state.watermark = new_wm
+
+        wm_of = lambda: client.state.watermark
 
         cycle()
         cycle()
@@ -2225,11 +2238,10 @@ def _check_outage_close_is_relayed(tmp: Path) -> None:
         )
 
         # And the id drains out of the carry-forward list.
-        assert wm.open_outage_ids == [] or wm.open_outage_ids == [1]
         cycle()
-        assert wm.open_outage_ids == [], (
+        assert wm_of().open_outage_ids == [], (
             f"a closed outage stayed in the re-send list: "
-            f"{wm.open_outage_ids}"
+            f"{wm_of().open_outage_ids}"
         )
 
         # The watermark must survive a restart with the list intact.
@@ -2292,13 +2304,52 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
                 waits.append(_t.time() - t0)
                 _t.sleep(0.02)
 
-        # One writer at a time, as the listener enforces.
-        slot = threading.Semaphore(1)
+        # Go through the REAL IngestServer.handle_batch, so the
+        # serialisation under test is the production one. Wrapping a
+        # locally-made Semaphore around the store call tested the
+        # premise and would have passed with `_write_slot` deleted.
+        import ssl as _ssl
+
+        from surveillancehound import relay as _R
+        from surveillancehound.ingest import IngestServer
+
+        icfg = _collector_cfg(
+            0, max_records_per_batch=cap,
+            sensors=[__import__(
+                "surveillancehound.config", fromlist=["RelaySensorCfg"]
+            ).RelaySensorCfg(id=f"s{i}", key="shared-secret-abcdef")
+                for i in range(8)],
+        )
+        server = IngestServer(icfg, store, now=_t.time)
+
+        peak_concurrent = [0]
+        live = [0]
+        conc_lock = threading.Lock()
+        real_ingest = store.ingest_remote_batch
+
+        def _counting(*a, **kw):
+            with conc_lock:
+                live[0] += 1
+                peak_concurrent[0] = max(peak_concurrent[0], live[0])
+            try:
+                return real_ingest(*a, **kw)
+            finally:
+                with conc_lock:
+                    live[0] -= 1
+
+        store.ingest_remote_batch = _counting
 
         def write(i: int) -> None:
-            with slot:
-                store.ingest_remote_batch(
-                    f"s{i}", "inst-aaaa1111", 1, batches[i], _t.time())
+            body = _R.build_batch(
+                f"s{i}", "inst-aaaa1111", 1,
+                {"flows": batches[i]["flows"], "alerts": [], "devices": [],
+                 "outages": [], "uptime": [], "monitor": None},
+                _t.time())
+            status, _ = server.handle_batch(
+                "10.0.0.9", body,
+                {_R.SENSOR_HEADER: f"s{i}",
+                 _R.SIG_HEADER: _R.sign("shared-secret-abcdef", body)})
+            assert status == 200, status
 
         t = threading.Thread(target=tick, daemon=True)
         t.start()
@@ -2310,6 +2361,19 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
         stop.set()
         _t.sleep(0.1)
 
+        # The LOAD-BEARING assertion: at no point were two relayed
+        # writes inside the store at once. A timing threshold alone
+        # does not catch a regression here — raising the semaphore to
+        # 64 leaves the wall-clock numbers on this fixture unchanged,
+        # so only the concurrency invariant actually protects the fix.
+        assert peak_concurrent[0] == 1, (
+            f"{peak_concurrent[0]} relayed writes were inside the store "
+            f"simultaneously. They queue on the store lock, the watchdog "
+            f"tick waits on it while holding _loop_lock, and the packet "
+            f"loop waits on that — so concurrent ingest is measured in "
+            f"seconds of blind capture"
+        )
+
         worst = max(waits)
         assert worst < 5.0, (
             f"a tick waited {worst:.1f}s on the store lock behind relayed "
@@ -2317,8 +2381,9 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
             f"pipe fills in milliseconds — this is the collector going "
             f"blind because a remote host sent data"
         )
-        print(f"  capture coupling: worst tick wait {worst:.2f}s, median "
-              f"{statistics.median(waits):.3f}s under 8 concurrent batches")
+        print(f"  capture coupling: {peak_concurrent[0]} concurrent store "
+              f"writer(s); worst tick wait {worst:.2f}s, median "
+              f"{statistics.median(waits):.3f}s")
     finally:
         store.close()
 
