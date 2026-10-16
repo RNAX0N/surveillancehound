@@ -48,10 +48,13 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 # A heartbeat newer than this means the daemon is running. A SECOND
-# opinion only — see `_writer_lock_path`. The heartbeat is written
-# from `UptimeTracker.tick`, so with `[uptime] enabled = false` it is
-# never written at all and "no heartbeat" cannot be read as "no
-# daemon".
+# opinion only — the writer lock is the guard; see
+# `_require_no_writer`. It used to be the ONLY check, and it was
+# written solely from `UptimeTracker.tick`, so with
+# `[uptime] enabled = false` it was never written and "no heartbeat"
+# read as "no daemon". `daemon._tick` writes it unconditionally now,
+# but a heartbeat still cannot prove absence: a daemon that started
+# a moment ago has not written one yet.
 _DAEMON_ALIVE_S = 120.0
 # How long a starting daemon waits for a predecessor to let go of the
 # writer lock. Longer than a clean shutdown's drain, so a restart is
@@ -574,7 +577,8 @@ class HoundStore:
     workload (camera traffic is hundreds of packets/sec, not millions)."""
 
     def __init__(self, path: Path, readonly: bool = False,
-                 exclusive: bool = False) -> None:
+                 exclusive: bool = False,
+                 lock_wait: float | None = None) -> None:
         """`readonly=True` for diagnostics and the dashboard.
 
         A reader has no business creating the store, creating its parent
@@ -617,7 +621,7 @@ class HoundStore:
         # dashboard do not: they are short-lived and must not lock the
         # daemon out of its own store.
         if exclusive:
-            self._take_writer_lock()
+            self._take_writer_lock(lock_wait)
         self._connect()
         with self._conn:
             self._drop_prerelease_relay_tables()
@@ -1849,21 +1853,31 @@ class HoundStore:
         disk this command is the documented recovery for, the plain
         form cannot run and this one can.
 
-        THE GUARD IS THE WRITER LOCK, not the heartbeat. The heartbeat
-        version of this check did not exist when `[uptime] enabled =
-        false`, because `set_heartbeat` is only called from
-        `UptimeTracker.tick` and the tracker is only built when uptime
-        is on. With uptime off, `heartbeat()` returns (0.0, 0.0), the
-        check was skipped, and the file was swapped under a live
-        daemon: measured 46,444 of 287,586 rows (16%) written to an
-        unlinked inode in one run, 89% in another — the fraction is
-        just how much of the run falls after the swap, and all of it
-        does. It was also open for the first few seconds of any
-        daemon's life, before its first tick.
+        THE GUARD IS THE WRITER LOCK, HELD THROUGHOUT. Two earlier
+        versions of this guard were defeated in two different ways,
+        and both lost every write a concurrent daemon made:
 
-        `flock` is a positive test and needs no config: the daemon
-        holds it for its whole life and the kernel releases it when
-        the process dies, so a crash does not wedge this command.
+        * A heartbeat check. `set_heartbeat` was called only from
+          `UptimeTracker.tick`, which the daemon builds only when
+          `[uptime] enabled` — so with uptime off the row was never
+          written, `heartbeat()` returned (0.0, 0.0) and the check
+          was skipped entirely. Measured 46,444 of 287,586 rows (16%)
+          written to an unlinked inode in one run and 74% in another;
+          the fraction is only how much of the run falls after the
+          swap, and all of it does.
+        * Taking the lock and releasing it again. That proves "no
+          daemon at this instant" and then does the slow part —
+          `VACUUM INTO` over the live dataset, the WAL teardown,
+          `os.replace` — unprotected. Measured 9,680 of 9,680 rows
+          lost through a 1.1s window on a 400 MB store; on a 1-vCPU
+          appliance that window is minutes. On OPNsense any GUI save
+          runs `hound onerestart`, so a second admin on the settings
+          page walks straight into it.
+
+        So the lock is taken by the CALLER, for the whole operation:
+        `cmd_prune` opens the store `exclusive=True` when compacting.
+        `flock` needs no config, and the kernel releases it when the
+        process dies, so a crash cannot wedge this command.
         """
         self._require_no_writer()
         live = self._live_bytes()
@@ -1922,7 +1936,29 @@ class HoundStore:
     def _writer_lock_path(self) -> Path:
         return Path(str(self.path) + ".writer")
 
-    def _take_writer_lock(self) -> None:
+    def _open_lock_file(self):
+        try:
+            return open(self._writer_lock_path(), "a+b")
+        except OSError as e:
+            # A `.writer` the daemon cannot open — wrong owner or
+            # mode — raised a bare PermissionError out of the
+            # constructor, which is a new way for an otherwise
+            # healthy daemon to refuse to start while its actual
+            # database is perfectly writable.
+            raise RuntimeError(
+                f"cannot open the writer lock {self._writer_lock_path()}: "
+                f"{e}. It must be writable by the user running the "
+                f"daemon; the store itself is fine."
+            ) from None
+
+    def _lock_inode_matches(self, fh) -> bool:
+        try:
+            return (os.fstat(fh.fileno()).st_ino
+                    == os.stat(self._writer_lock_path()).st_ino)
+        except OSError:
+            return False
+
+    def _take_writer_lock(self, wait: float | None = None) -> None:
         """Claim this store as THE writer. Raises if another holds it.
 
         The project's invariant is already one writer per store
@@ -1936,7 +1972,7 @@ class HoundStore:
         """
         if fcntl is None:
             return
-        fh = open(self._writer_lock_path(), "a+b")
+        fh = self._open_lock_file()
         # Brief retry, because the common case for contention is a
         # RESTART, not a second daemon. `service hound restart` can
         # start the new process while the old one is still draining —
@@ -1945,51 +1981,97 @@ class HoundStore:
         # would turn a restart into an outage. FreeBSD's `daemon -r -R
         # 5` would eventually retry, but only after logging a failure
         # that looks like a real fault.
-        deadline = time.monotonic() + _WRITER_LOCK_WAIT_S
+        # The DAEMON waits: its usual competitor is its own
+        # predecessor still draining, and failing instantly there
+        # turns every restart into an outage. A one-shot command
+        # passes 0 — it has an operator in front of it who would
+        # rather be told to stop the service now than watch a cursor
+        # blink for a minute first.
+        budget = _WRITER_LOCK_WAIT_S if wait is None else max(0.0, wait)
+        deadline = time.monotonic() + budget
         while True:
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
+                # `flock` is on the open file, not the name. If the
+                # lock file was replaced or removed between our open
+                # and our lock, we are holding an inode nobody else
+                # will consult — and a second process would create a
+                # fresh one and conclude no daemon is running.
+                if self._lock_inode_matches(fh):
+                    break
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                fh.close()
+                fh = self._open_lock_file()
+                continue
             except OSError:
                 if time.monotonic() >= deadline:
                     fh.close()
+                    waited = (f", and still had it after {budget:.0f}s"
+                              if budget else "")
                     raise RuntimeError(
                         f"another process already has {self.path} open "
-                        f"as a writer, and still had it after "
-                        f"{_WRITER_LOCK_WAIT_S:.0f}s. Only one daemon "
-                        f"may write a store; check for a running "
-                        f"`hound run`."
+                        f"as a writer{waited}. Only one process may "
+                        f"write a store — stop the daemon "
+                        f"(`service hound stop`, `systemctl stop "
+                        f"hound`) and re-run."
                     ) from None
                 time.sleep(0.25)
         self._writer_fh = fh
 
     def _require_no_writer(self) -> None:
-        """Refuse unless we can prove no daemon holds this store."""
+        """Refuse unless no daemon holds this store — AND KEEP IT THAT WAY.
+
+        The first version took the lock and dropped it again in a
+        `finally`, proving only "no daemon at this instant". Every
+        expensive step then ran unprotected: `VACUUM INTO` over the
+        whole live dataset, the WAL teardown, `os.replace`. A daemon
+        starting inside that window took the lock unopposed and wrote
+        to the inode we were about to unlink. Measured on a 400 MB
+        store with a 1.1s window: 9,680 of 9,680 rows lost, silently,
+        on both sides — and on a 1-vCPU appliance with slow storage
+        that window is tens of seconds to minutes, during which the
+        command prints nothing.
+
+        It is not only operator impatience: on OPNsense ANY save in
+        the Hound GUI runs configd -> reload.sh -> `hound onerestart`,
+        so a second admin touching the settings page restarts the
+        daemon straight into it.
+
+        So the caller must already HOLD the lock for the whole
+        operation. `cmd_prune` opens the store with
+        `exclusive=True` when compacting, and this returns
+        immediately in that case — re-opening the path here would
+        self-deadlock, because flock is per open file description,
+        not per process.
+        """
+        if self._writer_fh is not None:
+            return                 # we hold it, for the whole swap
         if fcntl is not None:
-            try:
-                fh = open(self._writer_lock_path(), "a+b")
-            except OSError as e:
-                raise RuntimeError(
-                    f"cannot open the writer lock beside {self.path}: "
-                    f"{e}"
-                ) from None
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                raise RuntimeError(
-                    "the daemon holds this store open. Compacting "
-                    "swaps the database file underneath it, and "
-                    "everything it writes afterwards goes to a file "
-                    "nothing will ever read. Stop the service, then "
-                    "re-run."
-                ) from None
-            finally:
-                fh.close()
+            # No lock of our own: refuse rather than guess. The only
+            # way to reach this is a caller that did not open the
+            # store exclusive, and proving "nobody right now" is not
+            # the property this needs.
+            raise RuntimeError(
+                "internal: the store must be opened with "
+                "exclusive=True before compacting, so the writer lock "
+                "is held for the whole swap"
+            )
         # Second opinion, for a daemon too old to take the lock. Not
-        # load-bearing: with `[uptime] enabled = false` the heartbeat
-        # is never written, so this cannot be the only check.
+        # load-bearing, and it never could be: a heartbeat cannot
+        # prove ABSENCE. A daemon that started a moment ago has not
+        # written one yet, and before `daemon._tick` wrote it
+        # unconditionally a daemon with `[uptime] enabled = false`
+        # never wrote one at all.
         _, updated = self.heartbeat()
-        if updated and (time.time() - updated) < _DAEMON_ALIVE_S:
+        # abs(): a heartbeat AHEAD of the clock — a backwards clock
+        # step, or a replay of a future-dated capture, which sets the
+        # daemon's clock from packet timestamps — made this difference
+        # negative, so the check fired forever and the message's
+        # "allow up to 120s after stopping" could never be satisfied.
+        # A future heartbeat is still a reason to be careful, so it
+        # refuses rather than being ignored; the writer lock above has
+        # already given the real answer in either case.
+        if updated and abs(time.time() - updated) < _DAEMON_ALIVE_S:
             raise RuntimeError(
                 f"the daemon wrote its heartbeat "
                 f"{time.time() - updated:.0f}s ago, so it is running. "

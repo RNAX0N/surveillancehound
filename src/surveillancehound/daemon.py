@@ -560,8 +560,17 @@ class Hound:
         # The lock in `store._take_writer_lock` is what actually
         # guards that swap now, but a liveness row that exists only
         # under one optional feature is wrong on its own terms.
-        self.store.set_heartbeat(self._last_tick_packet_at or 0.0, now)
-        if self.uptime is not None:
+        #
+        # Only when the tracker is absent: `UptimeTracker.tick` writes
+        # the same row from `observe_packet`, which is also "some
+        # packet was seen" and is the richer source because it is
+        # updated per packet rather than per tick. Writing both left
+        # two callers for one row, with the tracker's value always
+        # winning — harmless, but it invites a reader to assume the
+        # column means whichever of the two they found first.
+        if self.uptime is None:
+            self.store.set_heartbeat(self._last_tick_packet_at or 0.0, now)
+        else:
             for tr in self.uptime.tick(self.store, now, saw_packets=saw):
                 self._on_transition(tr, now)
         # 3) write baselines back to disk on cadence (no-op if disabled)

@@ -164,6 +164,30 @@ them here.
   out of `hound.toml`. Nothing on the collector helps with that; it is
   the agent host's own security boundary.
 
+## One daemon per store
+
+The daemon holds an exclusive `flock` on `<store>.writer`, a
+zero-byte file beside the database, for as long as it runs. A second
+`hound run` or `hound replay` against the same store is refused
+rather than quietly corrupting it, and `hound prune
+--offline-compact` — the only command that replaces the database
+file — refuses while that lock is held, because `os.replace` is
+invisible to a process that already has the old file open.
+
+Three things worth knowing:
+
+- **Do not delete the `.writer` file.** It is how a second process
+  can tell a daemon is running. Removing it while the daemon holds
+  it makes the next compaction create a fresh one, conclude nothing
+  is running, and swap the database out from under the daemon.
+- **Keep `[store].path` on local storage.** `flock` over NFS depends
+  on `lockd` and is not guaranteed; SQLite over NFS is unsupported
+  anyway.
+- **A restart is not blocked by it.** A starting daemon waits up to
+  60 seconds for its predecessor to finish draining, so
+  `service hound restart` behaves normally. Readers (`hound alerts`,
+  the dashboard, `hound export`) never take the lock at all.
+
 ## Why host networking
 
 `network_mode: host` is required, not a convenience. A bridged container

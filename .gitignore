@@ -13,6 +13,8 @@ dist/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+# Writer lock sidecar — see HoundStore._take_writer_lock.
+*.sqlite.writer
 *.log
 *.jsonl
 

@@ -793,7 +793,18 @@ def cmd_snapshots(args: argparse.Namespace) -> int:
 
 def cmd_prune(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
-    store = HoundStore(path=cfg.store.path)
+    # exclusive when compacting: `--offline-compact` swaps the
+    # database file, and the writer lock has to be held for the WHOLE
+    # operation, not merely checked at the start. Taking it here also
+    # means a daemon that starts mid-compaction is refused rather
+    # than silently writing to the inode we are about to unlink.
+    # lock_wait=0: fail fast. The daemon waits a minute for a
+    # draining predecessor because a restart should not be an outage;
+    # a prune has an operator watching it and should say "stop the
+    # service" immediately rather than after sixty silent seconds.
+    store = HoundStore(path=cfg.store.path,
+                       exclusive=bool(args.offline_compact),
+                       lock_wait=0.0)
     try:
         now = time.time()
         kwargs = {}
@@ -859,13 +870,21 @@ def cmd_prune(args: argparse.Namespace) -> int:
                 # room for the live data but requires the daemon to be
                 # stopped, because it swaps the file and a running
                 # daemon would keep writing to the old inode.
-                print(f"store is {before:,} bytes; rows were deleted but "
-                      f"no space was returned to the filesystem. The "
-                      f"freed pages are reusable in place, so ingest is "
-                      f"not blocked by this. To shrink the file, free "
-                      f"about {before * 2 / 1e6:,.0f} MB and re-run — or "
-                      f"stop the daemon and re-run with "
-                      f"--offline-compact, which needs far less.")
+                if args.offline_compact:
+                    # Already on the compacting path, so the in-place
+                    # advice below is wrong: it would tell the
+                    # operator to do what they just did.
+                    print(f"store is {before:,} bytes and already "
+                          f"compact; nothing to reclaim.")
+                else:
+                    print(f"store is {before:,} bytes; no space was "
+                          f"returned to the filesystem. Any freed "
+                          f"pages are reusable in place, so ingest is "
+                          f"not blocked by this. To shrink the file, "
+                          f"free about {before * 2 / 1e6:,.0f} MB and "
+                          f"re-run — or stop the daemon and re-run "
+                          f"with --offline-compact, which needs room "
+                          f"only for the live data.")
         if not any(deleted.values()):
             print("nothing to prune")
         else:

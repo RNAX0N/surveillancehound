@@ -825,6 +825,31 @@ def _check_resplit_always_makes_progress(tmp: Path) -> None:
     assert sorted(seen_ips) == ["10.0.0.1", "10.0.0.1"], (
         f"the split did not conserve records: {seen_ips}")
 
+    # 2a. A 413 that cannot be split must reach the DROP branch, not
+    #     the retry branch. Moving 413 out of that branch left a
+    #     permanently-oversized single record retried forever, which
+    #     wedges the head of the spool — the exact failure the
+    #     terminal treatment of 413 exists to prevent.
+    import inspect as _inspect
+    from surveillancehound.relay import RelayClient as _RC
+    _flush_src = _inspect.getsource(_RC._flush_locked)
+    _flush_src = "\n".join(
+        line.split("#", 1)[0] for line in _flush_src.splitlines())
+    assert "413" in _flush_src.split("spool.drop")[0].split(
+        "elif status in")[-1] or "413" in _flush_src, _flush_src[:200]
+    import re as _re
+    _drop_branch = _re.search(
+        r"elif status in \(([^)]*)\):\s*\n(?:[^\n]*\n)*?"
+        r"[^\n]*self\.spool\.drop", _flush_src)
+    assert _drop_branch is not None, (
+        "could not find the branch that drops a rejected batch")
+    assert "413" in _drop_branch.group(1), (
+        f"413 is not in the drop branch (found "
+        f"{_drop_branch.group(1).strip()!r}). A 413 the splitter "
+        f"cannot narrow is permanent — the body will be exactly as "
+        f"large next cycle — so retrying it wedges the spool head and "
+        f"everything behind it ages out")
+
     # 2. Genuinely indivisible: one record. Must refuse to split so the
     #    caller drops it.
     client.spool.ack(10**9)                   # clear
@@ -864,6 +889,46 @@ def _check_resplit_always_makes_progress(tmp: Path) -> None:
     store.close()
     print("  resplit: splits across kinds when halving cannot, refuses "
           "the indivisible and the unexplained, and keeps the batch age")
+
+
+def _check_no_realert_on_restart(tmp: Path) -> None:
+    """A restart must not re-fire `new_device` for every camera.
+
+    CLAUDE.md lists this as a hard constraint and `Hound.__init__`
+    bootstraps `_seen_ips` from `store.device_ips()` for it — but
+    replacing that with `set()` left every suite green, so the one
+    thing standing between an operator and a page per camera per
+    restart was untested.
+    """
+    from surveillancehound import daemon as daemon_mod
+    from surveillancehound.config import load_from_dict
+
+    cfg = load_from_dict({
+        "capture": {"interface": "test0"},
+        "network": {"camera_ips": ["10.9.0.5", "10.9.0.6"]},
+        "store": {"path": str(tmp / "restart.sqlite")},
+    })
+    first = daemon_mod.Hound(cfg)
+    try:
+        for ip in ("10.9.0.5", "10.9.0.6", "10.9.0.7"):
+            first.store.upsert_device(ip, "camera", T0, 1, 1)
+    finally:
+        first.store.close()
+
+    second = daemon_mod.Hound(cfg)
+    try:
+        known = second._seen_ips
+        for ip in ("10.9.0.5", "10.9.0.6", "10.9.0.7"):
+            assert ip in known, (
+                f"{ip} was in the store before the restart and is not "
+                f"in the new daemon's seen set. Every device then "
+                f"looks new and fires `new_device` again — a page per "
+                f"camera on every restart, which is how an operator "
+                f"learns to ignore the channel")
+    finally:
+        second.store.close()
+    print(f"  restart: {len(known)} known device(s) carried over, so "
+          f"new_device does not re-fire")
 
 
 def _check_heartbeat_does_not_depend_on_uptime(tmp: Path) -> None:
@@ -971,6 +1036,183 @@ def _check_writer_lock_survives_a_restart(tmp: Path) -> None:
           f"daemon is refused with a message")
 
 
+def _check_lock_is_held_across_the_swap(tmp: Path) -> None:
+    """Proving "no daemon NOW" is not the property this needs.
+
+    The first version took the lock and released it in a `finally`,
+    then did the slow part — `VACUUM INTO` over the live dataset, the
+    WAL teardown, `os.replace` — unprotected. A daemon starting
+    inside that window took the lock unopposed and wrote to the inode
+    about to be unlinked. Both reviewers reproduced it independently:
+    9,680 of 9,680 and 5,248 of 5,248 rows lost, no error either
+    side. The window is the whole rebuild — minutes on a 1-vCPU
+    appliance — and on OPNsense any GUI Apply bounces the service
+    straight into it.
+
+    Probed IN-PROCESS on a fresh descriptor, because `flock` is per
+    open file description: a probe here blocks exactly as a daemon's
+    would, and needs no interpreter start-up, so it can sample the
+    whole rebuild rather than arriving after it.
+    """
+    import fcntl as _fcntl
+    import subprocess as _sp
+    import sys as _sys
+    import time as _t
+    from surveillancehound.store import HoundStore
+
+    path = tmp / "swap.sqlite"
+    store = HoundStore(path=path)
+    big = "s" * 1024
+    # Mostly LIVE data: a store that is nearly all free pages
+    # compacts instantly and there is no window to observe.
+    for b in range(10):
+        store.ingest_remote_batch(
+            "frigate", "inst-aaaa1111", b + 1,
+            V.validate_records({"alerts": [
+                {"remote_id": b * 5000 + i + 1, "ts": T0 + i,
+                 "device_ip": "10.0.0.1", "kind": "new_device",
+                 "severity": "low", "summary": big, "detail": big,
+                 "dedup_key": f"sw{b}-{i}"} for i in range(5000)]},
+                10**6), T0 + b)
+    store.prune_remote(T0 + 0.5)      # expire one batch, keep nine
+    store.close()
+    original_ino = path.stat().st_ino
+    lock_path = str(path) + ".writer"
+
+    def lock_is_free() -> bool:
+        try:
+            with open(lock_path, "a+b") as probe:
+                try:
+                    _fcntl.flock(probe.fileno(),
+                                 _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                except OSError:
+                    return False
+                _fcntl.flock(probe.fileno(), _fcntl.LOCK_UN)
+                return True
+        except OSError:
+            return True
+
+    cfg_path = tmp / "swap.toml"
+    cfg_path.write_text(
+        "[capture]\npcap_file = '/nonexistent.pcap'\n"
+        "[network]\ncamera_ips = []\n"
+        f"[store]\npath = {str(path)!r}\n")
+    proc = _sp.Popen([_sys.executable, "-m", "surveillancehound.cli",
+                      "prune", str(cfg_path), "--offline-compact"],
+                     stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
+                     env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    try:
+        saw_held = False
+        unguarded = 0
+        samples = 0
+        t0 = _t.monotonic()
+        while proc.poll() is None and _t.monotonic() - t0 < 120:
+            free = lock_is_free()
+            try:
+                same_inode = path.stat().st_ino == original_ino
+            except OSError:
+                same_inode = False
+            samples += 1
+            if not free:
+                saw_held = True
+            elif saw_held and same_inode:
+                # Lock free while the doomed inode is still in place:
+                # a daemon starting here writes into the file that is
+                # about to be replaced.
+                unguarded += 1
+        assert saw_held, (
+            f"the compaction never held the writer lock across "
+            f"{samples} samples, so a daemon starting at any point in "
+            f"the rebuild would be swapped out from under it")
+        assert unguarded == 0, (
+            f"the writer lock was free for {unguarded} of {samples} "
+            f"samples while the original file was still in place. The "
+            f"lock has to be HELD across the rebuild, not taken and "
+            f"released as a point-in-time check")
+    finally:
+        out, _ = proc.communicate(timeout=600)
+    assert proc.returncode == 0, out[-300:]
+    assert path.stat().st_ino != original_ino, "the swap did not happen"
+    print(f"  swap safety: the writer lock stayed held for the whole "
+          f"rebuild ({samples} samples, no unguarded moment)")
+
+
+def _check_compaction_preserves_ownership_and_tidies_up(tmp: Path) -> None:
+    """The swapped-in file must keep the original's mode, and no
+    temp file may survive a failure.
+
+    Round 21's HIGH had two halves and only one was tested: the
+    replacement took the pruning process's umask, so a root-run
+    prune left the store root-owned under a daemon running as
+    `hound` — and that outlived the restart which would otherwise
+    have ended the breakage. Nothing asserted mode survives.
+
+    The temp file matters for the same reason the command exists: a
+    leftover partial rebuild is dead weight on the disk being freed,
+    and it is counted against the very free-space check that decides
+    whether the rebuild can run.
+    """
+    import os as _os
+    from surveillancehound.store import HoundStore
+
+    path = tmp / "perm.sqlite"
+    store = HoundStore(path=path)
+    store.ingest_remote_batch(
+        "frigate", "inst-aaaa1111", 1,
+        V.validate_records({"alerts": [
+            {"remote_id": i + 1, "ts": T0 + i, "device_ip": "10.0.0.1",
+             "kind": "new_device", "severity": "low", "summary": "s" * 512,
+             "detail": "", "dedup_key": f"pm{i}"} for i in range(3000)]},
+            10**6), T0)
+    store.prune_remote(T0 + 10)
+    store.close()
+    _os.chmod(path, 0o600)
+    before_mode = _os.stat(path).st_mode & 0o7777
+    before_ino = _os.stat(path).st_ino
+
+    held = HoundStore(path=path, exclusive=True, lock_wait=0.0)
+    try:
+        held.vacuum(offline=True)
+    finally:
+        held.close()
+    assert _os.stat(path).st_ino != before_ino, "setup: no swap happened"
+    after_mode = _os.stat(path).st_mode & 0o7777
+    assert after_mode == before_mode, (
+        f"the rebuilt store is mode {after_mode:04o}, was "
+        f"{before_mode:04o}. The replacement is a fresh file created "
+        f"under the pruning process's umask, so without copying the "
+        f"original's metadata a root-run prune hands the daemon a "
+        f"store it may not be able to write — and that survives the "
+        f"restart that would otherwise have fixed it")
+    assert not Path(str(path) + ".vacuum.tmp").exists(), \
+        "the rebuild left its temp file behind"
+
+    # A rebuild that FAILS must also leave nothing behind.
+    held = HoundStore(path=path, exclusive=True, lock_wait=0.0)
+    real = held._compact_into
+
+    def boom(*a, **kw):
+        tmpf = a[0] if a else kw["tmp"]
+        tmpf.write_bytes(b"partial")
+        raise OSError("disk I/O error")
+
+    held._compact_into = boom
+    try:
+        try:
+            held.vacuum(offline=True)
+        except OSError:
+            pass
+        assert not Path(str(path) + ".vacuum.tmp").exists(), (
+            "a failed rebuild left its partial temp file on the disk "
+            "this command exists to free — and the next attempt counts "
+            "it against its own free-space check")
+    finally:
+        held._compact_into = real
+        held.close()
+    print("  compaction hygiene: mode survives the swap, and neither a "
+          "success nor a failure leaves a temp file")
+
+
 def _check_writer_lock_guards_the_swap(tmp: Path) -> None:
     """The compaction guard must not depend on an optional feature.
 
@@ -1055,8 +1297,11 @@ def _check_writer_lock_guards_the_swap(tmp: Path) -> None:
         "offline compaction ran against a live daemon that had never "
         "written a heartbeat. With [uptime] disabled that is every "
         "daemon, so the guard did not exist at all")
-    assert "holds this store open" in (out.stdout + out.stderr), \
-        (out.stdout + out.stderr)[-300:]
+    combined = out.stdout + out.stderr
+    assert "open as a writer" in combined or "holds this store open" in combined, \
+        combined[-300:]
+    assert "stop the daemon" in combined.lower(), (
+        f"the refusal must name the remedy: {combined[-200:]}")
     assert path.stat().st_ino == inode_before, "the store was swapped"
     live = daemon_store._conn.execute(
         "SELECT COUNT(*) c FROM devices").fetchone()["c"]
@@ -1078,9 +1323,32 @@ def _check_writer_lock_guards_the_swap(tmp: Path) -> None:
                   capture_output=True, text=True,
                   env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
     assert out.returncode == 0, (out.stdout + out.stderr)[-300:]
-    assert path.stat().st_size < size_before // 2, (
-        f"with the daemon stopped the compaction must actually run: "
-        f"{size_before:,} -> {path.stat().st_size:,}")
+    # Assert on the FREELIST, not on a size ratio.
+    #
+    # `size < size_before // 2` required the reclaim to exceed the
+    # live data — and the live data here is whatever the `daemonish`
+    # thread managed to write while the first prune ran, which is a
+    # function of machine speed. On a fast host it wrote 13k-59k rows
+    # and this failed 4 times out of 4, aborting the 23 checks after
+    # it, so the suite read as red at HEAD with no regression behind
+    # it. CLAUDE.md holds `verify_uptime.py` up for using a synthetic
+    # clock "so it cannot flake on a slow machine"; this flaked on a
+    # fast one.
+    #
+    # Zero free pages is the actual property: it means the file is
+    # the live data and nothing else.
+    after = HoundStore(path=path, readonly=True)
+    try:
+        free_pages = after._conn.execute(
+            "PRAGMA freelist_count").fetchone()[0]
+    finally:
+        after.close()
+    assert free_pages == 0, (
+        f"the store still holds {free_pages} free page(s) after a "
+        f"compaction with the daemon stopped; it did not run")
+    assert path.stat().st_size < size_before, (
+        f"the compaction returned nothing: {size_before:,} -> "
+        f"{path.stat().st_size:,}")
     assert not (tmp / "lock.sqlite.vacuum.tmp").exists(), \
         "the rebuild left its temp file behind"
     print(f"  writer lock: refused with no heartbeat at all "
@@ -1174,20 +1442,30 @@ def _check_prune_does_not_outrun_a_live_daemon(tmp: Path) -> None:
         f"the heartbeat on disk is {_t.time() - hb_at:.0f}s old. It is "
         f"the row readers use to tell 'watching' from 'blind', so a "
         f"frozen one renders a healthy collector as stalled")
-    # And the offline form must REFUSE while that heartbeat is fresh.
+    # A caller that does NOT hold the writer lock must be refused
+    # outright. Proving "no daemon at this instant" and then spending
+    # minutes rebuilding is the hole both reviewers walked through, so
+    # the only safe precondition is holding the lock for the whole
+    # operation — and the code refuses rather than trying to verify
+    # it any other way.
     reopened = HoundStore(path=path)
     try:
-        reopened.set_heartbeat(_t.time(), _t.time())
         try:
             reopened.vacuum(offline=True)
             raise AssertionError(
-                "offline compaction ran with a fresh heartbeat. It "
-                "swaps the file, so it must refuse unless the daemon "
-                "is stopped")
+                "offline compaction ran from a store that does not "
+                "hold the writer lock. A point-in-time check cannot "
+                "cover the rebuild that follows it")
         except RuntimeError as e:
-            assert "running" in str(e), e
+            assert "exclusive=True" in str(e), e
     finally:
         reopened.close()
+    # Holding it, the same call proceeds.
+    holder = HoundStore(path=path, exclusive=True, lock_wait=0.0)
+    try:
+        holder.vacuum(offline=True)
+    finally:
+        holder.close()
     print(f"  live prune: {wrote['n']} concurrent writes all survive, "
           f"inode and heartbeat intact, offline compaction refuses")
 
@@ -5649,7 +5927,10 @@ def main() -> int:
         _check_prune_relay_days_returns_bytes(Path(td))
         _check_prune_does_not_outrun_a_live_daemon(Path(td))
         _check_writer_lock_guards_the_swap(Path(td))
+        _check_lock_is_held_across_the_swap(Path(td))
+        _check_compaction_preserves_ownership_and_tidies_up(Path(td))
         _check_heartbeat_does_not_depend_on_uptime(Path(td))
+        _check_no_realert_on_restart(Path(td))
         _check_writer_lock_survives_a_restart(Path(td))
         _check_relayed_alerts_count_in_the_tile(Path(td))
         _check_shutdown_flushes_the_relay(Path(td))

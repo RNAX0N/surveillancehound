@@ -303,8 +303,21 @@ def _check_readers_do_not_write(td: Path) -> None:
         pass
     finally:
         ro.close()
+    # The WEB handler is a reader too, and `_check_readers_do_not_write`
+    # drove only CLI subcommands — so `web.py`'s `readonly=True` could
+    # be removed with every suite green. It serves an unauthenticated
+    # GET, so DDL on that path is the worst place for it.
+    import inspect as _inspect
+    from surveillancehound import web as _web
+    _src = _inspect.getsource(_web._Handler._store)
+    _src = "\n".join(l.split("#", 1)[0] for l in _src.splitlines())
+    assert "readonly=True" in _src, (
+        "web._Handler._store does not open the store read-only. That "
+        "constructor creates the file, its directories, the schema and "
+        "the pre-release migration — driven by an unauthenticated GET")
     print("  CLI: readers never create or modify the store, and a "
-          "read-only handle refuses writes at the driver")
+          "read-only handle refuses writes at the driver; the web "
+          "handler is read-only too")
 
 
 def _check_export_counts_are_counts(cfg_path: Path) -> None:
