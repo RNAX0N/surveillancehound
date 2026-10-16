@@ -56,7 +56,14 @@ _MAX_RECORDS_PER_KIND = 1000
 # is the same both-ends coupling as max_records_per_batch, and the
 # honest fix is to configure the pair together rather than to guess
 # here.
-_REPLAY_PACE_S = 1.2
+# 2.5s, not 1.2s. Each spooled batch costs the collector TWO metered
+# units, not one: it opens a connection (metered at accept, because an
+# unmetered TLS handshake was itself a capture-starvation vector) and
+# then makes a request on it. At 1.2s that was 100 units/minute
+# against a 60/minute budget — the agent locking itself out while
+# recovering, which is the exact defect this pacing was added to
+# prevent, reintroduced by making connections cost something.
+_REPLAY_PACE_S = 2.5
 # Longest a clean shutdown will spend draining the spool.
 _FINAL_FLUSH_BUDGET_S = 20.0
 

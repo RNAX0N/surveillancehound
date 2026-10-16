@@ -2021,11 +2021,18 @@ def _check_spool_counters(tmp: Path) -> None:
         "collector's per-source request budget and the agent locks "
         "itself out while recovering"
     )
-    # 60 requests/minute is the collector default; pacing must leave
-    # headroom under it.
-    assert _rl._REPLAY_PACE_S >= 60.0 / 60, (
-        f"replay pace {_rl._REPLAY_PACE_S}s is at or above the default "
-        f"budget rate with no margin"
+    # Arithmetic, not a magic number: each batch costs TWO metered
+    # units at the collector (a connection AND a request on it), so
+    # the replay rate times two must sit under the default budget with
+    # margin. Metering connections silently doubled this cost once
+    # already and put the agent back to locking itself out.
+    from surveillancehound.config import RelayCfg as _RC
+    _units_per_min = 2 * (60.0 / _rl._REPLAY_PACE_S)
+    _budget = _RC().max_batches_per_minute
+    assert _units_per_min <= _budget * 0.85, (
+        f"spool replay costs {_units_per_min:.0f} metered units/min "
+        f"against a {_budget}/min budget; the agent will 429 itself "
+        f"while draining a backlog"
     )
 
     print("  spool: drop counters count once; stats() matches pending(); "
