@@ -323,8 +323,12 @@ class IngestServer:
         else:
             ok = relay.verify(key, body, signature)
         if not ok:
-            log.warning("relay: rejected batch from %s (sensor=%r)",
-                        source, sensor_hint[:64])
+            # debug: a peer chooses how often this fires, and the
+            # periodic refusal summary already tells an operator the
+            # port is busy. A line per rejected batch is a log flood
+            # with a remote throttle.
+            log.debug("relay: rejected batch from %s (sensor=%r)",
+                      source, sensor_hint[:64])
             return HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"}
 
 
@@ -581,10 +585,28 @@ class _Server(ThreadingHTTPServer):
         # it would never have shown up there.
         limiter = getattr(self, "limiter", None)
         now_fn = getattr(self, "now_fn", time.time)
-        if limiter is not None and limiter.in_cooldown(source, now_fn()):
-            self.rejected_overload += 1
-            self.shutdown_request(request)
-            return
+        if limiter is not None:
+            now = now_fn()
+            # Charge the CONNECTION, not just the requests on it.
+            #
+            # Metering started at the request line, and the TLS
+            # handshake happens before there is one — so a peer doing
+            # nothing but connect, handshake, disconnect was never
+            # charged at all. That is the most expensive pre-request
+            # unit in the stack: an RSA sign per handshake, measured
+            # at 33-66% of packet-parse throughput on a single-CPU
+            # collector, with the cooldown never arming. A 1-vCPU
+            # firewall VM is exactly what this project ships plugins
+            # for.
+            #
+            # A real agent opens one connection per batch, so this
+            # costs it one unit of a 60/minute budget every
+            # batch_seconds.
+            if limiter.in_cooldown(source, now) or not limiter.allow(
+                    source, now):
+                self.rejected_overload += 1
+                self.shutdown_request(request)
+                return
         with self._src_lock:
             in_use = sum(self._per_source.values())
             free = self.max_workers - in_use
@@ -600,17 +622,16 @@ class _Server(ThreadingHTTPServer):
                 return
             if self._per_source.get(source, 0) >= self.max_per_source:
                 self.rejected_overload += 1
-                log.warning(
+                log.debug(
                     "relay: refusing a connection from %s — it already "
-                    "holds %d of %d ingest workers. One host must not be "
-                    "able to lock out the others.",
+                    "holds %d of %d ingest workers.",
                     source, self.max_per_source, self.max_workers,
                 )
                 self.shutdown_request(request)
                 return
         if not self._slots.acquire(blocking=False):
             self.rejected_overload += 1
-            log.warning(
+            log.debug(
                 "relay: refusing a connection from %s — all %d ingest "
                 "workers are busy. Agents retry from their spool, so this "
                 "costs a delay, not data.",
@@ -723,8 +744,11 @@ class _Server(ThreadingHTTPServer):
                     log.warning(
                         "relay: refused %d connection(s) in the last %.0fs "
                         "— the ingest port is being flooded, or an agent is "
-                        "misconfigured. Relayed data may be delayed; local "
-                        "capture is unaffected.", refused, _OVERLOAD_REPORT_S)
+                        "misconfigured. Relayed data may be delayed, and a "
+                        "sustained flood costs local capture throughput "
+                        "even when every connection is refused. Restrict "
+                        "the port to your agents.",
+                        refused, _OVERLOAD_REPORT_S)
                 last_count = self.rejected_overload
                 last_report = now
             with self._src_lock:
@@ -891,7 +915,16 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                     if time.monotonic() >= give_up_at:
                         return
                     try:
-                        chunk = self.rfile.read(min(remaining, 8192))
+                        # read1, not read: `read(n)` on a buffered
+                        # reader loops internally until it HAS n
+                        # bytes, so the deadline above was only
+                        # consulted between 8 KB blocks — a peer
+                        # dribbling under the socket timeout was
+                        # measured holding this for 122s on 79 of
+                        # 65,536 bytes, 61x the stated bound. read1
+                        # returns whatever has arrived, so the
+                        # deadline is checked per arrival.
+                        chunk = self.rfile.read1(min(remaining, 8192))
                     except (OSError, ValueError):
                         return
                     if not chunk:

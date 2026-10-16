@@ -621,6 +621,7 @@ class RelayClient:
         self.state = AgentState.load(base)
         self.spool = Spool(base, cfg.spool_max_bytes, cfg.spool_max_age_seconds)
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -755,7 +756,21 @@ class RelayClient:
 
     def flush(self, deadline: float | None = None,
               ignore_stop: bool = False) -> bool:
-        """Try to deliver everything spooled. True if the spool emptied."""
+        """Try to deliver everything spooled. True if the spool emptied.
+
+        Serialised. `stop()` clears `_thread` even when its join times
+        out — a post can sit in a socket timeout for ~20s — so the
+        pusher could still be inside `post_batch` when `final_flush`
+        began. Both then posted the same batch, the loser took the
+        409, and `spool.drop()` recorded a DELIVERED batch as
+        discarded. A lock is the only thing that makes that
+        impossible, rather than unlikely.
+        """
+        with self._flush_lock:
+            return self._flush_locked(deadline, ignore_stop)
+
+    def _flush_locked(self, deadline: float | None,
+                      ignore_stop: bool) -> bool:
         with self._lock:
             pending = self.spool.pending(self.now())
         ok = True

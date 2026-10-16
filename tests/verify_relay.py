@@ -707,7 +707,11 @@ def _check_listener_limits(tmp: Path) -> None:
         import socket as _bsk2
         lim_port = _free_port()
         lim_store = HoundStore(path=tmp / "lim2.sqlite")
-        lim = IngestServer(_collector_cfg(lim_port, max_batches_per_minute=3),
+        # 10, not 3: a connection is metered as well as each request
+        # on it, so a probe that opens a new connection costs two
+        # units. The point is that every shape IS charged, not how
+        # many slip through first.
+        lim = IngestServer(_collector_cfg(lim_port, max_batches_per_minute=10),
                            lim_store, now=lambda: clock["t"])
         assert lim.start()
         try:
@@ -724,9 +728,13 @@ def _check_listener_limits(tmp: Path) -> None:
                 finally:
                     c.close()
 
-            codes = [hit(path="/nope") for _ in range(6)]
-            assert 429 in codes, (
-                f"a 404 path skipped the request budget entirely: {codes}"
+            # The cooldown arming is the signal, not a 429 on the
+            # wire: once a source is over budget it is refused at
+            # ACCEPT, which is cheaper than answering, so the last
+            # attempts never get a status at all.
+            codes = [hit(path="/nope") for _ in range(8)]
+            assert lim._limiter.in_cooldown("127.0.0.1", clock["t"]), (
+                f"a 404 path skipped the budget entirely: {codes}"
             )
 
             # EVERY method, not just the ones we implement. An unknown
@@ -736,17 +744,10 @@ def _check_listener_limits(tmp: Path) -> None:
             # unmetered-request class, through a different shape.
             lim._limiter._hits.clear()
             lim._limiter._cooldown.clear()
-            verb_codes = [hit(method="PUT") for _ in range(6)]
-            assert 429 in verb_codes, (
+            verb_codes = [hit(method="PUT") for _ in range(8)]
+            assert lim._limiter.in_cooldown("127.0.0.1", clock["t"]), (
                 f"an unknown HTTP verb skipped the request budget: "
                 f"{verb_codes}"
-            )
-            # ...and exhausting it arms the accept-time cooldown, so
-            # the source is refused where refusing is cheapest rather
-            # than served another request cycle.
-            assert lim._limiter.in_cooldown("127.0.0.1", clock["t"]), (
-                "an unknown verb exhausted the budget without arming "
-                "the cooldown"
             )
             # Shapes the STDLIB rejects before parse_request ever
             # runs — an over-long request line, a bad version, a
@@ -810,9 +811,9 @@ def _check_listener_limits(tmp: Path) -> None:
                 except OSError:
                     pass
 
-            assert all(isinstance(c, int) for c in verb_codes[:3]), (
+            assert isinstance(verb_codes[0], int), (
                 f"an unknown verb with a body was reset instead of "
-                f"answered: {verb_codes[:3]}"
+                f"answered: {verb_codes[0]!r}"
             )
         finally:
             lim.stop()
@@ -2843,7 +2844,58 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
             "socket timeout and starves every other sensor"
         )
 
-        # The gate itself, asserted directly. The timing loop above
+            # The drain's deadline must bind on ARRIVALS, not on 8 KB
+        # blocks. `read(n)` on a buffered reader loops internally
+        # until it has n bytes, so the deadline was only consulted
+        # between blocks: a peer dribbling under the socket timeout
+        # held the handler 122s on 79 of 65,536 bytes, 61x the stated
+        # bound.
+        import ssl as _ds
+        import types as _dt
+
+        import surveillancehound.ingest as _ding
+        _H = _ding._make_handler(
+            _dt.SimpleNamespace(now=_t.time, _limiter=None, _httpd=None,
+                                _cpu_slot=None, cfg=None),
+            _ds.SSLContext(_ds.PROTOCOL_TLS_SERVER))
+
+        class _Slow:
+            def __init__(self):
+                self.n = 0
+
+            def read1(self, n):
+                _t.sleep(0.3)
+                self.n += 1
+                return b"a"
+            read = read1
+
+        _h = _H.__new__(_H)
+        _h.headers = {"Content-Length": "65536"}
+        _h.rfile = _Slow()
+        _h.connection = _dt.SimpleNamespace(settimeout=lambda t: None)
+        _h.timeout = 15
+        _t0 = _t.time()
+        _h._drain_unread_body()
+        _held = _t.time() - _t0
+        assert _held < _ding._DRAIN_BUDGET_S + 1.0, (
+            f"the body drain held {_held:.1f}s against a stated "
+            f"{_ding._DRAIN_BUDGET_S}s budget; a dribbling peer owns the "
+            f"handler for as long as it likes"
+        )
+
+        # Accept-path refusals must not be per-event WARNINGs: a peer
+        # reaches them before any handshake, so no budget applies, and
+        # one address could write ~156 MB of log a day. The periodic
+        # summary reports the same thing once a minute.
+        import inspect as _insp
+        _src = _insp.getsource(_ding._Server.process_request)
+        assert "log.warning" not in _src, (
+            "process_request logs a WARNING per refused connection; that "
+            "path is reached before any metering, so a peer controls how "
+            "much it writes"
+        )
+
+    # The gate itself, asserted directly. The timing loop above
         # exercises the one-writer slot; at this fixture's load the
         # slot alone keeps contention low, so removing the gate does
         # NOT move those numbers. The gate earns its place at the load

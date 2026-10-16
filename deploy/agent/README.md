@@ -65,10 +65,17 @@ completed a signed request, so a flood of unauthenticated addresses
 cannot starve a sensor that is already reporting. It cannot make the
 port free, though: enough unauthenticated connections will still
 delay a sensor's **first** batch after an install or an address
-change. Each such connection costs a worker thread, a socket and a
-file descriptor until it completes or hits the connection budget, so
-a sustained flood is a real resource cost even though it cannot read
-or write anything.
+change.
+
+Do not read that as harmless. Connections AND requests are metered per
+source, and an over-budget source is refused at accept — but a peer
+that can reach the port still makes the collector do work, and the
+collector is the same process that parses packets. Before the
+metering that now covers it, a sustained TLS handshake flood was
+measured taking two thirds of local packet-parse throughput on a
+single-CPU collector, which is what a 1-vCPU firewall VM is. No alert
+reports that: packets are still arriving, so `capture_stalled` cannot
+fire.
 
 Put a firewall rule in front of it. The port should be reachable from
 your agents and nothing else:
