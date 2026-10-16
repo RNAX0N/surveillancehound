@@ -127,14 +127,21 @@ class Spool:
         # the directory there means a diagnostic run as the wrong user
         # leaves a root-owned path the daemon then cannot write.
         # AgentState.load was fixed for this; the spool was not.
+        self.readonly = readonly
         if not readonly:
             self.dir.mkdir(parents=True, exist_ok=True)
         self.path = self.dir / "spool.jsonl"
         self.max_bytes = int(max_bytes)
         self.max_age = float(max_age_seconds)
+        # Persisted beside the spool. These are the numbers `hound
+        # relay` exists to show, and it runs in a DIFFERENT PROCESS from
+        # the daemon — so in-RAM counters meant the "dropped" line could
+        # never print, no matter how much had been dropped.
+        self.counters_path = self.dir / "counters.json"
         self.dropped_size = 0
         self.dropped_age = 0
         self.dropped_stale = 0
+        self._load_counters()
         # append/ack/drop are each a read-modify-write of one file. Two
         # of them interleaving loses whichever batch the loser read
         # before the winner wrote — the exact data loss the spool exists
@@ -147,6 +154,31 @@ class Spool:
         # their compaction uses a real clock rather than wall time, which
         # keeps replay deterministic.
         self._now_hint = 0.0
+
+    def _load_counters(self) -> None:
+        try:
+            d = json.loads(self.counters_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        self.dropped_size = int(d.get("dropped_size", 0))
+        self.dropped_age = int(d.get("dropped_age", 0))
+        self.dropped_stale = int(d.get("dropped_stale", 0))
+
+    def _save_counters(self) -> None:
+        """Best effort: a diagnostic counter is never worth failing a push."""
+        if self.readonly:
+            return
+        try:
+            tmp = self.counters_path.with_suffix(
+                f".{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps({
+                "dropped_size": self.dropped_size,
+                "dropped_age": self.dropped_age,
+                "dropped_stale": self.dropped_stale,
+            }), encoding="utf-8")
+            os.replace(tmp, self.counters_path)
+        except OSError:
+            pass
 
     def _read(self) -> list[dict]:
         if not self.path.is_file():
@@ -230,6 +262,7 @@ class Spool:
             aged = sum(1 for e in dropped if (now - e["at"]) > self.max_age)
             self.dropped_age += aged
             self.dropped_size += len(dropped) - aged
+            self._save_counters()
         return kept
 
     def pending(self, now: float) -> list[tuple[int, bytes]]:
@@ -258,6 +291,7 @@ class Spool:
         """Discard one batch the collector will never accept."""
         with self._lock:
             self.dropped_stale += 1
+            self._save_counters()
             log.warning("relay: dropping spooled batch seq=%s (%s)", seq, reason)
             live = self._enforce_caps(self._read(), self._now_hint)
             self._write([e for e in live if e["seq"] != seq])
@@ -290,10 +324,16 @@ class Watermark:
     alert_id: int = 0
     outage_id: int = 0
     reported_at: float = 0.0
+    # Outage ids we last sent while they were still OPEN. Re-queried
+    # next cycle so their close is transmitted exactly once; without it
+    # the watermark advances past an open outage and its eventual close
+    # never matches the query again.
+    open_outage_ids: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {"flow_id": self.flow_id, "alert_id": self.alert_id,
-                "outage_id": self.outage_id, "reported_at": self.reported_at}
+                "outage_id": self.outage_id, "reported_at": self.reported_at,
+                "open_outage_ids": list(self.open_outage_ids)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Watermark":
@@ -301,6 +341,8 @@ class Watermark:
             flow_id=int(d.get("flow_id", 0)),
             alert_id=int(d.get("alert_id", 0)),
             outage_id=int(d.get("outage_id", 0)),
+            open_outage_ids=[int(x) for x in d.get("open_outage_ids", [])
+                             if isinstance(x, (int, float))][:10000],
             reported_at=float(d.get("reported_at", 0.0)),
         )
 
@@ -499,7 +541,8 @@ class RelayClient:
         wm = self.state.watermark
         flows = self.store.flows_since(wm.flow_id)
         alerts = self.store.alerts_since(wm.alert_id)
-        outages = self.store.outages_changed_since(wm.outage_id)
+        outages = self.store.outages_changed_since(
+            wm.outage_id, open_ids=wm.open_outage_ids)
         devices = self.store.devices_changed_since(wm.reported_at)
         uptime = self.store.uptime_report(
             self.cfg_report_window(), self.now(),
@@ -669,5 +712,8 @@ def _advance(wm: Watermark, flows, alerts, outages, now: float) -> Watermark:
         flow_id=max([wm.flow_id] + [f["id"] for f in flows]),
         alert_id=max([wm.alert_id] + [a["id"] for a in alerts]),
         outage_id=max([wm.outage_id] + [o["id"] for o in outages]),
+        # Carry forward only the ones still open, so each close costs
+        # exactly one extra send and the list drains by itself.
+        open_outage_ids=[o["id"] for o in outages if o.get("up_at") is None],
         reported_at=now,
     )

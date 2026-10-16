@@ -37,6 +37,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from collections.abc import Sequence
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -952,19 +953,34 @@ class HoundStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def outages_changed_since(self, after_id: int, limit: int = 5000) -> list[dict]:
-        """New outages, plus any still open.
+    def outages_changed_since(self, after_id: int,
+                              open_ids: "Sequence[int]" = (),
+                              limit: int = 5000) -> list[dict]:
+        """New outages, any still open, and any we last reported as open.
 
-        An open outage is re-sent each cycle so its eventual close lands as
-        an update on the collector; the (sensor_id, remote_id) key makes
-        that idempotent.
+        That third term is load-bearing. `up_at IS NULL` re-sends an
+        outage only while it is STILL open; the moment it closes it
+        stops matching, and by then the watermark has already advanced
+        past its id — so the close was never transmitted and the
+        collector's copy stayed open forever. That is precisely the
+        failure the (sensor, instance, remote_id) key exists to make
+        fixable, and the key was correct while the sender never sent
+        the update that would use it.
+
+        `open_ids` is what the caller last saw open, so a close is
+        guaranteed exactly one more send. The upsert on the collector
+        makes the repeat idempotent.
         """
+        ids = [int(i) for i in open_ids][:limit]
+        extra = ""
+        if ids:
+            extra = " OR id IN (%s)" % ",".join("?" * len(ids))
         with self._lock:
             rows = self._conn.execute(
                 """SELECT * FROM outages
-                   WHERE id > ? OR up_at IS NULL
+                   WHERE id > ? OR up_at IS NULL""" + extra + """
                    ORDER BY id LIMIT ?""",
-                (int(after_id), int(limit)),
+                (int(after_id), *ids, int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1191,6 +1207,11 @@ class HoundStore:
                        last_seq = excluded.last_seq,
                        clock_skew = excluded.clock_skew,
                        batches = remote_sensors.batches + 1,
+                       -- SUBMITTED, deliberately: this is a measure of
+                       -- what the sensor sent us, which is what an
+                       -- operator wants when judging a noisy sensor.
+                       -- The ack reports survivors instead, because the
+                       -- agent is asking what we kept.
                        records = remote_sensors.records + excluded.records,
                        bytes = remote_sensors.bytes + excluded.bytes,
                        mon_alive = excluded.mon_alive,

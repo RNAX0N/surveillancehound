@@ -2154,6 +2154,100 @@ def _check_prerelease_schema_upgrade(tmp: Path) -> None:
         store.close()
 
 
+def _check_outage_close_is_relayed(tmp: Path) -> None:
+    """An outage that CLOSES must reach the collector as closed.
+
+    `up_at IS NULL` re-sends an outage only while it is still open, and
+    the watermark advances past its id on the first send — so the close
+    matched nothing and the collector's copy stayed open forever. The
+    (sensor, instance, remote_id) key makes the update idempotent, and
+    was correct the whole time; the sender simply never sent the
+    update that would use it. Nothing renders remote_outages yet, so
+    this was invisible: the first surface to show it would have
+    reported every camera as still down.
+    """
+    from surveillancehound.relay import AgentState, Watermark
+    from surveillancehound.store import HoundStore
+
+    agent = HoundStore(path=tmp / "agent-out.sqlite")
+    collector = HoundStore(path=tmp / "coll-out.sqlite")
+    try:
+        with agent._conn:
+            agent._conn.execute(
+                "INSERT INTO outages (camera_ip, down_since, up_at, "
+                "last_seen_before, cause) VALUES ('10.0.0.5',?,NULL,"
+                "0.0,'silence')", (T0,))
+
+        wm = Watermark()
+        seq = 0
+
+        def cycle() -> None:
+            nonlocal wm, seq
+            seq += 1
+            rows = agent.outages_changed_since(
+                wm.outage_id, open_ids=wm.open_outage_ids)
+            if rows:
+                recs = V.validate_records({"outages": [{
+                    "remote_id": r["id"], "camera_ip": r["camera_ip"],
+                    "down_since": r["down_since"], "up_at": r["up_at"],
+                    "last_seen_before": r["last_seen_before"],
+                    "cause": r["cause"],
+                } for r in rows]}, 100)
+                collector.ingest_remote_batch(
+                    "frigate", "inst-aaaa1111", seq, recs, T0 + seq)
+            wm = Watermark(
+                outage_id=max([wm.outage_id] + [r["id"] for r in rows]),
+                open_outage_ids=[r["id"] for r in rows
+                                 if r["up_at"] is None],
+            )
+
+        cycle()
+        cycle()
+        got = collector._conn.execute(
+            "SELECT up_at FROM remote_outages").fetchone()
+        assert got is not None and got["up_at"] is None, got
+
+        with agent._conn:
+            agent._conn.execute(
+                "UPDATE outages SET up_at = ? WHERE id = 1", (T0 + 100,))
+        cycle()
+
+        rows = collector._conn.execute(
+            "SELECT camera_ip, down_since, up_at FROM remote_outages"
+        ).fetchall()
+        assert len(rows) == 1, (
+            f"the close inserted a second row instead of updating: "
+            f"{[tuple(r) for r in rows]}"
+        )
+        assert rows[0]["up_at"] == T0 + 100, (
+            "the outage close was never relayed; the collector still shows "
+            "this camera as down, and would keep showing it forever"
+        )
+
+        # And the id drains out of the carry-forward list.
+        assert wm.open_outage_ids == [] or wm.open_outage_ids == [1]
+        cycle()
+        assert wm.open_outage_ids == [], (
+            f"a closed outage stayed in the re-send list: "
+            f"{wm.open_outage_ids}"
+        )
+
+        # The watermark must survive a restart with the list intact.
+        st = AgentState.load(tmp / "agent-wm")
+        st.watermark = Watermark(outage_id=7, open_outage_ids=[3, 4])
+        st.save()
+        back = AgentState.load(tmp / "agent-wm")
+        assert back.watermark.open_outage_ids == [3, 4], (
+            f"open outage ids did not survive a restart: "
+            f"{back.watermark.open_outage_ids} — the closes would be lost"
+        )
+        print("  outage close: relayed exactly once, upserts in place, and "
+              "the re-send list drains and persists")
+    finally:
+        agent.close()
+        collector.close()
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -2173,6 +2267,7 @@ def main() -> int:
         _check_resource_bounds(Path(td))
         _check_instance_reset(Path(td))
         _check_prerelease_schema_upgrade(Path(td))
+        _check_outage_close_is_relayed(Path(td))
         _check_relayed_dispatch_is_quarantined(Path(td))
         _check_sensor_offline_alerts(Path(td))
         _check_relayed_api_surface(Path(td))

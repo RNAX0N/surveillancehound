@@ -37,6 +37,9 @@ INGEST_PATH = "/ingest/v1"
 # A forged seq must not be able to poison the counter so the real agent can
 # never catch up.
 MAX_SEQ_ADVANCE = 1_000_000
+# SQLite stores signed 64-bit integers; anything larger raises in the
+# driver rather than being rejected as bad input.
+_MAX_SEQ = 2**63 - 1
 
 
 class _RateLimiter:
@@ -237,8 +240,15 @@ class IngestServer:
         except validate.ValidationError as e:
             return HTTPStatus.BAD_REQUEST, {"error": str(e)}
         seq = doc.get("seq")
-        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
-            return HTTPStatus.BAD_REQUEST, {"error": "seq must be a positive integer"}
+        if (not isinstance(seq, int) or isinstance(seq, bool)
+                or not (1 <= seq <= _MAX_SEQ)):
+            # Bounded, because an int above SQLite's 64-bit range reaches
+            # the driver and raises OverflowError — which the catch-all
+            # turns into a 500, and the agent treats 500 as retryable, so
+            # a buggy agent would loop on it forever. A 400 tells it to
+            # stop.
+            return HTTPStatus.BAD_REQUEST, {
+                "error": f"seq must be an integer in [1, {_MAX_SEQ}]"}
 
         known = self.store.get_remote_sensor(sensor_id)
         if known is not None and known.instance_id == instance_id:

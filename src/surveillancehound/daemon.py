@@ -747,15 +747,25 @@ class Hound:
         over_batch = max(0, len(alerts) - _RELAY_ALERTS_PER_BATCH)
 
         window = self.cfg.alerts.dedup_window_seconds
+        batch_seen: set[str] = set()
         for raw in alerts[:_RELAY_ALERTS_PER_BATCH]:
             # Cheap dedup pre-check BEFORE spending budget. An alert the
             # dispatcher would suppress for free should not consume the
             # sensor's allowance, or a flood of duplicates lets a sensor
             # silence its own real pages.
-            seen = self._relay_last_dispatch.get(
-                ("k", sensor_id, raw["dedup_key"]))
+            # ...and within this batch, since the map is only written
+            # by the worker AFTER dispatch: without the local set, a
+            # burst of duplicates in one batch all pass the map check
+            # and burn budget and share before the worker suppresses
+            # them. The comment used to claim a protection the code
+            # did not provide.
+            dk = raw["dedup_key"]
+            if dk in batch_seen:
+                continue
+            seen = self._relay_last_dispatch.get(("k", sensor_id, dk))
             if seen is not None and (now - seen) < window:
                 continue
+            batch_seen.add(dk)
             # Budget is CHECKED here but only SPENT once the item is
             # actually queued. Spending it first meant alerts rejected
             # by the later gates — never queued, never dispatched,
