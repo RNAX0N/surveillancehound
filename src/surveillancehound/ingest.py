@@ -100,6 +100,12 @@ class _RateLimiter:
                 # next attempt costs this peer a handshake it does not
                 # get to complete rather than costing us a request.
                 self._cooldown[source] = now + _REJECT_COOLDOWN
+                if len(self._cooldown) > 4096:
+                    # Keyed on peer-controlled addresses, so bound it
+                    # directly rather than relying on the _hits sweep.
+                    for k in [k for k, v in self._cooldown.items()
+                              if v <= now]:
+                        del self._cooldown[k]
                 return False
             q.append(now)
             if len(self._hits) > 1024:

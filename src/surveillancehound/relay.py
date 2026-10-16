@@ -46,6 +46,10 @@ log = logging.getLogger(__name__)
 # agent cannot see the collector's config, so it self-limits to the
 # documented default rather than discovering the cap by rejection.
 _MAX_RECORDS_PER_KIND = 1000
+# Seconds between spooled batches when replaying a backlog. Chosen to
+# sit under the collector's default request budget (60/min) with room
+# to spare, since the agent cannot see that setting.
+_REPLAY_PACE_S = 1.2
 
 SCHEMA_VERSION = 1
 SIG_HEADER = "X-Hound-Signature"
@@ -745,7 +749,16 @@ class RelayClient:
         with self._lock:
             pending = self.spool.pending(self.now())
         ok = True
-        for seq, body in pending:
+        for i, (seq, body) in enumerate(pending):
+            # Pace a backlog. The collector meters REQUESTS per source,
+            # so an agent draining a day of spool in a tight loop trips
+            # that limit and earns itself an accept-time cooldown — a
+            # legitimate sensor locking itself out precisely when it is
+            # trying to catch up. Nothing is lost (a 429 ends the cycle
+            # and the batch stays spooled), but the recovery is slower
+            # and noisier than just going at a sustainable rate.
+            if i:
+                time.sleep(_REPLAY_PACE_S)
             try:
                 # Re-stamp: a batch spooled during an outage is older than
                 # the collector's skew window allows.

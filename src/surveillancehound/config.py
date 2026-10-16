@@ -216,6 +216,14 @@ class RelayCfg:
     # from more batches; agents post every batch_seconds and spool
     # whatever does not fit.
     max_records_per_batch: int = 1000
+    # Counts every REQUEST from a source, not only well-formed
+    # batches: a rejected request still costs a full HTTP cycle of
+    # pure-Python work in the process that parses packets, so a 404
+    # that skipped the budget was an unmetered way to burn capture
+    # CPU. The name is kept for config compatibility; read it as
+    # "requests per minute". A source that exhausts it is refused at
+    # accept for a short cooldown. The shipped agent paces its spool
+    # replay to stay underneath.
     max_batches_per_minute: int = 60
     clock_skew_seconds: float = 300.0
     remote_retention_days: float = 30.0

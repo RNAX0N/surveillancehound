@@ -1927,6 +1927,23 @@ def _check_spool_counters(tmp: Path) -> None:
         "the spool must survive a restart, or an outage loses exactly the "
         "observations it was buffering"
     )
+    # An agent draining a backlog must not trip the collector's
+    # request budget and lock ITSELF out. The limiter counts every
+    # request, so a tight replay loop earns an accept-time cooldown at
+    # exactly the moment the sensor is trying to catch up.
+    import surveillancehound.relay as _rl
+    assert _rl._REPLAY_PACE_S > 0, (
+        "spool replay is unpaced; a backlog drain exceeds the "
+        "collector's per-source request budget and the agent locks "
+        "itself out while recovering"
+    )
+    # 60 requests/minute is the collector default; pacing must leave
+    # headroom under it.
+    assert _rl._REPLAY_PACE_S >= 60.0 / 60, (
+        f"replay pace {_rl._REPLAY_PACE_S}s is at or above the default "
+        f"budget rate with no margin"
+    )
+
     print("  spool: drop counters count once; stats() matches pending(); "
           "ack/drop/restart hold")
 
