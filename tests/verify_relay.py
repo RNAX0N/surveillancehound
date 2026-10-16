@@ -1585,7 +1585,79 @@ def _check_spool_counters(tmp: Path) -> None:
         f"the newest batch must survive and order must hold: {got}"
     )
     assert sp2.dropped_size > 0
-    print("  spool: drop counters count once; stats() matches pending()")
+
+    # ack / drop semantics
+    sp3 = Spool(tmp / "spool3", 10 * 1024 * 1024, 3600.0)
+    for i in (1, 2, 3, 4):
+        sp3.append(i, b'{"x":%d}' % i, 0.0)
+    sp3.ack(2)
+    assert [q for q, _ in sp3.pending(1.0)] == [3, 4], (
+        "ack must clear everything up to and including the acked seq — "
+        "a batch the collector has is not ours to resend"
+    )
+    sp3.drop(3, "rejected")
+    assert [q for q, _ in sp3.pending(1.0)] == [4]
+    assert sp3.dropped_stale == 1
+
+    # Survives a restart: the file IS the state.
+    again = Spool(tmp / "spool3", 10 * 1024 * 1024, 3600.0)
+    assert [q for q, _ in again.pending(1.0)] == [4], (
+        "the spool must survive a restart, or an outage loses exactly the "
+        "observations it was buffering"
+    )
+    print("  spool: drop counters count once; stats() matches pending(); "
+          "ack/drop/restart hold")
+
+
+def _check_agent_state(tmp: Path) -> None:
+    """Agent identity and progress must survive a restart.
+
+    `instance_id` is how the collector tells a restarted agent from a
+    second one claiming the same id, and `next_seq` is what stops a
+    restart replaying from 1 and getting 409s forever. A watermark that
+    reset would re-send the agent's whole history on every restart.
+    """
+    from surveillancehound.relay import AgentState
+
+    base = tmp / "agent"
+    st = AgentState.load(base)
+    first_instance = st.instance_id
+    assert first_instance, "an agent must mint an instance id"
+    st.next_seq = 42
+    st.watermark.flow_id = 7
+    st.watermark.alert_id = 9
+    st.watermark.outage_id = 3
+    st.watermark.reported_at = 1234.5
+    st.last_push_ts = 999.0
+    st.save()
+
+    back = AgentState.load(base)
+    assert back.instance_id == first_instance, (
+        "instance_id must be stable across restarts, or the collector "
+        "treats every restart as a new agent and resets its sequence"
+    )
+    assert back.next_seq == 42, back.next_seq
+    assert (back.watermark.flow_id, back.watermark.alert_id,
+            back.watermark.outage_id) == (7, 9, 3), back.watermark
+    assert back.watermark.reported_at == 1234.5
+
+    # Four independent cursors, not one: flows, alerts and outages have
+    # separate autoincrement ids.
+    assert len({"flow_id", "alert_id", "outage_id", "reported_at"}
+               - set(back.watermark.as_dict())) == 0
+
+    # A wiped state directory mints a NEW instance, which is the signal
+    # the collector uses to reset its sequence expectations.
+    import shutil
+    shutil.rmtree(base)
+    fresh = AgentState.load(base)
+    assert fresh.instance_id != first_instance, (
+        "a wiped agent must present a new instance id so the collector "
+        "can tell it apart from a sequence replay"
+    )
+    assert fresh.next_seq == 1, fresh.next_seq
+    print("  agent state: instance stable across restart, new on wipe; "
+          "4 watermark cursors persist")
 
 
 def main() -> int:
@@ -1610,6 +1682,7 @@ def main() -> int:
         _check_relayed_api_surface(Path(td))
         _check_replay_opens_no_listener(Path(td))
         _check_spool_counters(Path(td))
+        _check_agent_state(Path(td))
     print("=== listener ===")
     with tempfile.TemporaryDirectory() as td:
         _check_listener(Path(td))
