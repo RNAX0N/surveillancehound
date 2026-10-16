@@ -2021,6 +2021,8 @@ def _check_shutdown_and_slot_release(tmp: Path) -> None:
         def __init__(self):            # no socket; we only exercise bookkeeping
             self._slots = __import__("threading").BoundedSemaphore(4)
             self._per_source = {}
+            self._trusted = {}
+            self._deadlines = {}
             self._src_lock = __import__("threading").Lock()
             self.rejected_overload = 0
 
@@ -2539,7 +2541,8 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
         # real sensor got 0 of 20 batches in. The two limits are
         # separate for this reason, and both halves need asserting —
         # fixing the stall by denying service is not a fix.
-        from surveillancehound.ingest import _CPU_SLOTS, _Server
+        from surveillancehound.ingest import (
+            _CONN_BUDGET, _CPU_SLOTS, _Server)
         assert _Server.max_workers >= 4 * _CPU_SLOTS, (
             f"the connection pool ({_Server.max_workers}) is too close "
             f"to the CPU limit ({_CPU_SLOTS}); a few hostile sources "
@@ -2548,19 +2551,22 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
         assert _Server.max_per_source < _Server.max_workers, (
             "one source may take the entire connection pool"
         )
-        # A flat per-source cap only sets how many ADDRESSES an
-        # attacker needs: exactly max_workers/max_per_source. Four
-        # hosts holding half-open sockets took a legitimate sensor
-        # from 45/45 to 2/45. The reserve is what makes that bounded
-        # by behaviour rather than by address count.
-        assert _Server.newcomer_reserve >= 2, (
-            "no slots are reserved for sources holding none, so enough "
-            "attacker addresses will always lock out a real sensor"
+        # Counting connections cannot separate a hostile peer from a
+        # real one at accept time — reserving for "sources holding
+        # none" did nothing, because every attacker connection is from
+        # a source holding none. The reserve must key on something an
+        # attacker cannot forge: having completed a signed request.
+        assert _Server.trusted_reserve >= 2, (
+            "no slots are held for sources that have proven a key, so "
+            "enough unauthenticated addresses lock out a real sensor"
         )
-        assert (_Server.newcomer_reserve
-                < _Server.max_workers - _Server.max_per_source), (
-            "the reserve is so large that ordinary traffic cannot use "
-            "the pool"
+        assert _Server.trusted_reserve < _Server.max_workers, (
+            "the reserve leaves no capacity for a sensor's first batch"
+        )
+        assert _CONN_BUDGET > 0, (
+            "without an absolute per-connection budget, a peer that "
+            "dribbles a byte before each socket timeout holds a slot "
+            "for as long as it likes"
         )
         assert _CPU_SLOTS <= 4, (
             f"{_CPU_SLOTS} concurrent batches through the pure-Python "

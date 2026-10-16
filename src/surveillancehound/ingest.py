@@ -45,6 +45,19 @@ _CPU_SLOTS = 2
 # until it completes the peer has proven nothing and is holding a
 # worker slot.
 _HANDSHAKE_TIMEOUT = 5.0
+# Absolute wall-clock a connection may hold a worker slot, from accept
+# to done. This is the bound that was missing: the handshake deadline
+# only covers a peer that sends nothing, and the socket timeout is
+# PER-RECV, so a peer dribbling one byte before each timeout holds a
+# slot for as long as it likes. Caps and counters bound how many
+# REQUESTS a peer may make; this bounds how much TIME it may buy, which
+# is the resource a slow-loris actually spends. A real agent posts a
+# ~1.5 MB batch over a LAN in well under a second.
+_CONN_BUDGET = 15.0
+# How long a source stays "proven" after a signed request. Long enough
+# to span an agent's batch interval many times over, short enough that
+# a decommissioned address does not hold its reservation forever.
+_TRUSTED_TTL = 3600.0
 # A forged seq must not be able to poison the counter so the real agent can
 # never catch up.
 MAX_SEQ_ADVANCE = 1_000_000
@@ -190,6 +203,7 @@ class IngestServer:
                     "relay: %d ingest handler(s) still running after 10s; "
                     "closing the store anyway. They will fail their "
                     "current batch and the agent will resend it.", left)
+            self._httpd._reaper_stop.set()
             self._httpd.server_close()
             self._httpd = None
         if self._thread is not None:
@@ -261,6 +275,18 @@ class IngestServer:
             log.warning("relay: rejected batch from %s (sensor=%r)",
                         source, sensor_hint[:64])
             return HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"}
+
+        # This address has now proven it holds a key. That is what buys
+        # it the reserved slots; nothing a peer can do without the key
+        # gets it in here.
+        if self._httpd is not None:
+            with self._httpd._src_lock:
+                self._httpd._trusted[source] = time.monotonic()
+                if len(self._httpd._trusted) > 1024:
+                    cutoff = time.monotonic() - _TRUSTED_TTL
+                    for k in [k for k, v in self._httpd._trusted.items()
+                              if v < cutoff]:
+                        del self._httpd._trusted[k]
 
         try:
             # Before json.loads allocates: see validate.MAX_CONTAINERS.
@@ -463,6 +489,13 @@ class _Server(ThreadingHTTPServer):
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
+        self._deadlines: dict = {}
+        # source -> monotonic time of its last successful signature
+        self._trusted: dict[str, float] = {}
+        self._reaper_stop = threading.Event()
+        self._reaper = threading.Thread(
+            target=self._reap, name="hound-ingest-reaper", daemon=True)
+        self._reaper.start()
         self._slots = threading.BoundedSemaphore(self.max_workers)
         self._per_source: dict[str, int] = {}
         self._src_lock = threading.Lock()
@@ -477,27 +510,37 @@ class _Server(ThreadingHTTPServer):
     # ceiling bounds resources; this one keeps one host from owning them.
     max_per_source = 4
 
-    # Slots held back for sources that currently hold NONE. A flat
-    # per-source cap only raises the number of addresses an attacker
-    # needs to own the pool, to exactly max_workers/max_per_source —
-    # four, which on a camera segment or any IPv6 range is not a
-    # defence. Measured, four hosts holding half-open sockets took a
-    # legitimate sensor from 45/45 to 2/45. Reserving capacity for
-    # first-connection sources means a sensor that is not already
-    # hogging can always get in, however many addresses are flooding.
-    newcomer_reserve = 4
+    # Slots reserved for sources that have PROVEN a key.
+    #
+    # Reserving for "sources holding no connection" did nothing: every
+    # attacker connection is from a source holding none, so the branch
+    # never fired and sixteen single-connection addresses still took
+    # the pool. Counting connections cannot separate a hostile peer
+    # from a real one, because at accept time nothing about the peer
+    # is known.
+    #
+    # Something IS known by then, though: whether this address has
+    # ever completed a signed request. An attacker without a key can
+    # never enter that set, and a real agent enters it on its first
+    # successful batch and posts from the same address every
+    # batch_seconds after. So the last few slots are held for proven
+    # sources, and a flood of unauthenticated addresses can delay a
+    # sensor's first-ever batch but not starve it thereafter.
+    trusted_reserve = 6
 
     def process_request(self, request, client_address):
         source = client_address[0] if client_address else "?"
         with self._src_lock:
-            held = self._per_source.get(source, 0)
             in_use = sum(self._per_source.values())
-            if held and (self.max_workers - in_use) <= self.newcomer_reserve:
+            free = self.max_workers - in_use
+            proven = self._trusted.get(source, 0.0) > (
+                time.monotonic() - _TRUSTED_TTL)
+            if not proven and free <= self.trusted_reserve:
                 self.rejected_overload += 1
                 log.debug(
-                    "relay: %s already holds %d connection(s); the last "
-                    "%d slots are reserved for sensors holding none",
-                    source, held, self.newcomer_reserve)
+                    "relay: refusing %s — the last %d slots are held for "
+                    "sources that have completed a signed request",
+                    source, self.trusted_reserve)
                 self.shutdown_request(request)
                 return
             if self._per_source.get(source, 0) >= self.max_per_source:
@@ -522,6 +565,7 @@ class _Server(ThreadingHTTPServer):
             return
         with self._src_lock:
             self._per_source[source] = self._per_source.get(source, 0) + 1
+            self._deadlines[request] = time.monotonic() + _CONN_BUDGET
         try:
             super().process_request(request, client_address)
         except BaseException:
@@ -532,8 +576,34 @@ class _Server(ThreadingHTTPServer):
             # leaks from one address would lock that address out for the
             # life of the process, turning the anti-lockout counter into
             # the lockout.
+            with self._src_lock:
+                self._deadlines.pop(request, None)
             self._release(source)
             raise
+
+    def _reap(self) -> None:
+        """Close connections that have outstayed their budget.
+
+        A reaper rather than a timeout because the handler can be
+        blocked anywhere — mid-handshake, mid-header, mid-body — and
+        only an external close reliably unblocks it. Shutting the
+        socket down makes the blocked recv raise, the handler unwind,
+        and the slot return.
+        """
+        while not self._reaper_stop.wait(1.0):
+            now = time.monotonic()
+            with self._src_lock:
+                stale = [c for c, due in self._deadlines.items() if due < now]
+            for conn in stale:
+                with self._src_lock:
+                    self._deadlines.pop(conn, None)
+                log.warning(
+                    "relay: closing a connection that held an ingest slot "
+                    "for over %.0fs without completing a request", _CONN_BUDGET)
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
     def _release(self, source: str) -> None:
         self._slots.release()
@@ -549,6 +619,8 @@ class _Server(ThreadingHTTPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
+            with self._src_lock:
+                self._deadlines.pop(request, None)
             self._release(source)
 
 

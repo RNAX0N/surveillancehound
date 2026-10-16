@@ -58,6 +58,28 @@ collector answers `401` for both an unknown sensor and a bad signature —
 deliberately the same response, since telling them apart is a probing
 oracle.
 
+## Restrict the ingest port to your agents
+
+The collector reserves capacity for source addresses that have
+completed a signed request, so a flood of unauthenticated addresses
+cannot starve a sensor that is already reporting. It cannot make the
+port free, though: enough unauthenticated connections will still
+delay a sensor's **first** batch after an install or an address
+change, and they cost the collector threads.
+
+Put a firewall rule in front of it. The port should be reachable from
+your agents and nothing else:
+
+```
+# OPNsense: Firewall -> Rules -> (interface facing the agents)
+#   pass  proto tcp  from <agent addresses>  to <collector>  port 18443
+#   block proto tcp  from any                to <collector>  port 18443
+```
+
+The relay is built to survive a hostile agent — that is the threat
+model — but it is not a service to expose broadly, and nothing in it
+pretends otherwise.
+
 ## Why host networking
 
 `network_mode: host` is required, not a convenience. A bridged container
