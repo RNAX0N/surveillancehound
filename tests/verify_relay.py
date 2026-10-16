@@ -2548,6 +2548,20 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
         assert _Server.max_per_source < _Server.max_workers, (
             "one source may take the entire connection pool"
         )
+        # A flat per-source cap only sets how many ADDRESSES an
+        # attacker needs: exactly max_workers/max_per_source. Four
+        # hosts holding half-open sockets took a legitimate sensor
+        # from 45/45 to 2/45. The reserve is what makes that bounded
+        # by behaviour rather than by address count.
+        assert _Server.newcomer_reserve >= 2, (
+            "no slots are reserved for sources holding none, so enough "
+            "attacker addresses will always lock out a real sensor"
+        )
+        assert (_Server.newcomer_reserve
+                < _Server.max_workers - _Server.max_per_source), (
+            "the reserve is so large that ordinary traffic cannot use "
+            "the pool"
+        )
         assert _CPU_SLOTS <= 4, (
             f"{_CPU_SLOTS} concurrent batches through the pure-Python "
             f"stages takes the GIL away from the pcap parser; this is "

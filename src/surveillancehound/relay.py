@@ -45,7 +45,7 @@ log = logging.getLogger(__name__)
 # Matches the collector's default [relay].max_records_per_batch. The
 # agent cannot see the collector's config, so it self-limits to the
 # documented default rather than discovering the cap by rejection.
-_MAX_RECORDS_PER_KIND = 5000
+_MAX_RECORDS_PER_KIND = 1000
 
 SCHEMA_VERSION = 1
 SIG_HEADER = "X-Hound-Signature"
@@ -216,6 +216,11 @@ class Spool:
         """Best effort. These are diagnostics; a damaged file must never
         stop the monitor from starting, which is what a bare int() on a
         hostile or truncated value did."""
+        if not self.counters_path.exists():
+            # A fresh agent has no counters file. Warning "unreadable"
+            # here cried corruption on every first boot, which is how a
+            # security tool teaches its operator to ignore warnings.
+            return
         try:
             d = json.loads(self.counters_path.read_text(encoding="utf-8"))
             if not isinstance(d, dict):
@@ -623,11 +628,20 @@ class RelayClient:
     def collect(self) -> tuple:
         """Everything new since the last successful push."""
         wm = self.state.watermark
-        flows = self.store.flows_since(wm.flow_id)
-        alerts = self.store.alerts_since(wm.alert_id)
+        # EVERY kind honours the configured cap, not just uptime. It
+        # was applied to uptime alone while the comment claimed
+        # "lowering it on both ends works" — so a collector configured
+        # below 5000 rejected 400 on the other four kinds, the agent
+        # treated that as terminal and dropped the batch, and the
+        # watermark had already advanced at enqueue. Permanent, silent,
+        # total loss, with flush() returning success.
+        per_kind = self._per_kind()
+        flows = self.store.flows_since(wm.flow_id, limit=per_kind)
+        alerts = self.store.alerts_since(wm.alert_id, limit=per_kind)
         outages = self.store.outages_changed_since(
-            wm.outage_id, open_ids=wm.open_outage_ids)
-        devices = self.store.devices_changed_since(wm.reported_at)
+            wm.outage_id, open_ids=wm.open_outage_ids, limit=per_kind)
+        devices = self.store.devices_changed_since(
+            wm.reported_at, limit=per_kind)
         # Capped like every other collector here. uptime_report returns
         # one row per camera with no limit, so a sensor with more
         # cameras than the collector's max_records_per_batch had EVERY
@@ -637,7 +651,6 @@ class RelayClient:
         all_uptime = self.store.uptime_report(
             self.cfg_report_window(), self.now(),
         )
-        per_kind = self._per_kind()
         uptime = all_uptime[:per_kind]
         if len(all_uptime) > per_kind:
             # `uptime_report` is ORDER BY ip, so a plain prefix hides

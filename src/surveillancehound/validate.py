@@ -98,11 +98,16 @@ def check_container_budget(body: bytes,
     THIS DOES NOT BOUND MEMORY, and it is worth being precise about
     what it does: it kills the ~25x amplification of a body made of
     empty containers. A container-SPARSE but memory-dense body —
-    `["ab","ab",...]` is two containers and ~110 MB parsed — walks
-    straight past it. That case is bounded instead by
-    `max_workers x max_body_bytes` on the listener, which is why the
-    worker ceiling is small. Measured at 4 workers: ~242 MB peak for
-    the worst shape found, against 1 GB+ at 32.
+    `["ab","ab",...]` is two containers, and a flat object of short
+    keys is ONE — both walk straight past it, at roughly 12x and 16x
+    the body size respectively.
+
+    Those are bounded instead by how many bodies can be resident and
+    parsing at once: see `_CPU_SLOTS` and `max_body_bytes` in
+    ingest.py, which is where the real limit lives. Deliberately no
+    megabyte figure here — the previous version of this docstring
+    quoted one that was wrong by 2.4x and a worker count that had
+    since changed, which is worse than quoting nothing.
     """
     # Fast path, in C. Counting every delimiter INCLUDING those inside
     # strings can only over-count, so if even that total is within

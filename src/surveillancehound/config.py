@@ -201,13 +201,21 @@ class RelayCfg:
     cert_file: str = ""
     key_file: str = ""
     sensor_timeout_seconds: float = 180.0
-    max_body_bytes: int = 8 * 1024 * 1024
-    # Per KIND, and there are five kinds — so this bounds one batch at
-    # 5x this many row operations inside a single store transaction,
-    # which is time the collector's packet loop can be waiting. Lowered
-    # from 20000 (100k rows, ~0.4s of store lock) because a bigger
-    # batch buys an agent nothing it cannot get from two batches.
-    max_records_per_batch: int = 5000
+    # 2 MB, not 8. A batch's cost to the collector is dominated by
+    # parsing it, and that is pure-Python work competing with packet
+    # capture under the GIL — so this is a capture setting as much as
+    # a relay one. A full legitimate batch at the 1000-record cap
+    # below measures 1.45 MB, so 2 MB is generous for real traffic
+    # while cutting the worst hostile body 4x.
+    max_body_bytes: int = 2 * 1024 * 1024
+    # Per KIND, and there are five kinds, so this bounds one batch at
+    # 5x this many records. Lowered 20000 -> 5000 -> 1000 as each
+    # round measured how much a single batch costs the collector in
+    # parse CPU and store-lock time, both of which the packet loop
+    # waits behind. A bigger batch buys an agent nothing it cannot get
+    # from more batches; agents post every batch_seconds and spool
+    # whatever does not fit.
+    max_records_per_batch: int = 1000
     max_batches_per_minute: int = 60
     clock_skew_seconds: float = 300.0
     remote_retention_days: float = 30.0
@@ -501,7 +509,7 @@ _MIN_KEY_LEN = 16
 # hound.toml.example recommends as the operator's remedy for a batch
 # holding resources too long. The agent sizes its batches from its OWN
 # max_records_per_batch instead, so lowering it on both ends works.
-_AGENT_RECORDS_PER_KIND = 5000
+_AGENT_RECORDS_PER_KIND = 1000
 
 
 def _require_strong_key(key: str, where: str) -> None:
@@ -572,8 +580,8 @@ def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
         cert_file=str(rl.get("cert_file", "")).strip(),
         key_file=str(rl.get("key_file", "")).strip(),
         sensor_timeout_seconds=float(rl.get("sensor_timeout_seconds", 180.0)),
-        max_body_bytes=int(rl.get("max_body_bytes", 8 * 1024 * 1024)),
-        max_records_per_batch=int(rl.get("max_records_per_batch", 5000)),
+        max_body_bytes=int(rl.get("max_body_bytes", 2 * 1024 * 1024)),
+        max_records_per_batch=int(rl.get("max_records_per_batch", 1000)),
         max_batches_per_minute=int(rl.get("max_batches_per_minute", 60)),
         clock_skew_seconds=float(rl.get("clock_skew_seconds", 300.0)),
         remote_retention_days=float(rl.get("remote_retention_days", 30.0)),

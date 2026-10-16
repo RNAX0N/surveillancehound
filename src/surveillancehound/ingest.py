@@ -41,6 +41,10 @@ INGEST_PATH = "/ingest/v1"
 # GIL-bound work competing with the pcap parser. Two is enough to keep
 # the store busy while one batch parses.
 _CPU_SLOTS = 2
+# Seconds a peer gets to complete the TLS handshake. Short, because
+# until it completes the peer has proven nothing and is holding a
+# worker slot.
+_HANDSHAKE_TIMEOUT = 5.0
 # A forged seq must not be able to poison the counter so the real agent can
 # never catch up.
 MAX_SEQ_ADVANCE = 1_000_000
@@ -225,14 +229,7 @@ class IngestServer:
                 self._inflight -= 1
 
     def _handle_batch(self, source: str, body: bytes, headers) -> tuple[int, dict]:
-        # Everything from here to the store write is GIL-bound work
-        # that competes with the pcap parser. Threads waiting here are
-        # parked, so holding the connection open costs a thread and a
-        # buffer but no processor — which is the distinction that lets
-        # the connection pool stay generous enough not to lock out
-        # legitimate sensors.
-        with self._cpu_slot:
-            return self._handle_batch_cpu(source, body, headers)
+        return self._handle_batch_cpu(source, body, headers)
 
     def _handle_batch_cpu(self, source: str, body: bytes,
                           headers) -> tuple[int, dict]:
@@ -480,9 +477,29 @@ class _Server(ThreadingHTTPServer):
     # ceiling bounds resources; this one keeps one host from owning them.
     max_per_source = 4
 
+    # Slots held back for sources that currently hold NONE. A flat
+    # per-source cap only raises the number of addresses an attacker
+    # needs to own the pool, to exactly max_workers/max_per_source —
+    # four, which on a camera segment or any IPv6 range is not a
+    # defence. Measured, four hosts holding half-open sockets took a
+    # legitimate sensor from 45/45 to 2/45. Reserving capacity for
+    # first-connection sources means a sensor that is not already
+    # hogging can always get in, however many addresses are flooding.
+    newcomer_reserve = 4
+
     def process_request(self, request, client_address):
         source = client_address[0] if client_address else "?"
         with self._src_lock:
+            held = self._per_source.get(source, 0)
+            in_use = sum(self._per_source.values())
+            if held and (self.max_workers - in_use) <= self.newcomer_reserve:
+                self.rejected_overload += 1
+                log.debug(
+                    "relay: %s already holds %d connection(s); the last "
+                    "%d slots are reserved for sensors holding none",
+                    source, held, self.newcomer_reserve)
+                self.shutdown_request(request)
+                return
             if self._per_source.get(source, 0) >= self.max_per_source:
                 self.rejected_overload += 1
                 log.warning(
@@ -553,7 +570,11 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             # bounds only the request — a peer that opens a connection,
             # sends one byte and stops would pin a worker thread forever
             # without ever authenticating or reaching the rate limiter.
-            self.request.settimeout(self.timeout)
+            # A short deadline for the HANDSHAKE specifically. The
+            # request timeout is for a peer that has proven something;
+            # a peer that has not should not be able to hold a worker
+            # slot for the full window just by opening a socket.
+            self.request.settimeout(_HANDSHAKE_TIMEOUT)
             self.connection = ctx.wrap_socket(self.request, server_side=True)
             self.request = self.connection
             self.connection.settimeout(self.timeout)
@@ -608,22 +629,32 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                             {"error": f"body over {server.cfg.max_body_bytes} bytes"})
                 return
 
-            try:
-                body = self.rfile.read(length)
-            except (TimeoutError, socket.timeout, OSError):
-                return
-            if len(body) != length:
-                self._reply(HTTPStatus.BAD_REQUEST, {"error": "short body"})
-                return
-
-            try:
-                status, payload = server.handle_batch(source, body, self.headers)
-            except Exception:       # noqa: BLE001
-                # Never return exception text to a client.
-                log.exception("relay: ingest failed")
-                self._reply(HTTPStatus.INTERNAL_SERVER_ERROR,
-                            {"error": "internal error"})
-                return
+            # The CPU slot is taken BEFORE the body is read, not
+            # after. Reading first meant every accepted connection
+            # buffered up to max_body_bytes while parked waiting for
+            # the slot — sixteen of those is 128 MB of bodies resident
+            # on top of the parses, and it was the larger half of a
+            # measured 591 MB peak. Now only the batches that are
+            # actually being worked on are in memory; the rest are a
+            # thread and a socket.
+            with server._cpu_slot:
+                try:
+                    body = self.rfile.read(length)
+                except (TimeoutError, socket.timeout, OSError):
+                    return
+                if len(body) != length:
+                    self._reply(HTTPStatus.BAD_REQUEST,
+                                {"error": "short body"})
+                    return
+                try:
+                    status, payload = server.handle_batch(
+                        source, body, self.headers)
+                except Exception:       # noqa: BLE001
+                    log.exception("relay: ingest failed")
+                    self._reply(HTTPStatus.INTERNAL_SERVER_ERROR,
+                                {"error": "internal error"})
+                    return
             self._reply(status, payload)
+            return
 
     return Handler
