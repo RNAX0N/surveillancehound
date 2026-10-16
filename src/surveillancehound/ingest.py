@@ -629,31 +629,35 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
                             {"error": f"body over {server.cfg.max_body_bytes} bytes"})
                 return
 
-            # The CPU slot is taken BEFORE the body is read, not
-            # after. Reading first meant every accepted connection
-            # buffered up to max_body_bytes while parked waiting for
-            # the slot — sixteen of those is 128 MB of bodies resident
-            # on top of the parses, and it was the larger half of a
-            # measured 591 MB peak. Now only the batches that are
-            # actually being worked on are in memory; the rest are a
-            # thread and a socket.
-            with server._cpu_slot:
-                try:
-                    body = self.rfile.read(length)
-                except (TimeoutError, socket.timeout, OSError):
-                    return
-                if len(body) != length:
-                    self._reply(HTTPStatus.BAD_REQUEST,
-                                {"error": "short body"})
-                    return
-                try:
+            # Read the body OUTSIDE the CPU slot.
+            #
+            # Holding the slot across the read was a slowloris on the
+            # CPU limit: two clients that complete the handshake,
+            # declare a large Content-Length and then dribble bytes
+            # held both slots for the full socket timeout, and a
+            # legitimate sensor got 5 of 10 batches in. A slow reader
+            # must cost a thread, which is plentiful, not a CPU slot,
+            # of which there are two.
+            #
+            # The memory that motivated moving it inside is handled by
+            # max_body_bytes instead: at the 2 MB default, all 16
+            # connections buffering at once is 32 MB.
+            try:
+                body = self.rfile.read(length)
+            except (TimeoutError, socket.timeout, OSError):
+                return
+            if len(body) != length:
+                self._reply(HTTPStatus.BAD_REQUEST, {"error": "short body"})
+                return
+            try:
+                with server._cpu_slot:
                     status, payload = server.handle_batch(
                         source, body, self.headers)
-                except Exception:       # noqa: BLE001
-                    log.exception("relay: ingest failed")
-                    self._reply(HTTPStatus.INTERNAL_SERVER_ERROR,
-                                {"error": "internal error"})
-                    return
+            except Exception:       # noqa: BLE001
+                log.exception("relay: ingest failed")
+                self._reply(HTTPStatus.INTERNAL_SERVER_ERROR,
+                            {"error": "internal error"})
+                return
             self._reply(status, payload)
             return
 

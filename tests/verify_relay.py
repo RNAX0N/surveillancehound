@@ -2568,6 +2568,25 @@ def _check_ingest_does_not_stall_capture(tmp: Path) -> None:
             f"the number that protects capture"
         )
 
+        # The CPU slot must NOT be held across the body read. Holding
+        # it there was a slowloris on the CPU limit: two clients that
+        # finish the handshake, declare a large Content-Length and
+        # then dribble held both slots for the full socket timeout,
+        # and a legitimate sensor got 5 of 10 batches in. Asserted
+        # structurally because reproducing it needs real sockets and
+        # real time; the shape is what matters.
+        import inspect
+
+        from surveillancehound import ingest as _ing
+        src_do_post = inspect.getsource(_ing._make_handler)
+        body_at = src_do_post.index("self.rfile.read(length)")
+        slot_at = src_do_post.index("server._cpu_slot")
+        assert body_at < slot_at, (
+            "the body is read while holding the CPU slot; a slow "
+            "sender then occupies one of two slots for the whole "
+            "socket timeout and starves every other sensor"
+        )
+
         # The gate itself, asserted directly. The timing loop above
         # exercises the one-writer slot; at this fixture's load the
         # slot alone keeps contention low, so removing the gate does
