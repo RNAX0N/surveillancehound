@@ -301,8 +301,19 @@ keep      = 5
 # how little disk is left — not by trust.
 #
 # remote_retention_days = 30.0     # age out relayed rows; 0 keeps forever
+# max_notifications_per_minute = 60  # per sensor; 0 disables. Caps PAGING
+#                                    # only — alerts are still stored and
+#                                    # shown. Dedup bounds repeats of one
+#                                    # alert; this bounds distinct ones.
 # max_rows_per_sensor   = 250000   # per table, oldest trimmed first; 0 = no cap
 # min_free_disk_mb      = 256.0    # refuse ingest below this; 0 disables
+#
+# NOTE on NAT: the ingest limits key on SOURCE ADDRESS, so agents behind
+# one NAT share a connection cap and a batch budget. That is fine at the
+# default 30s cadence, but after a long outage several agents flushing
+# their spools at once can starve each other into 429s. Give them
+# distinct addresses, or stagger batch_seconds, if you run more than a
+# couple behind one NAT.
 #
 # A trimmed or refused batch is not lost data in the usual case: the agent
 # spools what it could not deliver and resends it. These limits exist so a

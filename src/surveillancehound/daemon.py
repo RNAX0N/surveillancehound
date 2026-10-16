@@ -45,6 +45,7 @@ import queue
 import sqlite3
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -180,7 +181,9 @@ class Hound:
         # sensor_id -> last_seen at the moment we declared it down
         self._sensors_down: dict[str, float] = {}
         # (sensor_id, dedup_key) -> when we last DISPATCHED it
-        self._relay_last_dispatch: dict[tuple[str, str], float] = {}
+        self._relay_last_dispatch: dict[tuple, float] = {}
+        self._relay_notify_times: dict[str, deque] = {}
+        self._relay_budget_warned: dict[str, bool] = {}
         # Bounded hand-off from the ingest threads to one dispatch worker.
         self._relay_alertq: queue.Queue | None = (
             queue.Queue(maxsize=_RELAY_ALERT_QUEUE)
@@ -666,11 +669,18 @@ class Hound:
 
         def _run() -> None:
             while True:
+                # Check the flag FIRST, every iteration. Checking it only
+                # on an empty queue meant a remote-filled backlog kept
+                # the worker dispatching through shutdown: the 10s join
+                # expired, the store closed underneath it, and it then
+                # logged a ProgrammingError per queued alert — with the
+                # sensor choosing how long shutdown took and how much
+                # noise it made.
+                if self._relay_stop.is_set():
+                    return
                 try:
                     item = self._relay_alertq.get(timeout=0.5)
                 except queue.Empty:
-                    if self._relay_stop.is_set():
-                        return
                     continue
                 if item is None:
                     return
@@ -727,10 +737,23 @@ class Hound:
         #    row cannot answer this: the listener writes the batch before
         #    dispatch, and several queued copies can map to one row, so a
         #    row-based check either suppresses everything or nothing.
-        dkey = (sensor_id, raw["dedup_key"])
+        # Two identities, both of which must be fresh.
+        #
+        # `dedup_key` is what the alert is ABOUT. `remote_id` is the
+        # sensor's own id for the record, and the collector stores one
+        # row per (sensor_id, remote_id) — so reusing it across batches
+        # with different content stored the FIRST copy and paged every
+        # one. Fifty batches reusing id 1 produced fifty pages, one
+        # stored row, and fifty audit rows citing content that was never
+        # the thing sent. Treating a reused id as the same record is
+        # what keeps the record and the page agreeing.
+        dkey = ("k", sensor_id, raw["dedup_key"])
+        rkey = ("r", sensor_id, raw["remote_id"])
+        for k in (dkey, rkey):
+            seen = self._relay_last_dispatch.get(k)
+            if seen is not None and (now - seen) < window:
+                return
         sent = self._relay_last_dispatch.get(dkey)
-        if sent is not None and (now - sent) < window:
-            return
         # 2) What we RECEIVED before this process started, so a restart
         #    does not re-notify the backlog. Measured on ingested_at —
         #    collector time — never the sensor-supplied ts, which would
@@ -744,6 +767,7 @@ class Hound:
                 return
 
         self._relay_last_dispatch[dkey] = now
+        self._relay_last_dispatch[rkey] = now
         if len(self._relay_last_dispatch) > _RELAY_DEDUP_MAX:
             # Bounded: the keyspace is sensor-controlled via dedup_key.
             # Dropping the oldest can at worst re-notify something, never
@@ -752,6 +776,9 @@ class Hound:
                             key=self._relay_last_dispatch.get,
                             )[:_RELAY_DEDUP_MAX // 2]:
                 del self._relay_last_dispatch[k]
+        if not self._relay_notify_budget(sensor_id, now):
+            return
+
         alert = Alert(
             ts=raw["ts"], device_ip=raw["device_ip"], kind=raw["kind"],
             severity=raw["severity"], summary=raw["summary"],
@@ -769,6 +796,38 @@ class Hound:
 
         self.dispatcher.dispatch(alert, None, on_attempt=_audit)
         self.stats.alerts_emitted += 1
+
+    def _relay_notify_budget(self, sensor_id: str, now: float) -> bool:
+        """Per-sensor cap on NOTIFICATIONS, not on storage.
+
+        Dedup bounds repeats of one alert; this bounds distinct ones. A
+        sensor holding a valid key can otherwise emit alerts with
+        distinct dedup keys as fast as it can post, and every one fans
+        out to email, webhook and FTP. The alerts themselves are still
+        stored, still relayed to the dashboard, and still audited — only
+        the paging stops, which is the part that cannot be undone.
+        """
+        cap = self.cfg.relay.max_notifications_per_minute
+        if cap <= 0:
+            return True
+        q = self._relay_notify_times.setdefault(sensor_id, deque())
+        while q and (now - q[0]) > 60.0:
+            q.popleft()
+        if len(q) >= cap:
+            self.stats.relayed_alerts_dropped += 1
+            if not self._relay_budget_warned.get(sensor_id):
+                self._relay_budget_warned[sensor_id] = True
+                log.warning(
+                    "relay: sensor %r hit its notification budget of %d/min; "
+                    "further alerts from it are stored and shown but not "
+                    "dispatched until it slows down. Raise [relay] "
+                    "max_notifications_per_minute if this is legitimate.",
+                    sensor_id, cap,
+                )
+            return False
+        self._relay_budget_warned[sensor_id] = False
+        q.append(now)
+        return True
 
     def _emit(self, alert: Alert) -> int:
         row = AlertRow(

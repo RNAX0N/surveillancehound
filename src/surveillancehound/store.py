@@ -965,11 +965,16 @@ class HoundStore:
     # Append-only relayed tables and the column that orders them oldest-first.
     # Upsert-keyed tables are capped too: a sensor can claim an unbounded
     # number of distinct IPs, so "one row per IP" is not a bound.
+    # Ordered by COLLECTOR time in every case. Trimming on a
+    # sensor-supplied column lets a sensor stamp its rows far in the
+    # future so they sort newest and survive, pushing its own real
+    # history — and, within its own quota, nothing else — out first.
+    # `prune_remote` was already corrected this way; the trim was not.
     _QUOTA_TABLES = (
-        ("remote_flows", "last_seen"),
-        ("remote_alerts", "ts"),
-        ("remote_outages", "down_since"),
-        ("remote_devices", "last_seen"),
+        ("remote_flows", "ingested_at"),
+        ("remote_alerts", "ingested_at"),
+        ("remote_outages", "ingested_at"),
+        ("remote_devices", "ingested_at"),
         ("remote_uptime", "reported_at"),
     )
 

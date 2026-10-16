@@ -215,6 +215,11 @@ class RelayCfg:
     # full. A wedged SQLite write is a far worse failure than a rejected
     # batch the agent will spool and resend. 0 disables.
     min_free_disk_mb: float = 256.0
+    # Dedup bounds repeats of the SAME alert. This bounds distinct ones:
+    # an authenticated sensor can otherwise drive 200 alerts per batch
+    # into email, webhook and FTP at the batch rate. The alerts are still
+    # stored and still on the dashboard; only the paging is capped.
+    max_notifications_per_minute: int = 60
     sensors: list[RelaySensorCfg] = field(default_factory=list)
 
     @property
@@ -562,6 +567,8 @@ def _relay_from(data: dict, network: "NetworkCfg") -> RelayCfg:
         remote_retention_days=float(rl.get("remote_retention_days", 30.0)),
         max_rows_per_sensor=int(rl.get("max_rows_per_sensor", 250_000)),
         min_free_disk_mb=float(rl.get("min_free_disk_mb", 256.0)),
+        max_notifications_per_minute=int(
+            rl.get("max_notifications_per_minute", 60)),
         sensors=[
             RelaySensorCfg(id=str(x.get("id", "")).strip(),
                            key=str(x.get("key", "")))

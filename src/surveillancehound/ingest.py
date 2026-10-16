@@ -368,20 +368,34 @@ class _Server(ThreadingHTTPServer):
             return
         with self._src_lock:
             self._per_source[source] = self._per_source.get(source, 0) + 1
-        super().process_request(request, client_address)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # The slot and the counter are released in the worker's
+            # `finally` — which never runs if the thread fails to spawn
+            # (MemoryError, "can't start new thread"), i.e. exactly under
+            # the resource pressure an attacker is pushing toward. Six
+            # leaks from one address would lock that address out for the
+            # life of the process, turning the anti-lockout counter into
+            # the lockout.
+            self._release(source)
+            raise
+
+    def _release(self, source: str) -> None:
+        self._slots.release()
+        with self._src_lock:
+            n = self._per_source.get(source, 1) - 1
+            if n > 0:
+                self._per_source[source] = n
+            else:
+                self._per_source.pop(source, None)
 
     def process_request_thread(self, request, client_address):
         source = client_address[0] if client_address else "?"
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._slots.release()
-            with self._src_lock:
-                n = self._per_source.get(source, 1) - 1
-                if n > 0:
-                    self._per_source[source] = n
-                else:
-                    self._per_source.pop(source, None)
+            self._release(source)
 
 
 def _make_handler(server: IngestServer, ctx: ssl.SSLContext):

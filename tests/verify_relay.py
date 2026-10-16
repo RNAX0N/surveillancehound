@@ -1320,6 +1320,60 @@ def _check_relayed_dispatch_is_quarantined(tmp: Path) -> None:
         print("  relayed dispatch: a repeated remote_id cannot multiply "
               "notifications, and such a batch is refused")
 
+        # Reusing one remote_id ACROSS batches must not page repeatedly.
+        # The collector stores one row per (sensor_id, remote_id), so
+        # fifty batches reusing id 1 stored the first and paged all
+        # fifty — fifty audit rows citing content that was never sent.
+        _Count.n = 0
+        for i in range(50):
+            a = {
+                "remote_id": 1, "ts": real_now + i, "device_ip": "10.9.0.10",
+                "kind": "camera_offline", "severity": "critical",
+                "summary": f"page #{i}", "detail": "",
+                "dedup_key": f"varies-{i}",
+            }
+            store.ingest_remote_batch(
+                "reuser", "inst", i + 1,
+                V.validate_records({"alerts": [a]}, 10), real_now + i)
+            hound._dispatch_relayed_alert("reuser", a)
+        stored = store._conn.execute(
+            "SELECT COUNT(*) c FROM remote_alerts WHERE sensor_id='reuser'"
+        ).fetchone()["c"]
+        assert _Count.n == 1 and stored == 1, (
+            f"a reused remote_id paged {_Count.n} time(s) against {stored} "
+            f"stored row(s); the record and the page must agree"
+        )
+
+        # A per-sensor NOTIFICATION budget, since distinct dedup keys
+        # bypass dedup entirely. Storage must be unaffected — only the
+        # paging is capped, because that is the part that cannot be
+        # taken back.
+        hound.cfg.relay.max_notifications_per_minute = 5
+        hound._relay_notify_times.clear()
+        _Count.n = 0
+        for i in range(40):
+            a = {
+                "remote_id": 2000 + i, "ts": real_now, "device_ip": "10.9.0.11",
+                "kind": "bulk_inbound", "severity": "critical",
+                "summary": f"burst {i}", "detail": "",
+                "dedup_key": f"burst-{i}",
+            }
+            store.ingest_remote_batch(
+                "burst", "inst", i + 1,
+                V.validate_records({"alerts": [a]}, 10), real_now)
+            hound._dispatch_relayed_alert("burst", a)
+        burst_rows = store._conn.execute(
+            "SELECT COUNT(*) c FROM remote_alerts WHERE sensor_id='burst'"
+        ).fetchone()["c"]
+        assert _Count.n == 5, f"budget not enforced: {_Count.n} pages"
+        assert burst_rows == 40, (
+            f"the budget must cap PAGING only; {burst_rows}/40 alerts "
+            f"reached storage, so the dashboard would under-report"
+        )
+        hound.cfg.relay.max_notifications_per_minute = 60
+        print("  relayed dispatch: reused remote_id pages once; per-sensor "
+              "notification budget caps paging but not storage")
+
         # The ingest thread must only ENQUEUE. Dispatching inline would let
         # one authenticated batch hold an ingest thread for as long as its
         # slowest channel takes.
@@ -1745,6 +1799,99 @@ def _check_agent_state(tmp: Path) -> None:
           "4 watermark cursors persist; diagnostics do not rewrite it")
 
 
+def _check_shutdown_and_slot_release(tmp: Path) -> None:
+    """Shutdown must not be hostage to a remote-filled queue, and a
+    failed worker spawn must not leak a connection slot."""
+    import queue as _q
+    import time as _t
+
+    from surveillancehound import daemon as daemon_mod
+    from surveillancehound.config import load_from_dict
+
+    class _Slow:
+        type, level = "stdout", "info"
+
+        def dispatch(self, alert):
+            _t.sleep(0.05)
+
+    cfg = load_from_dict({
+        "capture": {"interface": "test0"},
+        "network": {"camera_ips": ["10.9.0.5"]},
+        "store": {"path": str(tmp / "shutdown.sqlite")},
+        "notify": [{"type": "stdout", "level": "info"}],
+        "relay": {
+            "mode": "collector", "listen_host": "127.0.0.1", "listen_port": 0,
+            "cert_file": str(FIXTURES / "ingest-test.crt"),
+            "key_file": str(FIXTURES / "ingest-test.key"),
+            "sensor": [{"id": "frigate", "key": "shared-secret-abcdef"}],
+        },
+    })
+    hound = daemon_mod.Hound(cfg)
+    hound.dispatcher.channels = [_Slow()]
+    try:
+        hound._start_relay_dispatch()
+        raw = {"remote_id": 1, "ts": T0, "device_ip": "10.0.0.5",
+               "kind": "new_device", "severity": "high", "summary": "s",
+               "detail": "", "dedup_key": "k"}
+        for i in range(1000):
+            try:
+                hound._relay_alertq.put_nowait(
+                    ("frigate", dict(raw, remote_id=i, dedup_key=f"k{i}")))
+            except _q.Full:
+                break
+        t0 = _t.time()
+        hound._stop_relay_dispatch()
+        elapsed = _t.time() - t0
+        assert elapsed < 3.0, (
+            f"shutdown took {elapsed:.1f}s with a full queue. The stop flag "
+            f"must be checked every iteration, not only when the queue is "
+            f"empty — otherwise a remote sensor decides how long shutdown "
+            f"takes, and the worker outlives the store it writes to"
+        )
+    finally:
+        hound.store.close()
+
+    # A failed thread spawn must release both the semaphore and the
+    # per-source count, or six failures lock that address out for good —
+    # the anti-lockout counter becoming the lockout.
+    from surveillancehound.ingest import _Server
+
+    class _Boom(_Server):
+        def __init__(self):            # no socket; we only exercise bookkeeping
+            self._slots = __import__("threading").BoundedSemaphore(4)
+            self._per_source = {}
+            self._src_lock = __import__("threading").Lock()
+            self.rejected_overload = 0
+
+        def shutdown_request(self, request):
+            pass
+
+        def process_request_thread(self, request, client_address):
+            raise AssertionError("must not be reached")
+
+    srv = _Boom()
+    import socketserver
+    orig = socketserver.ThreadingMixIn.process_request
+
+    def _fail(self, request, client_address):
+        raise RuntimeError("can't start new thread")
+
+    socketserver.ThreadingMixIn.process_request = _fail
+    try:
+        for _ in range(8):
+            try:
+                srv.process_request(None, ("10.0.0.9", 1234))
+            except RuntimeError:
+                pass
+    finally:
+        socketserver.ThreadingMixIn.process_request = orig
+    assert srv._per_source.get("10.0.0.9", 0) == 0, (
+        f"per-source count leaked on spawn failure: {srv._per_source}"
+    )
+    print("  shutdown: prompt with a full queue; slots released on spawn "
+          "failure")
+
+
 def main() -> int:
     import tempfile
     print("=== relay validation ===")
@@ -1768,6 +1915,7 @@ def main() -> int:
         _check_replay_opens_no_listener(Path(td))
         _check_spool_counters(Path(td))
         _check_agent_state(Path(td))
+        _check_shutdown_and_slot_release(Path(td))
     print("=== listener ===")
     with tempfile.TemporaryDirectory() as td:
         _check_listener(Path(td))
