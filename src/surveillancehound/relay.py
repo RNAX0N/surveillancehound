@@ -753,7 +753,8 @@ class RelayClient:
             self.state.save()
             return seq
 
-    def flush(self, deadline: float | None = None) -> bool:
+    def flush(self, deadline: float | None = None,
+              ignore_stop: bool = False) -> bool:
         """Try to deliver everything spooled. True if the spool emptied."""
         with self._lock:
             pending = self.spool.pending(self.now())
@@ -768,7 +769,7 @@ class RelayClient:
             # batches; the loser got 409s and recorded them as drops,
             # so `hound relay` reported batches discarded that had in
             # fact been delivered.
-            if self._stop.is_set():
+            if self._stop.is_set() and not ignore_stop:
                 return False
             if deadline is not None and self.now() >= deadline:
                 log.info("relay: shutdown flush budget reached; %d batch(es) "
@@ -781,10 +782,16 @@ class RelayClient:
             # trying to catch up. Nothing is lost (a 429 ends the cycle
             # and the batch stays spooled), but the recovery is slower
             # and noisier than just going at a sustainable rate.
-            if i and not self._stop.wait(_REPLAY_PACE_S):
-                pass
-            elif i:
-                return False
+            if i:
+                if ignore_stop:
+                    # `_stop` is set during a final flush, so waiting
+                    # on it returns instantly and the pacing vanishes
+                    # — which would let a shutdown drain outrun the
+                    # collector's request budget and earn 429s on the
+                    # way out. Pace on the clock instead.
+                    time.sleep(_REPLAY_PACE_S)
+                elif self._stop.wait(_REPLAY_PACE_S):
+                    return False
             try:
                 # Re-stamp: a batch spooled during an outage is older than
                 # the collector's skew window allows.
@@ -870,11 +877,15 @@ class RelayClient:
         # backlog" was never going to happen anyway. Send what fits;
         # the rest stays spooled for the next run, which is what the
         # spool is for.
-        self._stop.clear()
+        # Deliberately NOT self._stop.clear(). If the pusher's join
+        # timed out — a post can sit in a socket timeout — clearing
+        # the shared event would un-stop a thread we believe is gone,
+        # and the two would flush concurrently again. The flag below
+        # lets THIS call proceed without touching shared state.
         deadline = self.now() + _FINAL_FLUSH_BUDGET_S
         try:
             self.enqueue()
-            self.flush(deadline=deadline)
+            self.flush(deadline=deadline, ignore_stop=True)
         except Exception:               # noqa: BLE001
             log.exception("relay: final flush failed")
 
