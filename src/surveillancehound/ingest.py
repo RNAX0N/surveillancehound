@@ -784,15 +784,16 @@ def _make_handler(server: IngestServer, ctx: ssl.SSLContext):
             if len(body) != length:
                 self._reply(HTTPStatus.BAD_REQUEST, {"error": "short body"})
                 return
-            # The body is in, so this peer has done real work rather
-            # than held a socket open. Restart its budget so queueing
-            # for a CPU slot behind other batches cannot get it reaped
-            # mid-request.
-            if server._httpd is not None:
-                with server._httpd._src_lock:
-                    if self.request in server._httpd._deadlines:
-                        server._httpd._deadlines[self.request] = (
-                            time.monotonic() + _CONN_BUDGET)
+            # Deliberately NO deadline refresh here.
+            #
+            # It looked harmless — "the peer did real work, give it
+            # more time" — but keep-alive is on, and the refresh fires
+            # after ANY body is read, including one that goes on to be
+            # rejected 401. An unauthenticated peer could hold a slot
+            # forever by sending a small request before each timeout.
+            # It also buys nothing: the worst legitimate connection is
+            # a 2 MB upload on a 512 kbit link plus a handshake plus a
+            # CPU-slot queue, about 42s against a 120s budget.
             try:
                 with server._cpu_slot:
                     status, payload = server.handle_batch(
