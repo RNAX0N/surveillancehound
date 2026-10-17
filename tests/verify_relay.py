@@ -3657,14 +3657,24 @@ def _check_admission_gates_are_live(tmp: Path) -> None:
     # the module global while `is_proven` read the override, so a
     # shortened window kept entries the proven check already called
     # expired — two TTLs in one mechanism.
+    #
+    # `max_trusted = 2` with TWO stale entries, deliberately. With a
+    # ceiling of 1 the "still over, evict oldest" fallback removes
+    # the stale entry whichever TTL the prune read, so the assertion
+    # passed against the two-TTL code it was written to catch. Here
+    # the prune is the only thing that can remove them: the ceiling
+    # is not exceeded after the TTL pass, and is by exactly one if
+    # the TTL pass does nothing.
     probe._src_lock = __import__("threading").Lock()
-    probe.max_trusted = 1
+    probe.max_trusted = 2
     probe._trusted_ttl = 0.001
-    probe._trusted = {"10.0.0.96": _ingmod.time.monotonic() - 1.0}
+    mono = _ingmod.time.monotonic()
+    probe._trusted = {"10.0.0.96": mono - 1.0, "10.0.0.94": mono - 2.0}
     probe.mark_trusted("10.0.0.95")
-    assert "10.0.0.96" not in probe._trusted, (
-        "mark_trusted kept a source its own is_proven calls expired; "
-        "the TTL must be read from one place")
+    assert sorted(probe._trusted) == ["10.0.0.95"], (
+        f"mark_trusted kept sources its own is_proven calls expired "
+        f"({sorted(probe._trusted)}); the TTL must be read from one "
+        f"place, or a shortened window prunes on the long one")
 
 
     print("  admission gates: 507 on low disk, 400 on a forged sequence "
@@ -5553,6 +5563,35 @@ def _check_relay_diagnostic_does_not_invent_a_backlog(tmp: Path) -> None:
         "it blamed counters.json over a damaged state.json again, one "
         "field across from where the first fix looked")
 
+    # Every value a bare `int()` SILENTLY COERCES, not just the ones
+    # it raises on. `"garbage"` above only proves the exception path.
+    # Each of these produced `next_seq = 1` with the state looking
+    # loaded, so the clamp blamed an intact counters file and
+    # reported all 20 batches as backlog. A sequence is a positive
+    # int; everything else is a damaged file.
+    for bad in ('true', '"1"', '-5', '1.9', None):
+        if bad is None:
+            doc = '{"instance_id": "inst-aaaa1111"}'          # key absent
+        else:
+            doc = '{"instance_id": "inst-aaaa1111", "next_seq": %s}' % bad
+        (base / "state.json").write_text(doc)
+        line, full = spooled_line()
+        assert "2 batch" in line, (
+            f"state.json with next_seq={bad} reported {line.strip()!r} "
+            f"instead of 2. A bare int() does not fail on a wrong "
+            f"value, it invents a plausible one — so 'did the parse "
+            f"raise' is not the same question as 'is this a sequence'")
+        assert "counters file is damaged" not in full, (
+            f"next_seq={bad} made it blame the intact counters file")
+    # A null identity must not become the string "None" and wedge the
+    # agent under a junk instance id that no re-mint guard can clear.
+    (base / "state.json").write_text(
+        '{"instance_id": null, "next_seq": 21}')
+    line, full = spooled_line()
+    assert "instance      unknown" in full, (
+        f"a null instance_id was accepted as the literal string "
+        f"'None':\n{full}")
+
     # And with BOTH damaged the command must not go quiet: it cannot
     # clamp, so `spooled` undercounts while the daemon re-sends the
     # lot. Under-reporting is the right way to fail — this command
@@ -5602,6 +5641,118 @@ def _check_watermark_load_rejects_non_integers(tmp: Path) -> None:
             f"particular becomes 1 and swallows seq 0")
     print("  watermark load: a string, bool, float or null is refused "
           "rather than coerced into hiding batches")
+
+
+def _check_accounting_survives_a_reminted_sequence(tmp: Path) -> None:
+    """Randomised ground truth at ENTRY granularity, with duplicates.
+
+    `_check_spool_accounting_matches_reality` models what happened as
+    a set of SEQUENCES, so it is structurally blind to the crash
+    window `enqueue` actually has: the spool append happens before
+    `state.save()`, so a kill between them leaves a sequence spooled
+    that the next run mints again, and the file then holds two
+    entries numbered the same. That is how pairing the dropped set by
+    sequence got all the way to a review — evicting one of a pair
+    found the survivor's number among the kept and counted nothing,
+    and a set-of-sequences model cannot see the difference.
+
+    This harness tracks individual ENTRIES by body and classifies
+    every disappearance at the moment it happens, against the
+    watermark as it stood then:
+
+    * gone with `seq <= acked_through` — swept as delivered, not loss
+    * gone during an explicit `drop()`  — a collector rejection
+    * gone any other way                — loss, and a counter must move
+
+    Anything else is either hidden loss or invented loss, and the
+    project treats those as the same defect.
+    """
+    import random as _rnd
+    from surveillancehound.relay import Spool
+
+    def bodies(sp):
+        return {e["body"]: e["seq"] for e in sp._read()}
+
+    def one(seed: int):
+        r = _rnd.Random(seed)
+        d = tmp / f"remint{seed}"
+        sp = Spool(d, r.choice([2048, 16384, 1 << 20]),
+                   r.choice([30.0, 300.0]))
+        now, nxt, uid = T0, 1, 0
+        seen = {}                      # body -> seq, as of the last op
+        expect_lost = 0
+        expect_rejected = 0
+
+        def settle(during_drop_seq=None):
+            nonlocal seen, expect_lost, expect_rejected
+            after = bodies(sp)
+            for body, seq in seen.items():
+                if body in after:
+                    continue
+                if during_drop_seq is not None and seq == during_drop_seq:
+                    expect_rejected += 1
+                elif seq <= sp.acked_through:
+                    pass               # swept as delivered
+                else:
+                    expect_lost += 1
+            seen = after
+
+        for _ in range(r.randint(20, 90)):
+            op = r.choices(
+                ["append", "crash", "ack", "dup", "drop", "restart", "time"],
+                [34, 10, 20, 8, 6, 6, 16])[0]
+            if op in ("append", "crash"):
+                uid += 1
+                sp.append(nxt, b'{"u":%d,"x":"%s"}'
+                          % (uid, b"p" * r.randint(10, 300)), now)
+                # A crash re-mints: the entry is spooled but the
+                # advanced `next_seq` never reached disk, so the
+                # NEXT append reuses this number.
+                if op == "append":
+                    nxt += 1
+                settle()
+            elif op in ("ack", "dup"):
+                p = sp.pending(now)
+                if p:
+                    q = p[0][0]
+                    if op == "ack":
+                        sp.ack(q)
+                    else:
+                        sp.already_delivered(q, q)
+                    settle()
+            elif op == "drop":
+                p = sp.pending(now)
+                if p:
+                    q = p[0][0]
+                    sp.drop(q, "rejected by the collector")
+                    settle(during_drop_seq=q)
+            elif op == "restart":
+                sp = Spool(d, sp.max_bytes, sp.max_age)
+                settle()
+            else:
+                now += r.choice([1, 10, 60, 400])
+        uid += 1
+        sp.append(nxt, b'{"u":%d,"final":1}' % uid, now)
+        settle()
+        st = sp.stats(now)
+        return (expect_lost, st.dropped_age + st.dropped_size,
+                expect_rejected, st.dropped_stale)
+
+    wrong = []
+    seeds = 120
+    for seed in range(seeds):
+        lost, reported, rej, stale = one(seed)
+        if lost != reported or rej != stale:
+            wrong.append((seed, lost, reported, rej, stale))
+    assert not wrong, (
+        f"{len(wrong)} of {seeds} randomised sequences mis-report once "
+        f"a sequence can be re-minted. First: seed {wrong[0][0]} lost "
+        f"{wrong[0][1]} entries and reported {wrong[0][2]}; rejected "
+        f"{wrong[0][3]} against {wrong[0][4]} counted. A duplicated "
+        f"sequence must not let an eviction go unrecorded")
+    print(f"  spool accounting: {seeds} randomised runs WITH re-minted "
+          f"sequences; every entry's disappearance accounted for at "
+          f"the moment it happened")
 
 
 def _check_drop_attribution_names_the_right_cap(tmp: Path) -> None:
@@ -6146,6 +6297,29 @@ def _check_delivered_entries_are_not_counted_as_aged_out(tmp: Path) -> None:
         f"observations are about to be discarded and the warning does "
         f"not say so: {msg2}")
     assert not sp3.pending(T0 + 10_000), "nothing should be deliverable"
+
+    # The ordinary case, and the one the loss branch got wrong: an
+    # agent that delivered everything, compacted to an empty spool,
+    # and then had its counters damaged. Nothing was hidden and
+    # nothing is lost, and announcing loss here is the same error as
+    # the silent discard this clamp replaced, pointing the other way.
+    sp4 = Spool(tmp / "emptyspool", 64 * 1024 * 1024, 100.0)
+    sp4._acked_through = 10 ** 18
+    said.clear()
+    lg.addHandler(g)
+    try:
+        sp4.reconcile_watermark(5, T0)
+    finally:
+        lg.removeHandler(g)
+    msg3 = next(m for lv, m in said if "watermark" in m)
+    assert "observations are lost" not in msg3, (
+        f"an empty spool cannot have lost anything, and the clamp "
+        f"said: {msg3}")
+    assert "counted as dropped" not in msg3, (
+        f"there is nothing to count as dropped: {msg3}")
+    assert "nothing is lost" in msg3, (
+        f"it should say so plainly rather than leaving the operator "
+        f"to infer it: {msg3}")
     print("  ack watermark: delivered entries never counted as aged "
           "out, survives restart, five corruption modes re-send "
           "rather than discard, and a planted value is clamped and "
@@ -7243,6 +7417,7 @@ def main() -> int:
         _check_hound_relay_reports_duplicates(Path(td))
         _check_relay_diagnostic_does_not_invent_a_backlog(Path(td))
         _check_watermark_load_rejects_non_integers(Path(td))
+        _check_accounting_survives_a_reminted_sequence(Path(td))
         _check_drop_attribution_names_the_right_cap(Path(td))
         _check_ack_does_not_rewrite_the_whole_spool(Path(td))
         _check_delivered_entries_are_not_counted_as_aged_out(Path(td))

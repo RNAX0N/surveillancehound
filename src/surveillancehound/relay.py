@@ -679,8 +679,7 @@ class Spool:
             seqs = [e["seq"] for e in self._read()]
         return max(seqs) if seqs else None
 
-    def reconcile_watermark(self, highest_minted: int,
-                            now: float | None = None) -> None:
+    def reconcile_watermark(self, highest_minted: int, now: float) -> None:
         """Clamp an impossible delivered-watermark back below the spool.
 
         `counters.json` is best-effort and lives on disk beside the
@@ -696,13 +695,13 @@ class Spool:
         cannot have been acknowledged by anybody.
 
         `now` is only used to report accurately how many of the
-        re-exposed batches are still within the caps. Pass the
-        caller's clock; `_now_hint` is the fallback and is 0.0 before
-        the first push cycle, which would read every entry as fresh.
+        re-exposed batches are still within the caps, and is
+        REQUIRED. It defaulted to `_now_hint`, which is 0.0 before
+        the first push cycle — so the default read every entry as
+        fresh and produced the one thing this method exists to
+        avoid, a count that is not true.
         """
         with self._lock:
-            if now is None:
-                now = self._now_hint
             if self._acked_through <= highest_minted:
                 return
             # Clamp BELOW the lowest sequence still in the file, not
@@ -737,7 +736,22 @@ class Spool:
             # was written to fix.
             resent = len(self._deliverable(entries, now))
             stale = len(entries) - resent
-            if resent:
+            if not entries:
+                # Nothing to re-send and nothing lost: the agent had
+                # delivered everything and the spool was compacted.
+                # This is the ORDINARY damaged-counters case, and the
+                # loss branch below reported "0 spooled batch(es) ...
+                # those observations are lost" for it — a false loss
+                # report standing in for the false delivery report
+                # this clamp was written to remove.
+                log.warning(
+                    "relay: spool watermark claims batch %s was "
+                    "delivered but this agent has only ever created "
+                    "%s; the counters file is damaged. Clamping to "
+                    "%s. The spool is empty, so nothing was hidden "
+                    "and nothing is lost.",
+                    claimed, highest_minted, self._acked_through)
+            elif resent:
                 log.warning(
                     "relay: spool watermark claims batch %s was "
                     "delivered but this agent has only ever created "
@@ -745,16 +759,24 @@ class Spool:
                     "%s, so %d spooled batch(es) are re-sent — the "
                     "collector answers 409 for any it already holds%s.",
                     claimed, highest_minted, self._acked_through, resent,
-                    f". The other {stale} are past a spool cap and are "
-                    f"counted as dropped on the next sweep" if stale else "")
+                    f". The other {stale} cannot be sent — past a "
+                    f"spool cap, or below even the clamped watermark — "
+                    f"and are counted as dropped on the next sweep"
+                    if stale else "")
             else:
+                # Deliberately not "every one is past a cap": when the
+                # floor bottoms out at the sentinel because a planted
+                # sequence is negative, the survivors are below the
+                # watermark rather than expired. Say what is certain —
+                # they will not be sent — and not a reason that may
+                # not be the true one.
                 log.warning(
                     "relay: spool watermark claims batch %s was "
                     "delivered but this agent has only ever created "
                     "%s; the counters file is damaged. Clamping to "
                     "%s. None of the %d spooled batch(es) can be "
-                    "re-sent — every one is past spool_max_age_seconds "
-                    "or spool_max_bytes, and they are counted as "
+                    "re-sent — they are past a spool cap, or below "
+                    "even the clamped watermark — and are counted as "
                     "dropped on the next sweep. Those observations "
                     "are lost.",
                     claimed, highest_minted, self._acked_through,
@@ -815,13 +837,28 @@ class Spool:
             self._write(self._enforce_caps(kept, self._now_hint))
 
     def drop(self, seq: int, reason: str) -> None:
-        """Discard one batch the collector will never accept."""
+        """Discard one batch the collector will never accept.
+
+        Counts ENTRIES removed, not calls. A sequence is not unique in
+        the file — `enqueue` appends before it saves the advanced
+        `next_seq`, so a kill between those two writes leaves a
+        sequence the next run mints again — and `+= 1` then discarded
+        two observations while reporting one. Same defect as the
+        eviction counter had, on the other removal path.
+
+        Removing BOTH entries of a re-minted pair is itself coarse:
+        only the posted one was rejected, and the other is unrelated
+        data carrying the same number. Nothing in the file can tell
+        them apart, so the honest thing is to count what actually
+        went, which is what the operator needs to know.
+        """
         with self._lock:
-            self.dropped_stale += 1
-            self._save_counters()
             log.warning("relay: dropping spooled batch seq=%s (%s)", seq, reason)
             live = self._enforce_caps(self._read(), self._now_hint)
-            self._write([e for e in live if e["seq"] != seq])
+            kept = [e for e in live if e["seq"] != seq]
+            self.dropped_stale += len(live) - len(kept)
+            self._save_counters()
+            self._write(kept)
 
     def stats(self, now: float) -> SpoolStats:
         # The same view `pending()` would send, not the raw file. These
@@ -931,8 +968,33 @@ class AgentState:
                 # file whose `next_seq` was garbage produced a state
                 # that looked loaded and claimed the agent had never
                 # minted a sequence.
-                instance_id = str(d.get("instance_id", ""))
-                next_seq = int(d.get("next_seq", 1))
+                # STRICT on both identity fields, for the same reason
+                # `_load_counters` is strict about `acked_through`: a
+                # bare `int()`/`str()` does not fail on a wrong value,
+                # it invents a plausible one, and "did the conversion
+                # raise" is therefore not the same question as "is
+                # this a sequence".
+                #
+                # `next_seq` decides `highest_minted`, so every value
+                # that silently became 1 — `true`, `"1"`, `1.9`, a
+                # negative, a missing key — re-entered the bug the
+                # `loaded` flag was added to close: the clamp blames
+                # an intact counters file and reports the whole spool
+                # as backlog. A sequence is a positive int and nothing
+                # else; anything else is a damaged file.
+                raw_seq = d.get("next_seq")
+                if (not isinstance(raw_seq, int)
+                        or isinstance(raw_seq, bool) or raw_seq < 1):
+                    raise ValueError(f"next_seq is not a sequence: {raw_seq!r}")
+                next_seq = raw_seq
+                # `str()` of `None` is "None", which is non-empty, so
+                # the re-mint guard below never fired and the agent
+                # ran permanently as instance "None". A dict or list
+                # became its repr.
+                raw_id = d.get("instance_id", "")
+                if not isinstance(raw_id, str):
+                    raise ValueError(f"instance_id is not a string: {raw_id!r}")
+                instance_id = raw_id
                 watermark = Watermark.from_dict(d.get("watermark", {}))
                 last_push_ts = float(d.get("last_push_ts", 0.0))
                 last_error = str(d.get("last_error", ""))
@@ -1118,11 +1180,23 @@ class RelayClient:
         # can ever reach. Say which file is actually suspect, though,
         # or the clamp blames the counters for the state file's fault.
         if self.state.parse_failed:
+            # NOT "re-sent under it": `enqueue` bakes the identity into
+            # the body at spool time and `restamp` rewrites only
+            # `sent_at`, so spooled batches go under the OLD identity —
+            # which is exactly why the collector can still 409 them,
+            # since it matches on (sensor, instance, seq).
+            #
+            # The watermark reset is the big one and was missing: the
+            # per-kind positions go back to 0, so this run re-collects
+            # and re-relays the whole local store, not just the spool.
             log.warning(
-                "relay: state file at %s did not parse; this run starts "
-                "from sequence 1 with a new identity, and any spooled "
-                "batches are re-sent under it. The collector answers "
-                "409 for the ones it already holds.", self.state.path)
+                "relay: state file at %s did not parse. This run mints "
+                "a new identity and starts from sequence 1; the "
+                "per-kind watermarks reset too, so it re-relays this "
+                "sensor's whole store rather than only what is new. "
+                "Spooled batches still carry their original identity, "
+                "so the collector answers 409 for the ones it already "
+                "holds.", self.state.path)
         self.spool.reconcile_watermark(self.state.next_seq - 1,
                                        self.now())
         self._lock = threading.Lock()

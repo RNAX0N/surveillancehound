@@ -248,9 +248,11 @@ docker volume rm agent_hound-state
 
 ### Reading `hound relay` on the agent
 
-Real output, with the `dropped` and `duplicates` lines shown — both are
-printed only when their counters are non-zero, so a healthy agent ends
-at `spooled`:
+Real output. `dropped`, `duplicates` and `last error` each appear only
+when there is something to report, so a healthy agent ends at `spooled`.
+If the state file cannot be read the output is a **different shape** —
+`instance` and `next sequence` read `unknown`, there is no
+`delivered thru`, and a `warning` line may appear:
 
 ```
 relay: agent 'frigate' -> https://88.255.5.1:18443/ingest/v1
@@ -280,11 +282,16 @@ relay: agent 'frigate' -> https://88.255.5.1:18443/ingest/v1
 
 A gap between `delivered thru` and `next sequence - 1` with `spooled 0`
 means batches left the spool unacknowledged. Check `dropped` — but note
-that the counters only move when the **daemon** sweeps the spool. This
-command never mutates the spool (so a diagnostic can never destroy what
-it reports on), so on a *stopped* agent you can see the gap with no
-`dropped` line at all: the entries are still in `spool.jsonl`, already
-past their cap, and will be counted the moment the agent next runs.
+that the counters only move when the daemon actually **sweeps** the
+spool, which happens on a write (a batch spooled, acked, dropped or
+compacted), not at startup. This command never mutates the spool at all,
+so that a diagnostic cannot destroy what it reports on.
+
+So on a *stopped* agent you can see the gap with no `dropped` line: the
+entries are still in `spool.jsonl`, already past their cap, uncounted.
+Restarting the agent does not by itself count them either — it takes
+the first batch being spooled. Nothing is being hidden from you; the
+number simply has not been computed yet.
 
 ## What the agent does and does not do
 

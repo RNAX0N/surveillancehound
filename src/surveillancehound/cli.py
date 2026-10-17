@@ -729,11 +729,20 @@ def cmd_relay(args: argparse.Namespace) -> int:
         # the broken-state output cry wolf on every run.
         high = spool.highest_spooled_seq()
         if high is not None and spool.acked_through > high:
+            # "re-expose", not "re-send": re-exposed entries past a
+            # spool cap are swept, not sent. And the daemon's clamp
+            # condition is `acked_through > highest_minted`, which
+            # this command cannot evaluate — the state file holding
+            # that number is the one it could not read — so this
+            # guard is a superset and must not promise the daemon's
+            # behaviour as fact.
             print(f"  warning       counters claim delivery through "
                   f"{spool.acked_through}, above every sequence in the "
                   f"spool ({high}). With no readable state file this "
                   f"command will not act on that, so `spooled` below "
-                  f"may undercount; the daemon will re-send them.")
+                  f"may undercount. The daemon re-exposes them on its "
+                  f"next start and re-sends any still within the "
+                  f"spool caps.")
     if state.last_push_ts:
         print(f"  last push     {_dur(time.time() - state.last_push_ts)} ago")
     else:
