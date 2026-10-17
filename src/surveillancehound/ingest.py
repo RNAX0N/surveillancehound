@@ -879,8 +879,11 @@ class _Server(ThreadingHTTPServer):
         time.
         """
         last = self._trusted.get(source)
-        return (last is not None
-                and (time.monotonic() - last) < _TRUSTED_TTL)
+        # `_trusted_ttl` is an optional per-instance override, so a
+        # test can age the window out without touching a module
+        # global that every other thread shares.
+        ttl = getattr(self, "_trusted_ttl", _TRUSTED_TTL)
+        return last is not None and (time.monotonic() - last) < ttl
 
     def mark_trusted(self, source: str) -> None:
         now = time.monotonic()

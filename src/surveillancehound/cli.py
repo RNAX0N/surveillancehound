@@ -666,26 +666,45 @@ def cmd_relay(args: argparse.Namespace) -> int:
     # agent: read the spool, never the network
     from surveillancehound.relay import AgentState, Spool
     base = Path(cfg.store.path).parent / "relay"
-    state = AgentState.load(base, readonly=True)
+    # SPOOL FIRST, then state. The daemon always persists `next_seq`
+    # before it can ack that sequence, so reading counters before
+    # state cannot produce an inverted pair. The other order could:
+    # an ack landing between the two reads made `acked_through`
+    # exceed `next_seq - 1` and this command announced a damaged
+    # counters file during an ordinary push cycle. Observed 15 times
+    # in 4,000 reads against a 0.5 ms writer.
     spool = Spool(base, r.spool_max_bytes, r.spool_max_age_seconds,
                   readonly=True)
-    # Reconcile like the daemon does, or this command contradicts it.
-    # `RelayClient.__init__` clamps a delivered-watermark that is
-    # above anything the agent ever minted; without the same call
-    # here, `hound relay` reported `spooled 0 batch(es)` and no drops
-    # for a spool the daemon would clamp and re-send. This is the
-    # command documented to work when things are broken.
+    state = AgentState.load(base, readonly=True)
+    # Reconcile like the daemon does, or this command contradicts it
+    # — but ONLY when the state file was actually read.
     #
-    # Safe on a readonly Spool: `_save_counters` is a no-op there, so
-    # the clamp applies to this process's view and nothing is
-    # written under the daemon.
-    spool.reconcile_watermark(state.next_seq - 1)
+    # A readonly `AgentState.load` mints nothing, so an unreadable or
+    # torn state file yields `next_seq = 1` and the clamp then says
+    # "this agent has only ever created 0", blames an intact
+    # `counters.json`, and un-hides every delivered batch. Measured
+    # with 20 batches of which 18 were delivered: it reported a
+    # backlog of 20. Announcing a backlog that does not exist is the
+    # project's cardinal sin, and this is the command documented to
+    # work when things are broken.
+    #
+    # `instance_id` is the readable-state signal: the daemon writes
+    # it on first run and never clears it. The daemon's own path is
+    # unaffected — there a fresh identity is real.
+    #
+    # Safe on a readonly Spool either way: `_save_counters` is a
+    # no-op there, so the clamp applies to this process's view and
+    # nothing is written under a running daemon.
+    if state.instance_id:
+        spool.reconcile_watermark(state.next_seq - 1)
     st = spool.stats(time.time())
     print(f"relay: agent {r.sensor_id!r} -> {r.url}")
     if state.instance_id:
         print(f"  instance      {state.instance_id}")
         print(f"  next sequence {state.next_seq}")
-        print(f"  delivered thru {spool.acked_through}")
+        thru = spool.acked_through
+        print(f"  delivered thru "
+              f"{thru if thru >= 0 else 'none yet'}")
     else:
         # readonly load mints nothing, so an absent id means the agent
         # has never run OR its state file is unreadable. Printing a

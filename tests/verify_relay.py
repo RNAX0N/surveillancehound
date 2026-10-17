@@ -3640,9 +3640,14 @@ def _check_admission_gates_are_live(tmp: Path) -> None:
     # test written to remove a hidden dependency. A TTL far above
     # the current uptime makes the same comparison negative without
     # touching anything shared.
-    real_ttl = _ingmod._TRUSTED_TTL
-    try:
-        _ingmod._TRUSTED_TTL = _ingmod.time.monotonic() + 1e9
+    # An INSTANCE attribute, not the module global. `_TRUSTED_TTL`
+    # was still shared state, safe only because nothing live reads it
+    # at this point — which is the same argument that was rejected
+    # for patching `time.monotonic`. `is_proven` reads
+    # `self._trusted_ttl` when the probe defines it, so nothing
+    # outside this object is touched.
+    probe._trusted_ttl = _ingmod.time.monotonic() + 1e9
+    if True:
         assert probe.is_proven("10.0.0.99") is False, (
             "an address that has never completed a signed request "
             "reads as proven 10 seconds after boot. The reserve is "
@@ -3651,11 +3656,10 @@ def _check_admission_gates_are_live(tmp: Path) -> None:
         assert probe.is_proven("10.0.0.98") is True, (
             "a source that DID sign recently must still be proven")
         probe._trusted["10.0.0.97"] = (
-            _ingmod.time.monotonic() - _ingmod._TRUSTED_TTL - 1)
+            _ingmod.time.monotonic() - probe._trusted_ttl - 1)
         assert probe.is_proven("10.0.0.97") is False, (
             "a proof older than the TTL must expire")
-    finally:
-        _ingmod._TRUSTED_TTL = real_ttl
+
 
     print("  admission gates: 507 on low disk, 400 on a forged sequence "
           "and a hostile instance id; per-source cap and proven-source "
@@ -5138,7 +5142,27 @@ def _check_relayed_api_surface(tmp: Path) -> None:
 
     store.ingest_remote_batch(
         "live-one", "i1", 1,
-        V.validate_records({"uptime": [_rec("10.1.1.2", "up", 1.0)]}, 100),
+        V.validate_records({
+            "uptime": [_rec("10.1.1.2", "up", 1.0)],
+            # Seeded so the alert/flow assertions below are about
+            # content rather than about an empty list. An `all()` over
+            # nothing is true, so a reader that dropped relayed rows
+            # entirely would have passed the old form of this check.
+            "alerts": [{
+                "remote_id": 7, "ts": now - 30, "device_ip": "10.1.1.2",
+                "kind": "bulk_inbound", "severity": "high",
+                "summary": "relayed", "detail": "",
+                "dedup_key": "k7",
+            }],
+            "flows": [{
+                "remote_id": 9, "src_ip": "10.1.1.2", "src_port": 554,
+                "dst_ip": "203.0.113.9", "dst_port": 443, "proto": "tcp",
+                "first_seen": now - 60, "last_seen": now - 30,
+                "packets": 10, "bytes": 1000, "bytes_to_camera": 900,
+                "bytes_from_camera": 100, "tcp_flags_seen": "SA",
+                "classification": "bulk_inbound",
+            }],
+        }, 100),
         now - 20)
     # three hours silent, far past the 180s default timeout
     store.ingest_remote_batch(
@@ -5193,7 +5217,9 @@ def _check_relayed_api_surface(tmp: Path) -> None:
             f"{dead['availability']!r}"
         )
 
-        # Local rows must stay distinguishable from relayed ones.
+        # Local rows must stay distinguishable from relayed ones — and
+        # there must BE a local row, or the tag is untested.
+        assert [c["ip"] for c in up["cameras"]] == ["10.9.0.5"], up["cameras"]
         assert all(c.get("sensor") == "local" for c in up["cameras"]), up["cameras"]
 
         # Relayed ALERTS must reach the API too. They were stored,
@@ -5201,10 +5227,14 @@ def _check_relayed_api_surface(tmp: Path) -> None:
         with urllib.request.urlopen(base + "/api/alerts") as r:
             al = json.loads(r.read())
         assert "remote_alerts" in al, list(al)
+        assert [a["sensor_id"] for a in al["remote_alerts"]] == ["live-one"], (
+            al["remote_alerts"])
         assert all(a.get("sensor") == "local" for a in al["alerts"])
         with urllib.request.urlopen(base + "/api/flows") as r:
             fl = json.loads(r.read())
         assert "remote_flows" in fl, list(fl)
+        assert [f["sensor_id"] for f in fl["remote_flows"]] == ["live-one"], (
+            fl["remote_flows"])
 
         rep = {x["sensor_id"]: x["reporting"] for x in up["sensors"]}
         assert rep == {"live-one": True, "dead-one": False}, rep
@@ -5335,8 +5365,6 @@ def _check_spool_compaction_and_counters_persist(tmp: Path) -> None:
     re-expose delivered entries.
     """
     import json as _json
-    import subprocess as _sp
-    import sys as _sys
     from surveillancehound.relay import Spool
 
     # 1. The file physically shrinks, and dead weight stays bounded.
@@ -5421,6 +5449,141 @@ def _check_spool_compaction_and_counters_persist(tmp: Path) -> None:
           f"{n}-batch drain, never more than {worst} delivered "
           f"entries left in the file, duplicates persist, watermark "
           f"never rewinds")
+
+
+def _check_relay_diagnostic_does_not_invent_a_backlog(tmp: Path) -> None:
+    """`hound relay` must not report a backlog that does not exist.
+
+    The reconcile added for the daemon's benefit was applied here
+    unconditionally. A readonly `AgentState.load` mints nothing, so
+    an unreadable or torn `state.json` yields `next_seq = 1`, the
+    clamp says "this agent has only ever created 0", blames an
+    INTACT `counters.json`, and un-hides every delivered batch.
+    Measured with 20 batches of which 18 were delivered: it reported
+    a backlog of 20.
+
+    Announcing data that is not there is this project's cardinal
+    sin, and this is the command documented to work when things are
+    broken.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    import time as _t
+    from surveillancehound.relay import AgentState, Spool
+
+    home = tmp / "diag"
+    base = home / "relay"
+    base.mkdir(parents=True)
+    st = AgentState.load(base)
+    st.instance_id = "inst-aaaa1111"
+    st.next_seq = 21
+    st.save()
+    sp = Spool(base, 10 * 1024 * 1024, 86400.0)
+    wall = _t.time()
+    for i in range(1, 21):
+        sp.append(i, b'{"a":1}', wall)
+    sp.ack(18)                      # 18 delivered, 2 genuinely pending
+
+    cfg_path = tmp / "diag.toml"
+    cfg_path.write_text(
+        "[capture]\npcap_file = '/nonexistent.pcap'\n"
+        "[network]\ncamera_ips = ['192.168.10.11']\n"
+        f"[store]\npath = {str(home / 'hound.sqlite')!r}\n"
+        "[relay]\nmode = 'agent'\nsensor_id = 'frigate'\n"
+        "key = 'shared-secret-abcdef-long'\n"
+        "url = 'https://127.0.0.1:18443/ingest/v1'\n"
+        f"tls_fingerprint = ['sha256:{'ab' * 32}']\n")
+    env = {"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"}
+
+    def spooled_line() -> str:
+        out = _sp.run([_sys.executable, "-m", "surveillancehound.cli",
+                       "relay", str(cfg_path)],
+                      capture_output=True, text=True, env=env)
+        assert out.returncode == 0, out.stderr[-300:]
+        return next(l for l in out.stdout.splitlines()
+                    if "spooled" in l), out.stdout + out.stderr
+
+    line, _ = spooled_line()
+    assert "2 batch" in line, f"healthy case is wrong already: {line!r}"
+
+    # Now damage ONLY the state file. counters.json is intact.
+    (base / "state.json").write_text('{"truncated')
+    line, full = spooled_line()
+    assert "2 batch" in line, (
+        f"with an unreadable state.json and an intact counters.json, "
+        f"`hound relay` reported {line.strip()!r}. The truth is 2. A "
+        f"backlog that does not exist sends an operator hunting for "
+        f"data that was already delivered")
+    assert "counters file is damaged" not in full, (
+        "it blamed counters.json, which is intact; the unreadable "
+        "file is state.json")
+    print("  hound relay: an unreadable state file does not invent a "
+          "backlog or blame the wrong file")
+
+
+def _check_watermark_load_rejects_non_integers(tmp: Path) -> None:
+    """`acked_through` must be type-checked, like `last_seq` is.
+
+    A bare `int()` accepts the string "9999999" and `True` — and
+    `True` becomes 1, which swallows the seq-0 entry the -1 sentinel
+    exists to protect. The existing corruption test only covered
+    values that make `json.loads` or `int()` RAISE, all of which the
+    surrounding `except` already resets, so the type check itself was
+    never exercised.
+    """
+    import json as _json
+    from surveillancehound.relay import Spool
+
+    for label, value in (("a numeric string", "9999999"),
+                         ("true", True),
+                         ("a float", 3.7),
+                         ("null", None)):
+        d = tmp / f"wm-{label.replace(' ', '-')}"
+        sp = Spool(d, 1024 * 1024, 86400.0)
+        for i in range(0, 4):       # INCLUDING seq 0
+            sp.append(i, b'{"a":%d}' % i, T0)
+        sp.ack(0)
+        doc = _json.loads((d / "counters.json").read_text())
+        doc["acked_through"] = value
+        (d / "counters.json").write_text(_json.dumps(doc))
+        got = [q for q, _ in Spool(d, 1024 * 1024, 86400.0).pending(T0)]
+        assert got == [0, 1, 2, 3], (
+            f"an acked_through of {label} ({value!r}) left "
+            f"pending={got}. A value that is not an integer is not a "
+            f"sequence, and coercing it hides batches — `true` in "
+            f"particular becomes 1 and swallows seq 0")
+    print("  watermark load: a string, bool, float or null is refused "
+          "rather than coerced into hiding batches")
+
+
+def _check_drop_attribution_names_the_right_cap(tmp: Path) -> None:
+    """An age expiry must not be reported as a size eviction.
+
+    The dropped set was taken as `entries[:n]`, which assumes file
+    order is age order — and `replace()` deliberately breaks that,
+    since a split batch's parts inherit the original's timestamp and
+    land at the tail. The total stayed exact, so the ground-truth
+    harness passed, but the operator was pointed at
+    `spool_max_bytes` when the age cap was what discarded their data.
+    """
+    from surveillancehound.relay import Spool
+
+    # A huge byte cap, so nothing can legitimately be a size drop.
+    sp = Spool(tmp / "attrib", 64 * 1024 * 1024, 60.0)
+    sp.append(1, b'{"old":1}', T0)
+    sp.append(2, b'{"new":1}', T0 + 10)
+    # Put a tail entry carrying an OLD timestamp, as `replace` does.
+    sp.replace(2, [(3, b'{"part":1}')])
+    sp.append(4, b'{"fresh":1}', T0 + 5000)      # forces the sweep
+    st = sp.stats(T0 + 5000)
+    assert st.dropped_size == 0, (
+        f"{st.dropped_size} expiries were blamed on the byte cap on a "
+        f"spool at a fraction of a percent of it. The operator is "
+        f"then told to raise spool_max_bytes when "
+        f"spool_max_age_seconds is what discarded the data")
+    assert st.dropped_age > 0, st.dropped_age
+    print(f"  drop attribution: {st.dropped_age} expiries reported "
+          f"against the age cap, none mis-blamed on the byte cap")
 
 
 def _check_hound_relay_reports_duplicates(tmp: Path) -> None:
@@ -5834,6 +5997,19 @@ def _check_delivered_entries_are_not_counted_as_aged_out(tmp: Path) -> None:
         f"highest sequence this agent ever minted "
         f"({cl2.state.next_seq - 1}); nothing could have acknowledged "
         f"a batch that was never created")
+    # Assert the CLAIM, not just the bound. The warning says the
+    # spooled batches "are re-sent rather than discarded" — and
+    # clamping merely to `highest_minted` could not re-expose
+    # anything, because every spooled entry was minted and so is at
+    # or below it. The batches stayed hidden, every drop counter
+    # stayed zero, and they were removed silently at the next
+    # compaction while the log said otherwise. A log line that
+    # states something the code does not do is the same failure as a
+    # dashboard that does.
+    assert [q for q, _ in cl2.spool.pending(T0)], (
+        "the clamp logged that the spooled batches would be re-sent "
+        "and left none pending. Either re-expose them or stop "
+        "claiming to")
     assert any(lv >= _logging.WARNING and "watermark" in m
                for lv, m in said), (
         f"a watermark above anything ever minted was accepted without "
@@ -6933,6 +7109,9 @@ def main() -> int:
         _check_spool_accounting_matches_reality(Path(td))
         _check_spool_compaction_and_counters_persist(Path(td))
         _check_hound_relay_reports_duplicates(Path(td))
+        _check_relay_diagnostic_does_not_invent_a_backlog(Path(td))
+        _check_watermark_load_rejects_non_integers(Path(td))
+        _check_drop_attribution_names_the_right_cap(Path(td))
         _check_ack_does_not_rewrite_the_whole_spool(Path(td))
         _check_delivered_entries_are_not_counted_as_aged_out(Path(td))
         _check_retention_actually_bounds_growth(Path(td))

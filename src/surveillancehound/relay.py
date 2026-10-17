@@ -376,7 +376,6 @@ class Spool:
                         "drop totals restart from zero", self.counters_path)
             self.dropped_size = self.dropped_age = self.dropped_stale = 0
             self.duplicates = 0
-            self._acked_through = _NOTHING_ACKED
 
     def _save_counters(self) -> None:
         """Best effort: a diagnostic counter is never worth failing a push."""
@@ -531,7 +530,17 @@ class Spool:
         entries = [e for e in entries if e["seq"] > self._acked_through]
         kept = self._deliverable(entries, now)
         if len(kept) != len(entries):
-            dropped = entries[:len(entries) - len(kept)]
+            # Identify the dropped set by SEQUENCE, not by position.
+            #
+            # `entries[:n]` assumed file order is age order, and
+            # `replace()` deliberately breaks that: a split batch's
+            # parts inherit the original's timestamp and land at the
+            # tail. So an age expiry could be attributed to the size
+            # cap — the total stayed exact, but it pointed the
+            # operator at `spool_max_bytes` when the age cap was what
+            # discarded their data.
+            kept_seqs = {e["seq"] for e in kept}
+            dropped = [e for e in entries if e["seq"] not in kept_seqs]
             aged = sum(1 for e in dropped if (now - e["at"]) > self.max_age)
             self.dropped_age += aged
             self.dropped_size += len(dropped) - aged
@@ -539,6 +548,14 @@ class Spool:
         return kept
 
     def pending(self, now: float) -> list[tuple[int, bytes]]:
+        # `_now_hint` only ever advances here, and `_flush_locked`
+        # calls this ONCE per cycle — so the clock is frozen for the
+        # whole drain. That is load-bearing, not incidental: the
+        # sweep in `ack` uses `_now_hint`, so a clock that advanced
+        # mid-drain could count a batch as aged out between being
+        # handed to the poster and being acknowledged, reporting a
+        # DELIVERED batch as expired. `stats()` deliberately does not
+        # bump it either.
         with self._lock:
             self._now_hint = max(self._now_hint, now)
             entries = self._deliverable(self._read(), now)
@@ -653,15 +670,35 @@ class Spool:
         with self._lock:
             if self._acked_through <= highest_minted:
                 return
+            # Clamp BELOW the lowest sequence still in the file, not
+            # merely to the highest ever minted.
+            #
+            # Every spooled entry was minted by `AgentState`, so every
+            # entry is at or below `highest_minted` — clamping only to
+            # that left them all hidden, every drop counter at zero,
+            # and removed silently at the next compaction, while this
+            # very message promised they would be "re-sent rather
+            # than discarded". A log line that states something the
+            # code does not do is the same failure as a dashboard
+            # that does.
+            #
+            # Safe because this branch is only reached when the
+            # watermark is IMPOSSIBLE — above anything ever created.
+            # Nothing here can be trusted to mean "delivered", so
+            # re-sending is the only honest reading, and the
+            # collector answers 409 for whatever it already holds.
+            entries = self._read()
+            floor = highest_minted
+            if entries:
+                floor = min(floor, min(e["seq"] for e in entries) - 1)
             log.warning(
                 "relay: spool watermark claims batch %s was delivered "
                 "but this agent has only ever created %s; the counters "
-                "file is damaged. Clamping, so the %d spooled batch(es) "
-                "are re-sent rather than discarded — the collector "
-                "answers 409 for any it already holds.",
-                self._acked_through, highest_minted,
-                len(self._read()))
-            self._acked_through = max(_NOTHING_ACKED, int(highest_minted))
+                "file is damaged. Clamping to %s, so the %d spooled "
+                "batch(es) are re-sent rather than discarded — the "
+                "collector answers 409 for any it already holds.",
+                self._acked_through, highest_minted, floor, len(entries))
+            self._acked_through = max(_NOTHING_ACKED, int(floor))
             self._save_counters()
 
     def _sweep_expiries_locked(self) -> None:

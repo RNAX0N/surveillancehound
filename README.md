@@ -103,6 +103,8 @@ hound baselines <config> [--camera IP | --reset IP | --reset-all]
 hound snapshots <config>
 hound sensors <config> [--forget ID]   # relayed sensors; --forget drops one's rows
 hound relay <config>               # relay health; on a collector, prints the cert pin
+                                   # on an agent: backlog, delivered watermark,
+                                   # duplicates and drops (deploy/agent/README.md)
 hound prune <config> --flows-days 30 --alerts-days 90
 hound prune <config> --relay-days 7            # expire relayed rows, rebuild in place
 hound prune <config> --offline-compact         # STOP THE SERVICE FIRST; see below

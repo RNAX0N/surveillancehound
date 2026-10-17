@@ -246,6 +246,26 @@ docker compose down
 docker volume rm agent_hound-state
 ```
 
+### Reading `hound relay` on the agent
+
+```
+  instance      01K8...          this run's identity; part of every row's key
+  next sequence 4312             the next batch number this agent will mint
+  delivered thru 4309            the collector has acknowledged every batch
+                                 at or below this; prints "none yet" before
+                                 the first ack. Entries at or below it are
+                                 dead weight in the spool file and are swept
+                                 on the next compaction — they are NOT a
+                                 backlog, and `spooled` already excludes them.
+  spooled       2 batch(es)      undelivered; this is the real backlog
+  duplicates    1                409s — already held by the collector, not loss
+  dropped       0 / 0 / 0        size / age / rejected — these ARE loss
+```
+
+On a healthy agent `delivered thru` tracks `next sequence - 1`. A gap
+between them with `spooled 0` means batches left the spool without ever
+being acknowledged — check the `dropped` line, which is where they went.
+
 ## What the agent does and does not do
 
 - It runs the **whole** pipeline locally: capture, flow aggregation,
