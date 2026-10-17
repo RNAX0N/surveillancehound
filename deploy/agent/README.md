@@ -250,9 +250,11 @@ docker volume rm agent_hound-state
 
 Real output. `dropped`, `duplicates` and `last error` each appear only
 when there is something to report, so a healthy agent ends at `spooled`.
-If the state file cannot be read the output is a **different shape** —
-`instance` and `next sequence` read `unknown`, there is no
-`delivered thru`, and a `warning` line may appear:
+If `state.json` is absent or unreadable — a brand-new agent, or a
+damaged one — the output is a **different shape**: `instance` and
+`next sequence` read `unknown`, there is no `delivered thru`, and if the
+counters also look impossible a `warning` line appears. On a first run
+that is normal; alongside a non-empty spool it is a fault.
 
 ```
 relay: agent 'frigate' -> https://88.255.5.1:18443/ingest/v1

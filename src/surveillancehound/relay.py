@@ -415,10 +415,21 @@ class Spool:
             # are on the daemon's append/pending/ack path. The
             # counters file was already defended against exactly this
             # and the spool was not.
+            #
+            # The SIGN is part of the shape. A planted negative
+            # sequence drove `reconcile_watermark`'s floor down to the
+            # `_NOTHING_ACKED` sentinel, which put the entry BELOW the
+            # clamped watermark — where the delivered-filter removes
+            # it and no counter ever sees it. Silent loss, in the one
+            # branch written to be careful about exactly that. A
+            # sequence is a non-negative int, and `_load_counters`
+            # already bounds `acked_through` the same way.
             if (not isinstance(rec, dict)
+                    or isinstance(rec.get("seq"), bool)
                     or not isinstance(rec.get("at"), (int, float))
                     or not isinstance(rec.get("body"), str)
-                    or not isinstance(rec.get("seq"), int)):
+                    or not isinstance(rec.get("seq"), int)
+                    or rec["seq"] < 0):
                 continue
             out.append(rec)
         self._note_oldest(out)
@@ -674,6 +685,12 @@ class Spool:
         watermark it is choosing to trust is possible at all. A
         watermark ABOVE every spooled sequence cannot have come from
         an ack for anything in the file.
+
+        Reads no counters and writes no file, but NOT pure in the
+        sense `_deliverable`'s docstring means: `_read` refreshes
+        `_oldest_at` in memory. Harmless — it happens under `_lock`,
+        and a readonly Spool persists nothing — but the distinction
+        that docstring shouts about is worth not blurring.
         """
         with self._lock:
             seqs = [e["seq"] for e in self._read()]
@@ -759,26 +776,23 @@ class Spool:
                     "%s, so %d spooled batch(es) are re-sent — the "
                     "collector answers 409 for any it already holds%s.",
                     claimed, highest_minted, self._acked_through, resent,
-                    f". The other {stale} cannot be sent — past a "
-                    f"spool cap, or below even the clamped watermark — "
-                    f"and are counted as dropped on the next sweep"
+                    f". The other {stale} are past a spool cap and "
+                    f"are counted as dropped on the next sweep"
                     if stale else "")
             else:
-                # Deliberately not "every one is past a cap": when the
-                # floor bottoms out at the sentinel because a planted
-                # sequence is negative, the survivors are below the
-                # watermark rather than expired. Say what is certain —
-                # they will not be sent — and not a reason that may
-                # not be the true one.
+                # "past a cap" is now the only possibility: the floor
+                # is `min(highest_minted, lowest_spooled - 1)`, so no
+                # entry can be at or below it, and `_read` refuses a
+                # negative sequence — which was the one input that
+                # could drive the floor under a surviving entry.
                 log.warning(
                     "relay: spool watermark claims batch %s was "
                     "delivered but this agent has only ever created "
                     "%s; the counters file is damaged. Clamping to "
                     "%s. None of the %d spooled batch(es) can be "
-                    "re-sent — they are past a spool cap, or below "
-                    "even the clamped watermark — and are counted as "
-                    "dropped on the next sweep. Those observations "
-                    "are lost.",
+                    "re-sent — every one is past a spool cap — and "
+                    "they are counted as dropped on the next sweep. "
+                    "Those observations are lost.",
                     claimed, highest_minted, self._acked_through,
                     len(entries))
             self._save_counters()
@@ -854,9 +868,50 @@ class Spool:
         """
         with self._lock:
             log.warning("relay: dropping spooled batch seq=%s (%s)", seq, reason)
-            live = self._enforce_caps(self._read(), self._now_hint)
+            raw = self._read()
+            live = self._enforce_caps(raw, self._now_hint)
             kept = [e for e in live if e["seq"] != seq]
-            self.dropped_stale += len(live) - len(kept)
+            # Count removals from the FILE, not from `live`.
+            #
+            # `_enforce_caps` filters out everything at or below the
+            # delivered watermark, so an entry carrying this sequence
+            # but already covered by an ack was invisible to `live`
+            # while `_write(kept)` removed it anyway — counted by
+            # nothing. `_flush_locked` captures `pending()` ONCE and
+            # acks inside that captured list, so a terminal refusal on
+            # a later element of a re-minted pair reached exactly that
+            # state.
+            #
+            # `enqueue` no longer re-mints a sequence, so a duplicate
+            # now means a damaged or planted file. Say so rather than
+            # resolving it in a counter: nothing in the file records
+            # which copy was posted, so neither counting it as lost
+            # nor passing it over can be known to be true, and an
+            # unexplained number is worse than a named uncertainty.
+            # Two reasons an entry can be missing from `live`, and
+            # only one of them moved a counter: `_enforce_caps` counts
+            # what it evicts, and separately drops everything at or
+            # below the watermark without counting, because delivered
+            # is not loss. So the set this call is answerable for is
+            # the entries carrying THIS sequence that the caps did not
+            # already count.
+            live_ids = {id(e) for e in live}
+            delivered_ids = {id(e) for e in raw
+                             if e["seq"] <= self._acked_through}
+            capped_ids = {id(e) for e in raw if id(e) not in live_ids
+                          and id(e) not in delivered_ids}
+            kept_ids = {id(e) for e in kept}
+            mine = [e for e in raw
+                    if e["seq"] == seq and id(e) not in kept_ids
+                    and id(e) not in capped_ids]
+            self.dropped_stale += len(mine)
+            if len(mine) > 1:
+                log.warning(
+                    "relay: %d spool entries carried sequence %s. A "
+                    "sequence is minted once, so this file has been "
+                    "damaged or tampered with; all %d are discarded "
+                    "and counted, but only one of them was the batch "
+                    "the collector refused.", len(mine), seq, len(mine))
             self._save_counters()
             self._write(kept)
 
@@ -999,8 +1054,14 @@ class AgentState:
                 last_push_ts = float(d.get("last_push_ts", 0.0))
                 last_error = str(d.get("last_error", ""))
             except (OSError, json.JSONDecodeError, ValueError, TypeError,
-                    ArithmeticError, AttributeError):
-                log.warning("relay: unreadable state file, starting fresh")
+                    ArithmeticError, AttributeError) as exc:
+                # Name the cause. The strict checks above already build
+                # a precise message and it was being thrown away, while
+                # the operator was told only that a file was unreadable
+                # — and the consequence is now large enough to want the
+                # reason: this run re-relays the sensor's whole store.
+                log.warning("relay: unreadable state file at %s (%s); "
+                            "starting fresh", path, exc)
                 st.parse_failed = True
             else:
                 st.instance_id = instance_id
@@ -1466,8 +1527,31 @@ class RelayClient:
                     "%d-byte limit; sending it anyway — the collector "
                     "will refuse it and it will be dropped.",
                     len(body), limit)
-            self.spool.append(seq, body, self.now())
+            # BURN THE SEQUENCE FIRST, in its own save.
+            #
+            # This used to append and then save once, so a kill between
+            # the two writes left `next_seq` pointing at a sequence
+            # already in the spool, and the next run minted it again.
+            # Two entries then carried one number — and the delivered
+            # watermark is PER SEQUENCE, so an ack for either marks
+            # both delivered and the unsent one is swept silently. No
+            # per-entry counter can resolve that: nothing in the file
+            # says which copy was posted.
+            #
+            # Saving the sequence first inverts the failure into a
+            # harmless one. A kill before the append leaves a GAP,
+            # which the collector tolerates (`MAX_SEQ_ADVANCE` is a
+            # million), and the record watermark has NOT advanced, so
+            # the same records are re-collected under the next
+            # sequence. Nothing is lost and nothing is duplicated.
+            #
+            # The record watermark still moves only after the batch is
+            # on disk — advancing it first would discard observations
+            # that were never spooled, which is the permanent loss
+            # this ordering has always existed to prevent.
             self.state.next_seq = seq + 1
+            self.state.save()
+            self.spool.append(seq, body, self.now())
             self.state.watermark = new_wm
             self.state.save()
             return seq

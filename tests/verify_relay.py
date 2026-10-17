@@ -5643,6 +5643,91 @@ def _check_watermark_load_rejects_non_integers(tmp: Path) -> None:
           "rather than coerced into hiding batches")
 
 
+def _check_a_kill_during_enqueue_cannot_reuse_a_sequence(tmp: Path) -> None:
+    """A crash mid-enqueue must burn a sequence, never re-use one.
+
+    `enqueue` appended to the spool and then saved `next_seq`, so a
+    kill between those two writes left the state pointing at a
+    sequence already on disk and the next run minted it again. Two
+    entries then carried one number — and the delivered watermark is
+    per SEQUENCE, so an ack for either marked both delivered and the
+    unsent one was swept with no counter moving. No per-entry
+    accounting can resolve that after the fact: nothing in the file
+    records which copy was posted.
+
+    Saving the sequence first inverts it into a harmless failure. The
+    record watermark still moves only after the batch is on disk, so
+    the records are re-collected rather than lost.
+    """
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import AlertRow, HoundStore
+
+    home = tmp / "killed"
+    home.mkdir()
+    store = HoundStore(path=home / "agent.sqlite")
+    for i in range(3):
+        store.insert_alert(AlertRow(
+            id=None, ts=T0 + i, device_ip="10.0.0.1", kind="new_device",
+            severity="low", summary="x", detail="", dedup_key=f"k{i}"))
+    cfg = RelayCfg(mode="agent", sensor_id="frigate",
+                   key="shared-secret-abcdef",
+                   url="https://127.0.0.1:1/ingest/v1",
+                   tls_fingerprint=["sha256:" + "ab" * 32])
+    cl = RelayClient(cfg, store, now=lambda: T0)
+
+    # Kill on the first state save that FOLLOWS the spool append.
+    #
+    # Deliberately expressed as a physical event rather than "the
+    # second save", because the number of saves is what changed: the
+    # old ordering appended and then saved once, the new one saves
+    # the sequence, appends, then saves the watermark. Pinning the
+    # kill to a call index would model a different moment in each and
+    # the test would pass against the bug for the wrong reason —
+    # which it did, until this was rewritten.
+    real_save = cl.state.save
+    real_append = cl.spool.append
+    appended = {"yes": False}
+
+    def watched_append(*a, **kw):
+        appended["yes"] = True
+        return real_append(*a, **kw)
+
+    def flaky():
+        if appended["yes"]:
+            raise OSError("killed after the append, before the save")
+        real_save()
+
+    cl.spool.append = watched_append
+    cl.state.save = flaky
+    try:
+        cl.enqueue()
+    except OSError:
+        pass
+    spooled = [q for q, _ in cl.spool.pending(T0)]
+    assert spooled == [1], f"expected the batch on disk, got {spooled}"
+
+    # Now restart, exactly as the daemon would.
+    store2 = HoundStore(path=home / "agent.sqlite")
+    cl2 = RelayClient(cfg, store2, now=lambda: T0)
+    assert cl2.state.next_seq == 2, (
+        f"next_seq came back as {cl2.state.next_seq}; the sequence was "
+        f"not burned before the append, so this run will mint 1 again "
+        f"and the spool will hold two entries numbered 1")
+    cl2.enqueue()
+    seqs = [q for q, _ in cl2.spool.pending(T0)]
+    assert len(seqs) == len(set(seqs)), (
+        f"the spool holds a duplicated sequence {seqs}. The delivered "
+        f"watermark is per sequence, so an ack for one marks both "
+        f"delivered and the unsent entry is swept uncounted")
+    assert seqs == [1, 2], f"expected 1 then 2, got {seqs}"
+    store2.close()
+    store.close()
+    print(f"  enqueue: a kill between the append and the save burns a "
+          f"sequence instead of re-using it; the spool holds {seqs} "
+          f"with the records re-collected, not lost")
+
+
 def _check_accounting_survives_a_reminted_sequence(tmp: Path) -> None:
     """Randomised ground truth at ENTRY granularity, with duplicates.
 
@@ -5671,7 +5756,9 @@ def _check_accounting_survives_a_reminted_sequence(tmp: Path) -> None:
     from surveillancehound.relay import Spool
 
     def bodies(sp):
-        return {e["body"]: e["seq"] for e in sp._read()}
+        # body -> (seq, at). `at` is needed to tell an entry that
+        # expired undelivered from one an ack covered.
+        return {e["body"]: (e["seq"], e["at"]) for e in sp._read()}
 
     def one(seed: int):
         r = _rnd.Random(seed)
@@ -5683,15 +5770,35 @@ def _check_accounting_survives_a_reminted_sequence(tmp: Path) -> None:
         expect_lost = 0
         expect_rejected = 0
 
-        def settle(during_drop_seq=None):
+        def settle(wm0, clock, during_drop_seq=None):
+            """Classify every disappearance since the last call.
+
+            `wm0` is the watermark BEFORE the operation, and that
+            distinction is the whole point. `ack` and
+            `already_delivered` sweep expiries *before* they move the
+            watermark — on purpose, because counting after the move
+            lets an advancing watermark swallow a batch that aged out
+            unsent. Reading `sp.acked_through` after the call put this
+            oracle on the wrong side of that same boundary, so an
+            entry that expired undelivered and was correctly counted
+            in `dropped_age` scored as "swept as delivered". It made
+            the harness accuse correct code of inventing loss, on
+            seeds outside the shipped range.
+            """
             nonlocal seen, expect_lost, expect_rejected
             after = bodies(sp)
-            for body, seq in seen.items():
+            wm1 = sp.acked_through
+            for body, (seq, at) in seen.items():
                 if body in after:
                     continue
                 if during_drop_seq is not None and seq == during_drop_seq:
                     expect_rejected += 1
-                elif seq <= sp.acked_through:
+                elif seq > wm0 and (clock - at) > sp.max_age:
+                    # Expired while still undelivered. The pre-move
+                    # sweep counts this even if the watermark then
+                    # advanced past it.
+                    expect_lost += 1
+                elif seq <= wm1:
                     pass               # swept as delivered
                 else:
                     expect_lost += 1
@@ -5699,47 +5806,80 @@ def _check_accounting_survives_a_reminted_sequence(tmp: Path) -> None:
 
         for _ in range(r.randint(20, 90)):
             op = r.choices(
-                ["append", "crash", "ack", "dup", "drop", "restart", "time"],
-                [34, 10, 20, 8, 6, 6, 16])[0]
+                ["append", "crash", "ack", "dup", "drop", "cycle",
+                 "restart", "time"],
+                [30, 10, 18, 8, 6, 8, 6, 14])[0]
             if op in ("append", "crash"):
                 uid += 1
+                wm0 = sp.acked_through
                 sp.append(nxt, b'{"u":%d,"x":"%s"}'
                           % (uid, b"p" * r.randint(10, 300)), now)
                 # A crash re-mints: the entry is spooled but the
                 # advanced `next_seq` never reached disk, so the
-                # NEXT append reuses this number.
+                # NEXT append reuses this number. `enqueue` no longer
+                # has that window — it burns the sequence in its own
+                # save first — but a damaged or planted file can
+                # still hold two entries with one number, and every
+                # removal path has to stay answerable for both.
                 if op == "append":
                     nxt += 1
-                settle()
+                settle(wm0, now)
             elif op in ("ack", "dup"):
                 p = sp.pending(now)
                 if p:
                     q = p[0][0]
+                    wm0 = sp.acked_through
                     if op == "ack":
                         sp.ack(q)
                     else:
                         sp.already_delivered(q, q)
-                    settle()
+                    settle(wm0, now)
             elif op == "drop":
                 p = sp.pending(now)
                 if p:
                     q = p[0][0]
+                    wm0 = sp.acked_through
                     sp.drop(q, "rejected by the collector")
-                    settle(during_drop_seq=q)
+                    settle(wm0, now, during_drop_seq=q)
+            elif op == "cycle":
+                # Model the FLUSH LOOP, not a single call.
+                # `_flush_locked` captures `pending()` once and acks
+                # inside that captured list, so by the time it reaches
+                # a later element the watermark can already cover it.
+                # Choosing the drop target from a fresh `pending()`
+                # could never reach that state — which is exactly why
+                # this harness missed `drop()` failing to count an
+                # entry an ack had covered.
+                p = sp.pending(now)
+                if len(p) >= 2:
+                    wm0 = sp.acked_through
+                    sp.ack(p[0][0])
+                    settle(wm0, now)
+                    wm0 = sp.acked_through
+                    q = p[-1][0]
+                    sp.drop(q, "terminal refusal mid-drain")
+                    settle(wm0, now, during_drop_seq=q)
             elif op == "restart":
+                wm0 = sp.acked_through
                 sp = Spool(d, sp.max_bytes, sp.max_age)
-                settle()
+                settle(wm0, now)
             else:
                 now += r.choice([1, 10, 60, 400])
         uid += 1
+        wm0 = sp.acked_through
         sp.append(nxt, b'{"u":%d,"final":1}' % uid, now)
-        settle()
+        settle(wm0, now)
         st = sp.stats(now)
         return (expect_lost, st.dropped_age + st.dropped_size,
                 expect_rejected, st.dropped_stale)
 
     wrong = []
-    seeds = 120
+    # 400, not 120. The oracle's own ordering bug was invisible below
+    # ~300 seeds, so a number chosen to keep the suite quick was also
+    # the number that hid a defect in the thing being trusted as
+    # ground truth. Verified exact over 3000; 400 is what fits the
+    # suite's runtime budget.
+    seeds = 400
     for seed in range(seeds):
         lost, reported, rej, stale = one(seed)
         if lost != reported or rej != stale:
@@ -5834,9 +5974,52 @@ def _check_drop_attribution_names_the_right_cap(tmp: Path) -> None:
         f"the eviction was an age expiry; reported "
         f"age={st2.dropped_age} size={st2.dropped_size}")
 
+    # --- 3. a drop whose sequence an ack in the SAME cycle covered.
+    #
+    # `_flush_locked` captures `pending()` once and acks inside that
+    # captured list, so a terminal refusal on a later element can
+    # arrive after the watermark already covers its sequence. The
+    # delivered-filter at the top of `_enforce_caps` then hid the
+    # entry from the count while `_write` removed it anyway: two
+    # observations gone, nothing reported.
+    sp3 = Spool(tmp / "ackeddrop", 64 * 1024 * 1024, 10_000.0)
+    sp3.append(5, b'{"posted":1}', T0)
+    sp3.append(5, b'{"never-posted":1}', T0)   # re-minted pair
+    sp3.append(6, b'{"later":1}', T0)
+    sp3.ack(5)                                  # covers BOTH seq-5 entries
+    before = len(sp3._read())
+    c0 = sp3.dropped_stale + sp3.dropped_age + sp3.dropped_size
+    sp3.drop(5, "401 arriving mid-drain")
+    gone = before - len(sp3._read())
+    counted = (sp3.dropped_stale + sp3.dropped_age + sp3.dropped_size) - c0
+    assert gone == 2, f"expected both seq-5 entries to go, {gone} did"
+    assert counted == gone, (
+        f"{gone} entries left the spool and {counted} were counted. An "
+        f"ack moving past a re-minted sequence must not make the "
+        f"second entry invisible to the drop counter — that is loss "
+        f"the operator cannot see")
+
+    # A delivered entry compacted away in the same call is NOT loss
+    # and must not be counted, or the fix above becomes over-reporting.
+    sp4 = Spool(tmp / "deadweight", 64 * 1024 * 1024, 10_000.0)
+    sp4.append(4, b'{"delivered":1}', T0)
+    sp4.append(5, b'{"refused":1}', T0)
+    sp4.append(6, b'{"later":1}', T0)
+    sp4.ack(4)
+    before = len(sp4._read())
+    c0 = sp4.dropped_stale + sp4.dropped_age + sp4.dropped_size
+    sp4.drop(5, "401")
+    gone = before - len(sp4._read())
+    counted = (sp4.dropped_stale + sp4.dropped_age + sp4.dropped_size) - c0
+    assert gone == 2 and counted == 1, (
+        f"{gone} entries went and {counted} were counted; the delivered "
+        f"one was dead weight the collector already has, and counting "
+        f"it reports loss that did not happen")
+
     print(f"  drop attribution: an expiry behind a kept entry is blamed "
-          f"on the age cap, and an eviction with a duplicated sequence "
-          f"is still counted")
+          f"on the age cap, an eviction with a duplicated sequence is "
+          f"counted, and a drop an ack has overtaken counts both "
+          f"entries without counting dead weight")
 
 
 def _check_hound_relay_reports_duplicates(tmp: Path) -> None:
@@ -7417,6 +7600,7 @@ def main() -> int:
         _check_hound_relay_reports_duplicates(Path(td))
         _check_relay_diagnostic_does_not_invent_a_backlog(Path(td))
         _check_watermark_load_rejects_non_integers(Path(td))
+        _check_a_kill_during_enqueue_cannot_reuse_a_sequence(Path(td))
         _check_accounting_survives_a_reminted_sequence(Path(td))
         _check_drop_attribution_names_the_right_cap(Path(td))
         _check_ack_does_not_rewrite_the_whole_spool(Path(td))
