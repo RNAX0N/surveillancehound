@@ -5122,7 +5122,7 @@ def _check_relayed_api_surface(tmp: Path) -> None:
     from http.server import ThreadingHTTPServer
 
     from surveillancehound.config import load_from_dict
-    from surveillancehound.store import HoundStore
+    from surveillancehound.store import AlertRow, HoundStore
     from surveillancehound.web import _Handler
 
     now = time.time()
@@ -5132,6 +5132,12 @@ def _check_relayed_api_surface(tmp: Path) -> None:
                         first_seen=now - 9000)
     store.start_monitor_session(now - 9000, "live")
     store.set_heartbeat(now - 2, now)
+    # A LOCAL alert, so the "every local row is tagged local" assertion
+    # below has a row to be true of. Without one it is an all() over an
+    # empty list, which is true no matter what web.py does.
+    store.insert_alert(AlertRow(
+        id=None, ts=now - 40, device_ip="10.9.0.5", kind="new_device",
+        severity="low", summary="local", detail="", dedup_key="local-1"))
 
     def _rec(ip, state, avail):
         return {"ip": ip, "role": "camera", "state": state,
@@ -5229,6 +5235,8 @@ def _check_relayed_api_surface(tmp: Path) -> None:
         assert "remote_alerts" in al, list(al)
         assert [a["sensor_id"] for a in al["remote_alerts"]] == ["live-one"], (
             al["remote_alerts"])
+        assert [a["dedup_key"] for a in al["alerts"]] == ["local-1"], (
+            al["alerts"])
         assert all(a.get("sensor") == "local" for a in al["alerts"])
         with urllib.request.urlopen(base + "/api/flows") as r:
             fl = json.loads(r.read())
