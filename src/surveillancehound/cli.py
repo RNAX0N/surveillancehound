@@ -669,11 +669,23 @@ def cmd_relay(args: argparse.Namespace) -> int:
     state = AgentState.load(base, readonly=True)
     spool = Spool(base, r.spool_max_bytes, r.spool_max_age_seconds,
                   readonly=True)
+    # Reconcile like the daemon does, or this command contradicts it.
+    # `RelayClient.__init__` clamps a delivered-watermark that is
+    # above anything the agent ever minted; without the same call
+    # here, `hound relay` reported `spooled 0 batch(es)` and no drops
+    # for a spool the daemon would clamp and re-send. This is the
+    # command documented to work when things are broken.
+    #
+    # Safe on a readonly Spool: `_save_counters` is a no-op there, so
+    # the clamp applies to this process's view and nothing is
+    # written under the daemon.
+    spool.reconcile_watermark(state.next_seq - 1)
     st = spool.stats(time.time())
     print(f"relay: agent {r.sensor_id!r} -> {r.url}")
     if state.instance_id:
         print(f"  instance      {state.instance_id}")
         print(f"  next sequence {state.next_seq}")
+        print(f"  delivered thru {spool.acked_through}")
     else:
         # readonly load mints nothing, so an absent id means the agent
         # has never run OR its state file is unreadable. Printing a

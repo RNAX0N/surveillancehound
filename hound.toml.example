@@ -343,9 +343,8 @@ keep      = 5
 # Agent-side keys, shown here because the troubleshooting docs refer to
 # them; set them in the AGENT's config, not this one:
 # batch_seconds         = 30.0     # push cadence
-# spool_max_bytes       = 67108864 # 64 MB. Lower it on an SD/eMMC-booted
-#                                  # NVR: draining a full spool rewrites the
-#                                  # file once per delivered batch.
+# spool_max_bytes       = 67108864 # 64 MB. How much the agent may queue
+#                                  # while the collector is unreachable.
 # spool_max_age_seconds = 86400.0  # 24h; whichever cap is hit first drops
 #                                  # the oldest, and the drop is counted
 #

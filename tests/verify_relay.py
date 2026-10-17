@@ -946,6 +946,24 @@ def _check_clock_skew_does_not_destroy_data(tmp: Path) -> None:
           "the clock is fixed")
 
 
+def _clear_spool(spool) -> None:
+    """Empty a spool for the next sub-case, without a watermark.
+
+    `spool.ack(10**9)` used to do this by rewriting the file. Since
+    the ack became O(1) it sets a DELIVERED WATERMARK of 10**9
+    instead, so every later append is filtered out as already
+    delivered — which silently turned the timestamp assertion in
+    `_check_resplit_always_makes_progress` into `all(... for a in
+    [])`, vacuously true. The mutation that breaks
+    `Spool.replace`'s age preservation survived because of it.
+    """
+    with spool._lock:
+        spool._write([])
+        spool._acked_through = -1
+        spool._acks_since_compact = 0
+        spool._save_counters()
+
+
 def _check_resplit_always_makes_progress(tmp: Path) -> None:
     """A rejected batch must shrink, or be dropped. Never neither.
 
@@ -1078,7 +1096,7 @@ def _check_resplit_always_makes_progress(tmp: Path) -> None:
 
     # 2. Genuinely indivisible: one record. Must refuse to split so the
     #    caller drops it.
-    client.spool.ack(10**9)                   # clear
+    _clear_spool(client.spool)
     seq, body = spool_one({"devices": recs["devices"], "flows": [],
                            "alerts": [], "outages": [], "uptime": [],
                            "monitor": None})
@@ -1088,7 +1106,7 @@ def _check_resplit_always_makes_progress(tmp: Path) -> None:
         "so it must fall through to the drop")
 
     # 3. A 400 that size cannot explain must not be split at all.
-    client.spool.ack(10**9)
+    _clear_spool(client.spool)
     seq, body = spool_one(recs)
     assert client._resplit(seq, body,
                            {"error": "sent_at is +4000s from collector "
@@ -1099,7 +1117,7 @@ def _check_resplit_always_makes_progress(tmp: Path) -> None:
 
     # 4. The replacement must NOT reset the spool age, or the one bound
     #    that ends such a loop is gone.
-    client.spool.ack(10**9)
+    _clear_spool(client.spool)
     seq, body = spool_one(recs)
     import time as _t
     old_at = client.spool._read()[0]["at"]
@@ -3614,21 +3632,30 @@ def _check_admission_gates_are_live(tmp: Path) -> None:
 
     probe = _ingmod._Server.__new__(_ingmod._Server)
     probe._trusted = {}
-    real_monotonic = _ingmod.time.monotonic
+    # Move the TTL, not the clock. `_ingmod.time` IS the stdlib
+    # module, so assigning `time.monotonic` replaces it for every
+    # thread in the process — a reaper, a store busy-timeout, a
+    # pusher. Nothing is live at this exact point today, which is
+    # the only thing that made it safe, and a landmine in the one
+    # test written to remove a hidden dependency. A TTL far above
+    # the current uptime makes the same comparison negative without
+    # touching anything shared.
+    real_ttl = _ingmod._TRUSTED_TTL
     try:
-        _ingmod.time.monotonic = lambda: 10.0      # 10s since boot
+        _ingmod._TRUSTED_TTL = _ingmod.time.monotonic() + 1e9
         assert probe.is_proven("10.0.0.99") is False, (
             "an address that has never completed a signed request "
             "reads as proven 10 seconds after boot. The reserve is "
             "then open to anyone for the first hour of uptime")
-        probe._trusted["10.0.0.98"] = 5.0
+        probe._trusted["10.0.0.98"] = _ingmod.time.monotonic()
         assert probe.is_proven("10.0.0.98") is True, (
             "a source that DID sign recently must still be proven")
-        probe._trusted["10.0.0.97"] = 10.0 - _ingmod._TRUSTED_TTL - 1
+        probe._trusted["10.0.0.97"] = (
+            _ingmod.time.monotonic() - _ingmod._TRUSTED_TTL - 1)
         assert probe.is_proven("10.0.0.97") is False, (
             "a proof older than the TTL must expire")
     finally:
-        _ingmod.time.monotonic = real_monotonic
+        _ingmod._TRUSTED_TTL = real_ttl
 
     print("  admission gates: 507 on low disk, 400 on a forged sequence "
           "and a hostile instance id; per-source cap and proven-source "
@@ -5295,6 +5322,166 @@ def _check_replay_opens_no_listener(tmp: Path) -> None:
     print("  replay: no ingest listener, no sensor alerts from packet time")
 
 
+def _check_spool_compaction_and_counters_persist(tmp: Path) -> None:
+    """The properties the O(1) ack is sold on, each asserted.
+
+    All three could be mutated away with the whole suite green:
+    `_ACK_COMPACT_MIN = 10**9` (never compact) — so the headline
+    claim that the file shrinks and dead weight stays bounded rested
+    on untested code; `duplicates` not persisted — and cross-process
+    persistence is the entire reason `counters.json` exists, since
+    `hound relay` runs in a different process from the daemon; and
+    removing `ack`'s monotonicity guard, which would let a rewind
+    re-expose delivered entries.
+    """
+    import json as _json
+    import subprocess as _sp
+    import sys as _sys
+    from surveillancehound.relay import Spool
+
+    # 1. The file physically shrinks, and dead weight stays bounded.
+    d = tmp / "compact"
+    sp = Spool(d, 64 * 1024 * 1024, 86400.0)
+    body = b'{"records":{"flows":[' + b'{"x":1},' * 200 + b'{"x":1}]}}'
+    n = 2000
+    for i in range(1, n + 1):
+        sp.append(i, body, T0)
+    f = d / "spool.jsonl"
+    peak = f.stat().st_size
+    assert peak > 1_000_000, peak
+    for i in range(1, n + 1):
+        sp.ack(i)
+    after = f.stat().st_size
+    assert after < peak // 10, (
+        f"the spool file is {after:,} bytes after draining all {n} "
+        f"batches, from {peak:,}. Delivered entries are filtered by "
+        f"every reader but must also be REMOVED, or the file only "
+        f"grows and every read pays for it")
+    assert sp.pending(T0) == []
+
+    # Dead weight stays bounded DURING a drain, not only after it.
+    d2 = tmp / "bounded"
+    sp2 = Spool(d2, 64 * 1024 * 1024, 86400.0)
+    for i in range(1, 1001):
+        sp2.append(i, body, T0)
+    f2 = d2 / "spool.jsonl"
+    # The invariant is on the ABSOLUTE number of delivered entries
+    # still in the file, not the ratio: near the end of a drain
+    # `live` approaches zero, so any residue at all is "100%" while
+    # being a handful of lines. What has to hold is that dead weight
+    # never exceeds what the compaction threshold allows.
+    from surveillancehound.relay import (_ACK_COMPACT_FRACTION,
+                                         _ACK_COMPACT_MIN)
+    worst = 0
+    for i in range(1, 1001):
+        sp2.ack(i)
+        if i % 50 == 0:
+            live = len(sp2.pending(T0))
+            physical = sum(1 for line in
+                           f2.read_text(encoding="utf-8").splitlines()
+                           if line.strip())
+            allowed = (_ACK_COMPACT_MIN
+                       + max(live, 0) // _ACK_COMPACT_FRACTION + 1)
+            dead = physical - live
+            worst = max(worst, dead)
+            assert dead <= allowed, (
+                f"after {i} acks the file held {dead} delivered "
+                f"entries against {live} live, over the {allowed} the "
+                f"compaction threshold allows. Compaction has to keep "
+                f"pace with the drain, not wait for the end of it")
+    assert worst > 0, "setup: compaction never lagged, nothing measured"
+
+    # 2. `duplicates` survives the process boundary `hound relay`
+    #    crosses.
+    d3 = tmp / "dup-persist"
+    sp3 = Spool(d3, 1024 * 1024, 86400.0)
+    sp3.append(1, b'{"a":1}', T0)
+    sp3.already_delivered(1, 9)
+    reread = Spool(d3, 1024 * 1024, 86400.0)
+    assert reread.stats(T0).duplicates == 1, (
+        f"the duplicate count did not persist "
+        f"({reread.stats(T0).duplicates}). `hound relay` runs in a "
+        f"different process from the daemon, which is the whole "
+        f"reason this file exists")
+    assert "duplicates" in _json.loads(
+        (d3 / "counters.json").read_text()), "not written at all"
+
+    # 3. The watermark never goes backwards.
+    d4 = tmp / "monotonic"
+    sp4 = Spool(d4, 1024 * 1024, 86400.0)
+    for i in range(1, 6):
+        sp4.append(i, b'{"a":%d}' % i, T0)
+    sp4.ack(4)
+    sp4.ack(2)                      # a rewind must be ignored
+    assert sp4.acked_through == 4, (
+        f"the watermark rewound to {sp4.acked_through}; delivered "
+        f"entries would be re-exposed and re-sent")
+    assert [q for q, _ in sp4.pending(T0)] == [5], sp4.pending(T0)
+    print(f"  spool compaction: {peak:,} -> {after:,} bytes over a "
+          f"{n}-batch drain, never more than {worst} delivered "
+          f"entries left in the file, duplicates persist, watermark "
+          f"never rewinds")
+
+
+def _check_hound_relay_reports_duplicates(tmp: Path) -> None:
+    """`hound relay`'s output is the operator surface for all of this.
+
+    Nothing exercised `cmd_relay`'s printing at all, so the line that
+    distinguishes "the collector already had it" from "this was
+    discarded" could be deleted silently — and that distinction is
+    the point of the change.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    from surveillancehound.relay import AgentState, Spool
+
+    home = tmp / "relaycli"
+    base = home / "relay"
+    base.mkdir(parents=True)
+    state = AgentState.load(base)
+    state.instance_id = "inst-aaaa1111"
+    state.next_seq = 4
+    state.save()
+    sp = Spool(base, 1024 * 1024, 86400.0)
+    sp.append(1, b'{"a":1}', T0)
+    sp.already_delivered(1, 1)
+    sp.append(2, b'{"a":2}', T0)
+    sp.drop(2, "rejected by the collector")
+
+    cfg_path = tmp / "relaycli.toml"
+    cfg_path.write_text(
+        "[capture]\npcap_file = '/nonexistent.pcap'\n"
+        "[network]\ncamera_ips = ['192.168.10.11']\n"
+        f"[store]\npath = {str(home / 'hound.sqlite')!r}\n"
+        "[relay]\nmode = 'agent'\nsensor_id = 'frigate'\n"
+        "key = 'shared-secret-abcdef-long'\n"
+        "url = 'https://127.0.0.1:18443/ingest/v1'\n"
+        f"tls_fingerprint = ['sha256:{'ab' * 32}']\n")
+    out = _sp.run([_sys.executable, "-m", "surveillancehound.cli",
+                   "relay", str(cfg_path)],
+                  capture_output=True, text=True,
+                  env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    assert out.returncode == 0, out.stderr[-300:]
+    text = out.stdout
+    assert "duplicates" in text, (
+        f"`hound relay` does not mention the duplicate at all:\n"
+        f"{text}")
+    dup_line = next(l for l in text.splitlines() if "duplicates" in l)
+    assert "not lost" in dup_line or "delivered" in dup_line, (
+        f"the duplicate line does not say it is delivery rather than "
+        f"loss: {dup_line!r}")
+    assert "dropped" in text, "the real drop must still be reported"
+    drop_line = next(l for l in text.splitlines()
+                     if l.strip().startswith("dropped"))
+    assert "duplicates" not in drop_line, (
+        f"the duplicate is being counted under dropped: {drop_line!r}")
+    assert "delivered thru" in text, (
+        "the watermark is not shown, so an operator cannot tell a "
+        "genuinely empty spool from one hidden behind it")
+    print("  hound relay: duplicates reported apart from drops, and "
+          "the delivered watermark is visible")
+
+
 def _check_spool_accounting_matches_reality(tmp: Path) -> None:
     """Randomised ground truth: the counters must equal what happened.
 
@@ -6744,6 +6931,8 @@ def main() -> int:
         _check_spool_counters(Path(td))
         _check_delivery_is_never_reported_as_loss(Path(td))
         _check_spool_accounting_matches_reality(Path(td))
+        _check_spool_compaction_and_counters_persist(Path(td))
+        _check_hound_relay_reports_duplicates(Path(td))
         _check_ack_does_not_rewrite_the_whole_spool(Path(td))
         _check_delivered_entries_are_not_counted_as_aged_out(Path(td))
         _check_retention_actually_bounds_growth(Path(td))

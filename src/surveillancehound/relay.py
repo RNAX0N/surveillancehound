@@ -112,10 +112,10 @@ _OUTAGE_ID_BINDS = 900
 # more than ~25% delivered entries. The floor stops a nearly-empty
 # spool compacting on every other ack.
 _ACK_COMPACT_MIN = 64
+_ACK_COMPACT_FRACTION = 4
 # "No batch has been confirmed yet". Below any sequence a Spool can
 # legally hold, so it cannot be mistaken for one.
 _NOTHING_ACKED = -1
-_ACK_COMPACT_FRACTION = 4
 # Largest sequence number the agent will adopt from a collector's
 # 409. Mirrors the collector's own `_MAX_SEQ`; a value beyond it
 # could not have come from a sane peer and gets ignored rather than
@@ -356,8 +356,16 @@ class Spool:
             # the collector answers 409 and `already_delivered`
             # records that as delivery — but re-sending a day of
             # spool for nothing is worth avoiding.
-            self._acked_through = int(
-                d.get("acked_through", _NOTHING_ACKED))
+            # Type-checked like the 409 path checks `last_seq`: a
+            # string "9999999" coerced to 9999999, and `true` to 1,
+            # which swallows the seq-0 entry the -1 sentinel exists
+            # to protect. The two paths read the same class of value
+            # off disk or the wire and should agree.
+            raw_ack = d.get("acked_through", _NOTHING_ACKED)
+            self._acked_through = (
+                raw_ack if isinstance(raw_ack, int)
+                and not isinstance(raw_ack, bool)
+                and raw_ack >= _NOTHING_ACKED else _NOTHING_ACKED)
         except (OSError, ValueError, TypeError, ArithmeticError,
                 AttributeError, json.JSONDecodeError):
             # ArithmeticError covers OverflowError, which int() raises on
@@ -616,6 +624,16 @@ class Spool:
             self._acks_since_compact += 1
             self._save_counters()
             self._maybe_compact()
+
+    @property
+    def acked_through(self) -> int:
+        """Highest sequence the collector has confirmed. -1 if none.
+
+        Exposed because `hound relay` is the command an operator runs
+        when the agent looks stuck, and a watermark is the one piece
+        of spool state that can make a healthy-looking spool empty.
+        """
+        return self._acked_through
 
     def reconcile_watermark(self, highest_minted: int) -> None:
         """Clamp the delivered-watermark to a sequence we actually made.
