@@ -470,15 +470,23 @@ class Spool:
             #
             # `_oldest_at` is a hint maintained by the last read or
             # write, so the usual cycle costs one float compare rather
-            # than re-reading a 64 MB file. When it is unknown the
-            # check simply does not fire; `pending()` runs every cycle
-            # and populates it.
+            # than re-reading a 64 MB file.
+            #
+            # When it is UNKNOWN — a fresh process, so every restart —
+            # establish it by reading, do not stamp `now`. Stamping
+            # claimed the oldest entry had just arrived, so a spool
+            # that had been sitting through an outage longer than the
+            # age cap never tripped the sweep and its expiries were
+            # never counted. Over 150 randomised append/ack/restart
+            # sequences that silently under-reported real loss on 6 of
+            # them. One read per process start is the right price for
+            # a number the drop accounting depends on.
+            if self._oldest_at is None:
+                self._note_oldest(self._read())
             expired = (self._oldest_at is not None
                        and (now - self._oldest_at) > self.max_age)
             if oversized or expired:
                 self._write(self._enforce_caps(self._read(), now))
-            elif self._oldest_at is None:
-                self._oldest_at = now
 
     def _deliverable(self, entries: list[dict], now: float) -> list[dict]:
         """What is still within both caps. PURE — no counters, no writes.
@@ -556,6 +564,30 @@ class Spool:
         with self._lock:
             if seq <= self._acked_through:
                 return
+            # Count expiries BEFORE the watermark moves past them.
+            #
+            # This guard existed, and making `ack` O(1) deleted it
+            # along with the full rewrite it was attached to. The
+            # delivered-filter runs ahead of the drop counters, so a
+            # batch that aged out UNSENT and then falls below an
+            # advancing watermark is removed as though it had been
+            # delivered and never reaches `dropped_age`. Measured
+            # over 100 randomised append/ack/409/drop/restart
+            # sequences: 100 of 100 under-reported real loss, by up
+            # to 36 batches of 99.
+            #
+            # Trigger at stock settings: an outage longer than
+            # `spool_max_age_seconds`, then a restart — on a fresh
+            # Spool `_oldest_at` is None, so the first append skips
+            # its own sweep and stamps a false "oldest" — then the
+            # collector returns and the fresh tail is acked. Restarts
+            # are routine: upgrades, config changes, and the
+            # `daemon -r` respawn CLAUDE.md requires.
+            #
+            # Hiding loss that happened is the same sin as reporting
+            # loss that did not, which is what this whole change set
+            # was for.
+            self._sweep_expiries_locked()
             self._acked_through = int(seq)
             self._acks_since_compact += 1
             self._save_counters()
@@ -577,6 +609,9 @@ class Spool:
                      "(it is at seq %s); treating as delivered",
                      seq, last_seq)
             if seq > self._acked_through:
+                # Same reason as `ack`: expiries are counted before
+                # the watermark can hide them.
+                self._sweep_expiries_locked()
                 self._acked_through = int(seq)
             self._acks_since_compact += 1
             self._save_counters()
@@ -610,6 +645,18 @@ class Spool:
                 len(self._read()))
             self._acked_through = max(_NOTHING_ACKED, int(highest_minted))
             self._save_counters()
+
+    def _sweep_expiries_locked(self) -> None:
+        """Compact if anything has aged out, so it is COUNTED.
+
+        O(1) in the common case — one float compare against the
+        `_oldest_at` hint — and only reads the file when something
+        has actually expired, so it does not reintroduce the
+        per-ack rewrite. Caller holds `_lock`.
+        """
+        if (self._oldest_at is not None
+                and (self._now_hint - self._oldest_at) > self.max_age):
+            self._compact_locked()
 
     def _maybe_compact(self) -> None:
         """Rewrite once a quarter of the spool is delivered. Holds `_lock`."""

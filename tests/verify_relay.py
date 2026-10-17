@@ -5295,6 +5295,138 @@ def _check_replay_opens_no_listener(tmp: Path) -> None:
     print("  replay: no ingest listener, no sensor alerts from packet time")
 
 
+def _check_spool_accounting_matches_reality(tmp: Path) -> None:
+    """Randomised ground truth: the counters must equal what happened.
+
+    Every sequence ever appended ends in exactly one state —
+    delivered, rejected, still pending, or LOST — and
+    `dropped_age + dropped_size` must equal the lost set while
+    `dropped_stale` equals the rejections. Both directions matter
+    equally: reporting loss that did not happen sends an operator
+    hunting for data that arrived, and hiding loss that did is how a
+    monitor becomes decoration.
+
+    This exists because the O(1) ack broke it in BOTH directions
+    within one change:
+
+    * The delivered-filter ran ahead of the drop counters, so a batch
+      that aged out UNSENT and then fell below an advancing watermark
+      was swept away as though delivered. 100 of 100 randomised
+      sequences under-reported, by up to 36 of 99 lost.
+    * `append` stamped `_oldest_at = now` when the hint was unknown —
+      which is every restart — falsely claiming the oldest entry had
+      just arrived, so a spool that sat through an outage longer than
+      the age cap never tripped its sweep.
+
+    A hand-written case would have found neither. The operations are
+    interleaved at random because the bugs live in the interleaving.
+    """
+    import random as _rnd
+    from surveillancehound.relay import Spool
+
+    def one(seed: int):
+        r = _rnd.Random(seed)
+        d = tmp / f"truth{seed}"
+        sp = Spool(d, r.choice([4096, 65536, 1 << 20]),
+                   r.choice([30.0, 300.0]))
+        appended, delivered, rejected = set(), set(), set()
+        now, nxt = T0, 1
+        for _ in range(r.randint(20, 90)):
+            op = r.choices(
+                ["append", "ack", "dup", "drop", "restart", "time"],
+                [40, 22, 8, 6, 6, 18])[0]
+            if op == "append":
+                sp.append(nxt, b'{"x":"%s"}' % (b"p" * r.randint(10, 400)),
+                          now)
+                appended.add(nxt)
+                nxt += 1
+            elif op in ("ack", "dup"):
+                p = sp.pending(now)
+                if p:
+                    q = p[0][0]
+                    if op == "ack":
+                        sp.ack(q)
+                    else:
+                        sp.already_delivered(q, q)
+                    # `ack(q)` proves only that q was delivered.
+                    # Anything below it that `pending()` skipped was
+                    # expired or evicted — which is the loss this
+                    # test is about.
+                    delivered.add(q)
+            elif op == "drop":
+                p = sp.pending(now)
+                if p:
+                    q = p[0][0]
+                    sp.drop(q, "rejected by the collector")
+                    rejected.add(q)
+            elif op == "restart":
+                sp = Spool(d, sp.max_bytes, sp.max_age)
+            else:
+                now += r.choice([1, 10, 60, 400])
+        sp.append(nxt, b'{"final":1}', now)
+        appended.add(nxt)
+        st = sp.stats(now)
+        still = {q for q, _ in sp.pending(now)}
+        lost = appended - delivered - rejected - still
+        return (len(lost), st.dropped_age + st.dropped_size,
+                st.dropped_stale, len(rejected))
+
+    wrong = []
+    seeds = 60
+    for seed in range(seeds):
+        lost, reported, stale, rej = one(seed)
+        if lost != reported or stale != rej:
+            wrong.append((seed, lost, reported, stale, rej))
+    assert not wrong, (
+        f"{len(wrong)} of {seeds} randomised sequences mis-report. "
+        f"First: seed {wrong[0][0]} lost {wrong[0][1]} batch(es) and "
+        f"reported {wrong[0][2]}; {wrong[0][3]} counted as rejected "
+        f"against {wrong[0][4]} actually rejected. Under-reporting "
+        f"hides real loss; over-reporting sends an operator after "
+        f"data that arrived")
+    # The ONE interleaving the ack-side sweep exists for, written
+    # out rather than left to chance: an old batch expires while a
+    # newer one is still live, and the next operation is an ack with
+    # no append in between. An append would have swept and counted
+    # the old one; an ack must too, or the advancing watermark
+    # swallows it. 60 random seeds did not reliably produce this, so
+    # the mutation that removes the sweep survived them.
+    sp = Spool(tmp / "interleave", 10 * 1024 * 1024, 100.0)
+    sp.append(1, b'{"old":1}', T0)
+    sp.append(2, b'{"new":1}', T0 + 90)
+    later = T0 + 150                 # 1 expired (150s old), 2 is 60s old
+    live = [q for q, _ in sp.pending(later)]
+    assert live == [2], (
+        f"setup: expected only the newer batch pending, got {live}")
+    sp.ack(2)                        # no append between expiry and ack
+    st = sp.stats(later)
+    assert st.dropped_age == 1, (
+        f"a batch expired UNSENT while a newer one was still live, and "
+        f"acking the newer one reported dropped_age={st.dropped_age}. "
+        f"The watermark moved past the expired entry and swallowed "
+        f"it — real loss, silently")
+    assert st.pending == 0, st.pending
+
+    # And through `already_delivered`, which has its own copy of the
+    # sweep. A 409 advances the watermark exactly as an ack does, so
+    # it can swallow an expired entry exactly as an ack can.
+    sp2 = Spool(tmp / "interleave409", 10 * 1024 * 1024, 100.0)
+    sp2.append(1, b'{"old":1}', T0)
+    sp2.append(2, b'{"new":1}', T0 + 90)
+    assert [q for q, _ in sp2.pending(later)] == [2]
+    sp2.already_delivered(2, 2)
+    st2 = sp2.stats(later)
+    assert st2.dropped_age == 1, (
+        f"a 409 advanced the watermark past an expired batch and "
+        f"reported dropped_age={st2.dropped_age}. The duplicate path "
+        f"needs the same sweep as the ack path")
+    assert st2.duplicates == 1, st2.duplicates
+
+    print(f"  spool accounting: {seeds} randomised append/ack/409/drop/"
+          f"restart sequences plus the expired-under-a-live-ack case, "
+          f"every lost batch counted exactly once")
+
+
 def _check_delivery_is_never_reported_as_loss(tmp: Path) -> None:
     """A 409 means the collector HAS the data. That is not a drop.
 
@@ -6611,6 +6743,7 @@ def main() -> int:
         _check_replay_opens_no_listener(Path(td))
         _check_spool_counters(Path(td))
         _check_delivery_is_never_reported_as_loss(Path(td))
+        _check_spool_accounting_matches_reality(Path(td))
         _check_ack_does_not_rewrite_the_whole_spool(Path(td))
         _check_delivered_entries_are_not_counted_as_aged_out(Path(td))
         _check_retention_actually_bounds_growth(Path(td))
