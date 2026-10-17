@@ -5443,8 +5443,86 @@ def _check_delivered_entries_are_not_counted_as_aged_out(tmp: Path) -> None:
     assert [q for q, _ in bare.pending(T0)] == list(range(1, 11)), (
         "a lost watermark must fall back to re-sending everything "
         "still in the file, which the collector then 409s")
+    # A DAMAGED watermark must not silently eat the spool.
+    #
+    # Every corruption mode that can happen by accident — truncation,
+    # garbage, a wrong type, a float that overflows int() — has to
+    # reset to "nothing delivered" and re-send, not hide entries.
+    # Only a deliberately planted, valid, enormous integer can hide
+    # them, and that needs write access to the agent's state
+    # directory, where an attacker can already read the shared
+    # secret. That one is clamped and logged rather than silent.
+    import json as _json
+    import logging as _logging
+
+    for label, text in (
+            ("truncated", '{"acked_through": 10'),
+            ("garbage", "not json at all"),
+            ("wrong type", '{"acked_through": "lots"}'),
+            ("overflowing float", '{"acked_through": 1e400}'),
+            ("a list", '[1, 2, 3]')):
+        d3 = tmp / f"corrupt-{label.replace(' ', '-')}"
+        sp5 = Spool(d3, 10 * 1024 * 1024, 86400.0)
+        for i in range(1, 6):
+            sp5.append(i, b'{"a":%d}' % i, T0)
+        sp5.ack(1)
+        (d3 / "counters.json").write_text(text)
+        reread = Spool(d3, 10 * 1024 * 1024, 86400.0)
+        got = [q for q, _ in reread.pending(T0)]
+        assert got == [1, 2, 3, 4, 5], (
+            f"a {label} counters file left pending={got}. A damaged "
+            f"diagnostic file must cost a re-send — which the "
+            f"collector 409s — never the observations themselves")
+
+    # The planted case: clamped against the highest sequence this
+    # agent ever minted, and said out loud.
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import AlertRow, HoundStore
+
+    home2 = tmp / "tampered"
+    home2.mkdir()
+    store2 = HoundStore(path=home2 / "agent.sqlite")
+    store2.insert_alert(AlertRow(
+        id=None, ts=T0, device_ip="10.0.0.1", kind="new_device",
+        severity="low", summary="x", detail="", dedup_key="t1"))
+    cfg2 = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url="https://127.0.0.1:1/ingest/v1",
+        tls_fingerprint=["sha256:" + "ab" * 32])
+    cl = RelayClient(cfg2, store2, now=lambda: T0)
+    cl.enqueue()
+    cf = home2 / "relay" / "counters.json"
+    doc = _json.loads(cf.read_text()) if cf.exists() else {}
+    doc["acked_through"] = 10 ** 18
+    cf.write_text(_json.dumps(doc))
+    said = []
+
+    class _G(_logging.Handler):
+        def emit(self, rec):
+            said.append((rec.levelno, rec.getMessage()))
+
+    g = _G()
+    lg = _logging.getLogger("surveillancehound.relay")
+    lg.addHandler(g)
+    try:
+        cl2 = RelayClient(cfg2, store2, now=lambda: T0)
+    finally:
+        lg.removeHandler(g)
+        store2.close()
+    assert cl2.spool._acked_through <= cl2.state.next_seq - 1, (
+        f"watermark {cl2.spool._acked_through} survived above the "
+        f"highest sequence this agent ever minted "
+        f"({cl2.state.next_seq - 1}); nothing could have acknowledged "
+        f"a batch that was never created")
+    assert any(lv >= _logging.WARNING and "watermark" in m
+               for lv, m in said), (
+        f"a watermark above anything ever minted was accepted without "
+        f"a word: {said}")
     print("  ack watermark: delivered entries never counted as aged "
-          "out, survives restart, degrades to re-send if lost")
+          "out, survives restart, five corruption modes re-send "
+          "rather than discard, and a planted value is clamped and "
+          "logged")
 
 
 def _check_spool_counters(tmp: Path) -> None:

@@ -582,6 +582,35 @@ class Spool:
             self._save_counters()
             self._maybe_compact()
 
+    def reconcile_watermark(self, highest_minted: int) -> None:
+        """Clamp the delivered-watermark to a sequence we actually made.
+
+        `counters.json` is best-effort and lives on disk beside the
+        spool. A corrupt or truncated value — or a hostile one, on a
+        host where the threat model is already lost — made every
+        entry compare as delivered, so the agent discarded its whole
+        spool and reported `pending 0` with every drop counter at
+        zero. Silent loss that passes its own audit is the worst
+        shape this project has, and the watermark introduced it.
+
+        The bound is exact rather than a heuristic: `AgentState`
+        mints every sequence, so one above the highest ever minted
+        cannot have been acknowledged by anybody.
+        """
+        with self._lock:
+            if self._acked_through <= highest_minted:
+                return
+            log.warning(
+                "relay: spool watermark claims batch %s was delivered "
+                "but this agent has only ever created %s; the counters "
+                "file is damaged. Clamping, so the %d spooled batch(es) "
+                "are re-sent rather than discarded — the collector "
+                "answers 409 for any it already holds.",
+                self._acked_through, highest_minted,
+                len(self._read()))
+            self._acked_through = max(_NOTHING_ACKED, int(highest_minted))
+            self._save_counters()
+
     def _maybe_compact(self) -> None:
         """Rewrite once a quarter of the spool is delivered. Holds `_lock`."""
         threshold = max(_ACK_COMPACT_MIN,
@@ -888,6 +917,11 @@ class RelayClient:
         base = Path(store.path).parent / "relay"
         self.state = AgentState.load(base)
         self.spool = Spool(base, cfg.spool_max_bytes, cfg.spool_max_age_seconds)
+        # The two files are written independently and either can be
+        # damaged on its own. A delivered-watermark above the highest
+        # sequence this agent ever minted is impossible, and taking it
+        # at face value silently discards the spool.
+        self.spool.reconcile_watermark(self.state.next_seq - 1)
         self._lock = threading.Lock()
         self._flush_lock = threading.Lock()
         # Link-health logging state. See `_note_link`.

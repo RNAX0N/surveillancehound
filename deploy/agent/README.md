@@ -162,7 +162,14 @@ them here.
   collector's trust boundary.
 - **An attacker on the agent host itself** can read the shared secret
   out of `hound.toml`. Nothing on the collector helps with that; it is
-  the agent host's own security boundary.
+  the agent host's own security boundary. The same access can plant a
+  delivered-watermark in the spool's `counters.json` that hides
+  everything queued — the agent clamps it to a sequence it actually
+  minted and logs loudly, but anything already below that is
+  indistinguishable from delivered. Accidental damage to that file
+  (truncation, garbage, a value that will not parse) is safe: it
+  resets and the batches are re-sent, which the collector answers
+  with `409`.
 - **`--offline-compact` is not serialised against the other manual
   writing subcommands.** It refuses while the DAEMON holds the store,
   which is the case that matters, but not while `sensors --forget`,
