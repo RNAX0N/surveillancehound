@@ -691,6 +691,14 @@ def cmd_relay(args: argparse.Namespace) -> int:
     if st.dropped_size or st.dropped_age or st.dropped_stale:
         print(f"  dropped       {st.dropped_size} over size, "
               f"{st.dropped_age} over age, {st.dropped_stale} rejected")
+        print("                these are observations that did NOT reach "
+              "the collector")
+    if st.duplicates:
+        # Deliberately NOT under "dropped". The collector already had
+        # these; counting them as discarded reported loss that never
+        # happened, which is the same error as hiding loss that did.
+        print(f"  duplicates    {st.duplicates} batch(es) the collector "
+              f"already had (delivered, not lost)")
     if state.last_error:
         # Stripped, not printed raw. This string is built from the
         # collector's response body, and the collector echoes

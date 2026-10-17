@@ -794,8 +794,7 @@ class _Server(ThreadingHTTPServer):
         with self._src_lock:
             in_use = sum(self._per_source.values())
             free = self.max_workers - in_use
-            proven = self._trusted.get(source, 0.0) > (
-                time.monotonic() - _TRUSTED_TTL)
+            proven = self.is_proven(source)
             if not proven and free <= self.trusted_reserve:
                 self.rejected_overload += 1
                 log.debug(
@@ -857,6 +856,31 @@ class _Server(ThreadingHTTPServer):
         """Worker slots currently held, by source accounting."""
         with self._src_lock:
             return sum(self._per_source.values())
+
+    def is_proven(self, source: str) -> bool:
+        """Has this address completed a signed request recently?
+
+        ABSENCE IS NOT A TIMESTAMP. This was
+        `self._trusted.get(source, 0.0) > time.monotonic() - _TRUSTED_TTL`,
+        and `time.monotonic()` counts from boot — so for the first
+        hour of uptime the right-hand side is NEGATIVE and the 0.0
+        default for an unknown source compares as proven. Every
+        source read as trusted and the reserve did not exist.
+
+        That is the window where it matters most: a firewall that has
+        just rebooted, with no sensor having reported yet, is exactly
+        when a flood of fresh addresses can take every worker. Four
+        review rounds missed it because every reviewer's machine had
+        been up for more than an hour; it surfaced on a box 31
+        minutes from boot.
+
+        Not a monotonic-clock quirk to code around — a sentinel that
+        collides with real data. `None` cannot be mistaken for a
+        time.
+        """
+        last = self._trusted.get(source)
+        return (last is not None
+                and (time.monotonic() - last) < _TRUSTED_TTL)
 
     def mark_trusted(self, source: str) -> None:
         now = time.monotonic()

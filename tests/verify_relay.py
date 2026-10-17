@@ -3597,6 +3597,39 @@ def _check_admission_gates_are_live(tmp: Path) -> None:
          _I._Server.trusted_reserve) = saved
         hold.set()
 
+    # THE RESERVE MUST NOT DEPEND ON HOW LONG THE BOX HAS BEEN UP.
+    #
+    # `proven` was `self._trusted.get(source, 0.0) > time.monotonic()
+    # - _TRUSTED_TTL`. `time.monotonic()` counts from boot, so for the
+    # first hour of uptime the right-hand side is negative and the
+    # 0.0 default for an UNKNOWN source compares as proven — the
+    # reserve did not exist at all. A firewall that has just rebooted,
+    # with no sensor yet reporting, is precisely when a flood of
+    # fresh addresses can take every worker.
+    #
+    # Four review rounds missed this because every reviewer's machine
+    # had been up over an hour. Asserted here against a SIMULATED
+    # fresh boot so it cannot depend on the host again.
+    import surveillancehound.ingest as _ingmod
+
+    probe = _ingmod._Server.__new__(_ingmod._Server)
+    probe._trusted = {}
+    real_monotonic = _ingmod.time.monotonic
+    try:
+        _ingmod.time.monotonic = lambda: 10.0      # 10s since boot
+        assert probe.is_proven("10.0.0.99") is False, (
+            "an address that has never completed a signed request "
+            "reads as proven 10 seconds after boot. The reserve is "
+            "then open to anyone for the first hour of uptime")
+        probe._trusted["10.0.0.98"] = 5.0
+        assert probe.is_proven("10.0.0.98") is True, (
+            "a source that DID sign recently must still be proven")
+        probe._trusted["10.0.0.97"] = 10.0 - _ingmod._TRUSTED_TTL - 1
+        assert probe.is_proven("10.0.0.97") is False, (
+            "a proof older than the TTL must expire")
+    finally:
+        _ingmod.time.monotonic = real_monotonic
+
     print("  admission gates: 507 on low disk, 400 on a forged sequence "
           "and a hostile instance id; per-source cap and proven-source "
           "reserve both refuse over real TLS")
@@ -5262,6 +5295,158 @@ def _check_replay_opens_no_listener(tmp: Path) -> None:
     print("  replay: no ingest listener, no sensor alerts from packet time")
 
 
+def _check_delivery_is_never_reported_as_loss(tmp: Path) -> None:
+    """A 409 means the collector HAS the data. That is not a drop.
+
+    The 409 branch called `spool.drop()`, which increments
+    `dropped_stale` — so `hound relay` told the operator observations
+    had been discarded when they had in fact arrived. Reporting loss
+    that did not happen is the same class of error as hiding loss
+    that did, and this project treats that as its cardinal sin.
+
+    Reachable on any duplicate: a re-sent batch after a restart that
+    lost the ack watermark, or a collector that is simply ahead.
+    """
+    from surveillancehound import relay as _R
+    from surveillancehound.config import RelayCfg
+    from surveillancehound.relay import RelayClient
+    from surveillancehound.store import AlertRow, HoundStore
+
+    home = tmp / "dup"
+    home.mkdir()
+    store = HoundStore(path=home / "agent.sqlite")
+    for i in range(3):
+        store.insert_alert(AlertRow(
+            id=None, ts=T0 + i, device_ip="10.0.0.1", kind="new_device",
+            severity="low", summary="x", detail="", dedup_key=f"dup{i}"))
+    cfg = RelayCfg(
+        mode="agent", sensor_id="frigate", key="shared-secret-abcdef",
+        url="https://127.0.0.1:1/ingest/v1",
+        tls_fingerprint=["sha256:" + "ab" * 32],
+    )
+    client = RelayClient(cfg, store, now=lambda: T0)
+    client.enqueue()
+    real = _R.post_batch
+    _R.post_batch = lambda *a, **k: (409, {"last_seq": 5})
+    try:
+        assert client.flush() is True, "a 409 must not fail the cycle"
+    finally:
+        _R.post_batch = real
+    st = client.spool.stats(T0)
+    assert st.dropped_stale == 0, (
+        f"a 409 counted {st.dropped_stale} batch(es) as discarded. The "
+        f"collector already HAS those records — reporting them as lost "
+        f"sends an operator looking for data that arrived")
+    assert st.duplicates == 1, (
+        f"the duplicate was not recorded at all ({st.duplicates}); it "
+        f"should be visible, just not as loss")
+    assert st.pending == 0, "the batch must leave the spool"
+    store.close()
+    print("  409: recorded as a duplicate, not as discarded data")
+
+
+def _check_ack_does_not_rewrite_the_whole_spool(tmp: Path) -> None:
+    """Acking a batch must not cost the size of the spool.
+
+    `ack()` read and rewrote the ENTIRE file per delivered batch —
+    the same O(n^2) churn `append`'s docstring identifies and avoids
+    for enqueue. Measured on a full 64 MiB spool of 15,427 batches:
+    682 ms of CPU and 63 MB rewritten PER ACK, about 175 CPU-minutes
+    and 971 GB to drain one long outage. The agent runs the whole
+    capture pipeline beside this with no `CaptureGate`, so that CPU
+    competes with its own packet loop, and the writes are what kills
+    an SD-booted NVR.
+
+    Asserted as a RATIO against a small spool, not an absolute time,
+    so it cannot flake on a slow or busy machine: the per-ack cost
+    must not scale with how much is queued.
+    """
+    import time as _t
+    from surveillancehound.relay import Spool
+
+    body = b'{"records":{"flows":[' + b'{"x":1},' * 200 + b'{"x":1}]}}'
+
+    def drain_cost(count: int) -> float:
+        sp = Spool(tmp / f"perf{count}", 64 * 1024 * 1024, 86400.0)
+        for i in range(1, count + 1):
+            sp.append(i, body, T0)
+        t0 = _t.process_time()
+        for i in range(1, count + 1):
+            sp.ack(i)
+        assert sp.pending(T0) == [], "drain left entries behind"
+        return (_t.process_time() - t0) / count
+
+    small = drain_cost(200)
+    large = drain_cost(4000)
+    # 20x the queue. Quadratic would be ~20x the per-ack cost; the
+    # bound is deliberately loose because this measures real I/O.
+    assert large < small * 6, (
+        f"per-ack cost grew {large / small:.1f}x when the spool grew "
+        f"20x ({small * 1000:.2f} ms -> {large * 1000:.2f} ms). The ack "
+        f"is still rewriting the whole file, so draining a long outage "
+        f"costs CPU and flash writes proportional to the square of the "
+        f"backlog")
+    print(f"  ack cost: {small * 1000:.2f} ms at 200 batches, "
+          f"{large * 1000:.2f} ms at 4,000 — {large / small:.1f}x for a "
+          f"20x queue, not 20x")
+
+
+def _check_delivered_entries_are_not_counted_as_aged_out(tmp: Path) -> None:
+    """The ack watermark must not turn into a false drop report.
+
+    Delivered entries stay in the file until the next compaction. If
+    the age cap counted them when they expire, a long outage would
+    report a day of "dropped" observations the collector had already
+    acknowledged — which is exactly the false reporting this whole
+    change exists to remove, reintroduced by the mechanism that
+    removes it.
+
+    And a restart must not re-send what was acked: the watermark is
+    persisted beside the spool.
+    """
+    from surveillancehound.relay import Spool
+
+    d = tmp / "aged"
+    sp = Spool(d, 10 * 1024 * 1024, 60.0)
+    for i in range(1, 6):
+        sp.append(i, b'{"a":%d}' % i, T0)
+    sp.ack(3)                       # 1-3 delivered, 4-5 not
+    assert [q for q, _ in sp.pending(T0)] == [4, 5], sp.pending(T0)
+
+    # An hour later everything has aged out. Only the UNDELIVERED two
+    # are a loss.
+    sp.append(99, b'{"a":99}', T0 + 3600)       # mutation -> counts
+    st = sp.stats(T0 + 3600)
+    assert st.dropped_age == 2, (
+        f"dropped_age is {st.dropped_age}; the three delivered entries "
+        f"must not be counted when they expire, only the two that were "
+        f"never sent")
+    assert st.dropped_stale == 0, st.dropped_stale
+
+    # Restart: the watermark survives, so nothing is re-sent.
+    d2 = tmp / "persist"
+    sp2 = Spool(d2, 10 * 1024 * 1024, 86400.0)
+    for i in range(1, 11):
+        sp2.append(i, b'{"a":%d}' % i, T0)
+    sp2.ack(6)
+    reopened = Spool(d2, 10 * 1024 * 1024, 86400.0)
+    assert [q for q, _ in reopened.pending(T0)] == [7, 8, 9, 10], (
+        f"a restart re-sent delivered batches: "
+        f"{[q for q, _ in reopened.pending(T0)]}. Each would come back "
+        f"as a 409 — survivable, but a day of spool re-posted for "
+        f"nothing")
+
+    # And losing the counters file degrades to re-sending, not to
+    # corruption or silence.
+    (d2 / "counters.json").unlink()
+    bare = Spool(d2, 10 * 1024 * 1024, 86400.0)
+    assert [q for q, _ in bare.pending(T0)] == list(range(1, 11)), (
+        "a lost watermark must fall back to re-sending everything "
+        "still in the file, which the collector then 409s")
+    print("  ack watermark: delivered entries never counted as aged "
+          "out, survives restart, degrades to re-send if lost")
+
+
 def _check_spool_counters(tmp: Path) -> None:
     """`hound relay` must not report numbers it cannot stand behind.
 
@@ -6347,6 +6532,9 @@ def main() -> int:
         _check_relayed_api_surface(Path(td))
         _check_replay_opens_no_listener(Path(td))
         _check_spool_counters(Path(td))
+        _check_delivery_is_never_reported_as_loss(Path(td))
+        _check_ack_does_not_rewrite_the_whole_spool(Path(td))
+        _check_delivered_entries_are_not_counted_as_aged_out(Path(td))
         _check_retention_actually_bounds_growth(Path(td))
         _check_http_refusals_are_logged(Path(td))
         _check_alert_kinds_cannot_drift(Path(td))

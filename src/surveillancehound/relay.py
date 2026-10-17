@@ -99,6 +99,23 @@ _POST_TIMEOUT_S = 10.0
 # bind. Mirrored here so the rotation step matches the window; they
 # disagreed and left ids permanently unexamined.
 _OUTAGE_ID_BINDS = 900
+# Delivered batches to accumulate before rewriting the spool file.
+#
+# The rewrite is O(spool), so doing it per ack cost 682 ms and 63 MB
+# on a full 64 MiB spool. Waiting for a FIXED count is better but
+# still quadratic overall — a 15,000-batch drain compacts 15,000/N
+# times over a file that is only slowly getting smaller.
+#
+# So the threshold is proportional to what is actually live: compact
+# once a quarter of the spool is dead weight. Draining then costs a
+# geometric series rather than a product, and the file never carries
+# more than ~25% delivered entries. The floor stops a nearly-empty
+# spool compacting on every other ack.
+_ACK_COMPACT_MIN = 64
+# "No batch has been confirmed yet". Below any sequence a Spool can
+# legally hold, so it cannot be mistaken for one.
+_NOTHING_ACKED = -1
+_ACK_COMPACT_FRACTION = 4
 # Largest sequence number the agent will adopt from a collector's
 # 409. Mirrors the collector's own `_MAX_SEQ`; a value beyond it
 # could not have come from a sane peer and gets ignored rather than
@@ -196,6 +213,10 @@ class SpoolStats:
     dropped_size: int = 0
     dropped_age: int = 0
     dropped_stale: int = 0
+    # Batches the collector turned out to ALREADY HAVE. Delivery, not
+    # loss, and counted apart from `dropped_stale` for that reason —
+    # see `Spool.already_delivered`.
+    duplicates: int = 0
 
 
 class CaptureGate:
@@ -278,6 +299,22 @@ class Spool:
         self.dropped_size = 0
         self.dropped_age = 0
         self.dropped_stale = 0
+        self.duplicates = 0
+        # Highest sequence the collector has confirmed. Entries at or
+        # below it are delivered: never sent again, never counted as
+        # a drop, and removed from the file on the next compaction
+        # rather than on every ack. See `ack`.
+        #
+        # -1, not 0, for "nothing acked". Production sequences start
+        # at 1, but 0 is a perfectly legal int for a Spool to hold and
+        # a 0 sentinel silently swallowed it — a structure should not
+        # depend on an invariant that lives in another module.
+        self._acked_through = _NOTHING_ACKED
+        self._acks_since_compact = 0
+        # Undelivered entries present at the last compaction, so the
+        # next one triggers proportionally. 0 means "unknown", which
+        # the floor covers.
+        self._live_at_compact = 0
         self._load_counters()
         # append/ack/drop are each a read-modify-write of one file. Two
         # of them interleaving loses whichever batch the loser read
@@ -313,6 +350,14 @@ class Spool:
             self.dropped_size = int(d.get("dropped_size", 0))
             self.dropped_age = int(d.get("dropped_age", 0))
             self.dropped_stale = int(d.get("dropped_stale", 0))
+            self.duplicates = int(d.get("duplicates", 0))
+            # Persisted so a restart does not re-send what the
+            # collector already confirmed. Losing it is survivable —
+            # the collector answers 409 and `already_delivered`
+            # records that as delivery — but re-sending a day of
+            # spool for nothing is worth avoiding.
+            self._acked_through = int(
+                d.get("acked_through", _NOTHING_ACKED))
         except (OSError, ValueError, TypeError, ArithmeticError,
                 AttributeError, json.JSONDecodeError):
             # ArithmeticError covers OverflowError, which int() raises on
@@ -322,6 +367,8 @@ class Spool:
             log.warning("relay: unreadable spool counters at %s; the "
                         "drop totals restart from zero", self.counters_path)
             self.dropped_size = self.dropped_age = self.dropped_stale = 0
+            self.duplicates = 0
+            self._acked_through = _NOTHING_ACKED
 
     def _save_counters(self) -> None:
         """Best effort: a diagnostic counter is never worth failing a push."""
@@ -334,6 +381,8 @@ class Spool:
                 "dropped_size": self.dropped_size,
                 "dropped_age": self.dropped_age,
                 "dropped_stale": self.dropped_stale,
+                "duplicates": self.duplicates,
+                "acked_through": self._acked_through,
             }), encoding="utf-8")
             os.replace(tmp, self.counters_path)
         except OSError:
@@ -441,6 +490,12 @@ class Spool:
         data loss the spool exists to prevent, caused by the diagnostic
         command for it.
         """
+        # Delivered entries are not pending and are not loss. They sit
+        # in the file until the next compaction, so every reader has to
+        # look past them — and `_enforce_caps` must not count them when
+        # they age out, or a long outage would report a day of
+        # "dropped" data the collector had already acknowledged.
+        entries = [e for e in entries if e["seq"] > self._acked_through]
         kept = [e for e in entries if (now - e["at"]) <= self.max_age]
         total = sum(len(e["body"]) for e in kept)
         i = 0
@@ -456,6 +511,8 @@ class Spool:
         honest: `pending()` runs every push cycle, so counting on read
         made one expired batch register a fresh drop forever.
         """
+        # Count against the UNDELIVERED set only, for the same reason.
+        entries = [e for e in entries if e["seq"] > self._acked_through]
         kept = self._deliverable(entries, now)
         if len(kept) != len(entries):
             dropped = entries[:len(entries) - len(kept)]
@@ -472,20 +529,73 @@ class Spool:
             return [(e["seq"], e["body"].encode("utf-8")) for e in entries]
 
     def ack(self, seq: int) -> None:
-        """Drop everything up to and including `seq` — it is now durable.
+        """Everything up to and including `seq` is durable on the collector.
 
-        Also compacts, since this already rewrites the file. That is
-        where aged-out batches get counted: readers must not count (they
-        run every cycle and would re-count forever) and appends only
-        compact when oversized, so without this `dropped_age` would stay
-        at zero while batches silently expired.
+        O(1) in the size of the spool. It used to read and rewrite the
+        WHOLE file on every delivered batch, which is the same O(n^2)
+        churn `append` documents and avoids for enqueue. Measured on a
+        full 64 MiB spool of 15,427 batches: 682 ms of CPU and 63 MB
+        rewritten PER ACK — about 175 CPU-minutes and 971 GB to drain
+        one long outage. The agent runs the whole capture pipeline
+        beside this and has no `CaptureGate`, so that CPU competes
+        with its own packet loop, and on an SD- or eMMC-booted NVR the
+        writes are the thing that kills the card.
+
+        So the ack moves a watermark and the file is compacted on a
+        cadence. Three things have to hold for that to be safe, and
+        each is load-bearing:
+
+        * The watermark is PERSISTED (`counters.json`), so a restart
+          does not re-send what was already confirmed.
+        * Every reader filters on it, so a delivered entry is never
+          sent twice even before it is physically removed.
+        * `_enforce_caps` counts only UNDELIVERED entries, so a
+          delivered one ageing out before compaction is not reported
+          as lost data.
         """
         with self._lock:
-            # Count expiries BEFORE removing the acked range, or a batch
-            # that aged out unsent is swept away as though it had been
-            # delivered and never appears in the drop total.
-            live = self._enforce_caps(self._read(), self._now_hint)
-            self._write([e for e in live if e["seq"] > seq])
+            if seq <= self._acked_through:
+                return
+            self._acked_through = int(seq)
+            self._acks_since_compact += 1
+            self._save_counters()
+            self._maybe_compact()
+
+    def already_delivered(self, seq: int, last_seq: int) -> None:
+        """The collector says it already has this batch. NOT a loss.
+
+        A 409 means the records are on the collector — a duplicate, or
+        a watermark we lost. Routing it through `drop()` counted it in
+        `dropped_stale`, so `hound relay` reported discarded
+        observations for data that had in fact arrived. Reporting loss
+        that did not happen is the same class of error as hiding loss
+        that did.
+        """
+        with self._lock:
+            self.duplicates += 1
+            log.info("relay: batch seq=%s was already on the collector "
+                     "(it is at seq %s); treating as delivered",
+                     seq, last_seq)
+            if seq > self._acked_through:
+                self._acked_through = int(seq)
+            self._acks_since_compact += 1
+            self._save_counters()
+            self._maybe_compact()
+
+    def _maybe_compact(self) -> None:
+        """Rewrite once a quarter of the spool is delivered. Holds `_lock`."""
+        threshold = max(_ACK_COMPACT_MIN,
+                        self._live_at_compact // _ACK_COMPACT_FRACTION)
+        if self._acks_since_compact >= threshold:
+            self._compact_locked()
+
+    def _compact_locked(self) -> None:
+        """Physically remove delivered and expired entries. Caller holds
+        `_lock`."""
+        self._acks_since_compact = 0
+        kept = self._enforce_caps(self._read(), self._now_hint)
+        self._live_at_compact = len(kept)
+        self._write(kept)
 
     def replace(self, seq: int, parts: list[tuple[int, bytes]]) -> None:
         """Swap one batch for smaller ones. NOT a drop.
@@ -536,6 +646,7 @@ class Spool:
                 dropped_size=self.dropped_size,
                 dropped_age=self.dropped_age,
                 dropped_stale=self.dropped_stale,
+                duplicates=self.duplicates,
             )
 
 
@@ -1383,7 +1494,11 @@ class RelayClient:
                 last = (raw_last if isinstance(raw_last, int)
                         and not isinstance(raw_last, bool)
                         and 0 < raw_last < _MAX_SAFE_SEQ else seq)
-                self.spool.drop(seq, f"collector already has seq {last}")
+                # NOT `drop()`. A 409 means the collector HAS these
+                # records; calling it a drop put them in
+                # `dropped_stale`, so `hound relay` reported discarded
+                # observations for data that had arrived.
+                self.spool.already_delivered(seq, last)
                 with self._lock:
                     if self.state.next_seq <= last:
                         self.state.next_seq = last + 1
