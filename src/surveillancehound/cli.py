@@ -713,8 +713,17 @@ def cmd_relay(args: argparse.Namespace) -> int:
         # agent has never run OR its state file is unreadable. Printing
         # a blank instance and "next sequence 1" as fact would be
         # stating something this command cannot actually see.
-        print("  instance      unknown — no readable state file at "
-              f"{base / 'state.json'}")
+        # `parse_failed` and `loaded` are distinct now, so say which
+        # it is. "no readable state file" was printed for a file that
+        # reads perfectly and has one bad field, which sends an
+        # operator looking for a permissions or disk fault.
+        if state.parse_failed:
+            print(f"  instance      unknown — the state file at "
+                  f"{base / 'state.json'} is damaged (see the log for "
+                  f"the field)")
+        else:
+            print("  instance      unknown — no state file at "
+                  f"{base / 'state.json'}; the agent has not run yet")
         print("  next sequence unknown (the agent mints state on first run)")
         # With the state file unreadable the clamp is skipped, so an
         # ALSO-damaged counters file keeps hiding the spool and

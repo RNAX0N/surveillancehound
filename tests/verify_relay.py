@@ -5545,6 +5545,22 @@ def _check_relay_diagnostic_does_not_invent_a_backlog(tmp: Path) -> None:
     assert "counters file is damaged" not in full, (
         "it blamed counters.json, which is intact; the unreadable "
         "file is state.json")
+    # The diagnostic must not claim it reset anything. A readonly
+    # load mints nothing and writes nothing, and this is the command
+    # documented to work when things are broken — so "starting fresh"
+    # on its stderr told the operator about an identity reset that
+    # did not happen.
+    assert "starting fresh" not in full, (
+        f"`hound relay` said it was starting fresh. It is readonly "
+        f"and rewrote nothing:\n{full}")
+    assert "nothing rewritten" in full, (
+        f"the readonly path should say what it actually did:\n{full}")
+    assert "damaged" in full, (
+        f"a state file that exists but will not parse must not be "
+        f"reported as an agent that has never run:\n{full}")
+    assert (base / "state.json").read_text() == '{"truncated', (
+        "the diagnostic rewrote the torn state file it was asked to "
+        "report on")
 
     # A PARTIAL parse, which is the case the first fix missed.
     # `instance_id` is the first field the loader reads, so a file
@@ -5583,6 +5599,10 @@ def _check_relay_diagnostic_does_not_invent_a_backlog(tmp: Path) -> None:
             f"raise' is not the same question as 'is this a sequence'")
         assert "counters file is damaged" not in full, (
             f"next_seq={bad} made it blame the intact counters file")
+    assert (base / "state.json").read_text() == doc, (
+        "the diagnostic rewrote the damaged state file it was asked "
+        "to report on")
+
     # A null identity must not become the string "None" and wedge the
     # agent under a junk instance id that no re-mint guard can clear.
     (base / "state.json").write_text(
@@ -5693,10 +5713,10 @@ def _check_a_kill_during_enqueue_cannot_reuse_a_sequence(tmp: Path) -> None:
         appended["yes"] = True
         return real_append(*a, **kw)
 
-    def flaky():
+    def flaky(**kw):
         if appended["yes"]:
             raise OSError("killed after the append, before the save")
-        real_save()
+        real_save(**kw)
 
     cl.spool.append = watched_append
     cl.state.save = flaky

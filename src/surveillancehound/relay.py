@@ -422,8 +422,11 @@ class Spool:
             # clamped watermark — where the delivered-filter removes
             # it and no counter ever sees it. Silent loss, in the one
             # branch written to be careful about exactly that. A
-            # sequence is a non-negative int, and `_load_counters`
-            # already bounds `acked_through` the same way.
+            # sequence is a NON-NEGATIVE int — one lower than
+            # `_load_counters` allows `acked_through`, which bottoms
+            # out at the `_NOTHING_ACKED` sentinel of -1 precisely so
+            # that seq 0 can be a real, undelivered entry. The bounds
+            # differ on purpose.
             if (not isinstance(rec, dict)
                     or isinstance(rec.get("seq"), bool)
                     or not isinstance(rec.get("at"), (int, float))
@@ -900,10 +903,14 @@ class Spool:
                              if e["seq"] <= self._acked_through}
             capped_ids = {id(e) for e in raw if id(e) not in live_ids
                           and id(e) not in delivered_ids}
-            kept_ids = {id(e) for e in kept}
+            # No `id(e) not in kept_ids` term: `kept` excludes every
+            # entry at this sequence by construction, so for the
+            # entries `mine` considers it is always true, and a
+            # condition that cannot fail reads as load-bearing in a
+            # block whose point is that the classification can be
+            # followed.
             mine = [e for e in raw
-                    if e["seq"] == seq and id(e) not in kept_ids
-                    and id(e) not in capped_ids]
+                    if e["seq"] == seq and id(e) not in capped_ids]
             self.dropped_stale += len(mine)
             if len(mine) > 1:
                 log.warning(
@@ -912,6 +919,23 @@ class Spool:
                     "damaged or tampered with; all %d are discarded "
                     "and counted, but only one of them was the batch "
                     "the collector refused.", len(mine), seq, len(mine))
+            elif mine and mine[0]["seq"] <= self._acked_through:
+                # One entry, already acknowledged, and now refused.
+                # Counting it reports loss for data the collector
+                # confirmed it holds — so say that out loud rather
+                # than leaving the number to speak for itself. Not
+                # reachable through the flush loop (the spool is
+                # sequence-increasing and `_flush_locked` only acks
+                # EARLIER elements of its captured list), so arriving
+                # here means a damaged file or two flushes racing,
+                # which is what `_flush_lock` exists to prevent.
+                log.warning(
+                    "relay: batch seq=%s was acknowledged at or below "
+                    "the delivered watermark (%s) and then refused. It "
+                    "is counted under dropped, but the collector "
+                    "reported holding it — treat this as a damaged "
+                    "spool or concurrent flushes, not as lost data.",
+                    seq, self._acked_through)
             self._save_counters()
             self._write(kept)
 
@@ -1060,8 +1084,24 @@ class AgentState:
                 # the operator was told only that a file was unreadable
                 # — and the consequence is now large enough to want the
                 # reason: this run re-relays the sensor's whole store.
-                log.warning("relay: unreadable state file at %s (%s); "
-                            "starting fresh", path, exc)
+                # "unreadable or invalid", because four of the six
+                # ways to land here parsed fine and failed VALIDATION
+                # — and the clause that said otherwise sat directly
+                # above the precise cause contradicting it.
+                #
+                # "starting fresh" only when we actually will: a
+                # readonly load mints nothing and writes nothing, and
+                # `hound relay` is the command specified to work when
+                # things are broken. Telling its operator the agent
+                # had just reset its identity, with the file on disk
+                # byte-identical afterwards, is the same defect as any
+                # other untrue line.
+                log.warning(
+                    "relay: unreadable or invalid state file at %s "
+                    "(%s); %s", path, exc,
+                    "reporting what can be read, nothing rewritten"
+                    if readonly else
+                    "starting fresh with a new identity")
                 st.parse_failed = True
             else:
                 st.instance_id = instance_id
@@ -1075,20 +1115,61 @@ class AgentState:
             st.save()
         return st
 
-    def save(self) -> None:
+    def save(self, *, durable: bool = False) -> None:
+        """Atomically rewrite the state file.
+
+        `durable=True` additionally fsyncs the file and its directory,
+        for the ONE caller whose correctness is an ordering against a
+        later write: `enqueue` burns the sequence before appending to
+        the spool, so that a kill can only ever leave a gap. Without a
+        flush that ordering lives in the page cache — correct for
+        SIGKILL, OOM and a `daemon -r` respawn, but under power loss it
+        would depend on the filesystem choosing to commit the rename
+        before the append, and a filesystem or flash controller that
+        does not would reconstruct the duplicated sequence that
+        ordering exists to prevent.
+
+        Off by default because the ack path saves per batch during a
+        drain, and an fsync there would put a flush between every
+        acknowledgement of a thousand-batch backlog. This is the same
+        write-amplification argument `ack` makes about SD and eMMC
+        cards: one flush per batch interval is nothing, one per ack is
+        not.
+        """
         # Unique temp name: the pusher thread and the shutdown path both
         # save, and a shared "state.json.tmp" lets one truncate the other
         # mid-write. A torn state file loses next_seq and the agent mints
         # a fresh instance_id, which resets the collector's sequence.
         tmp = self.path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-        tmp.write_text(json.dumps({
+        payload = json.dumps({
             "instance_id": self.instance_id,
             "next_seq": self.next_seq,
             "watermark": self.watermark.as_dict(),
             "last_push_ts": self.last_push_ts,
             "last_error": self.last_error,
-        }, indent=2), encoding="utf-8")
+        }, indent=2)
+        if durable:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+        else:
+            tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, self.path)
+        if durable:
+            # The rename itself needs the directory entry on disk, or
+            # the fsync above protects the contents of a file the
+            # directory does not yet point at.
+            try:
+                fd = os.open(self.path.parent, os.O_RDONLY)
+            except OSError:
+                return
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
 
 
 # --------------------------------------------------------------------------
@@ -1548,9 +1629,20 @@ class RelayClient:
             # The record watermark still moves only after the batch is
             # on disk — advancing it first would discard observations
             # that were never spooled, which is the permanent loss
-            # this ordering has always existed to prevent.
+            # this ordering has always existed to prevent. So a kill
+            # AFTER the append and before the second save re-collects
+            # the same records under the next sequence; they are
+            # relayed twice and deduped at the collector on
+            # (sensor, instance, remote_id). Duplicated DELIVERY is
+            # fine; a duplicated SEQUENCE is what cannot be resolved.
+            #
+            # `durable=True` on the first save only. The ordering is
+            # the whole guarantee, so it has to survive power loss and
+            # not merely process death; the second save does not need
+            # it, and the ack path must not have it. One flush per
+            # batch interval, not per ack.
             self.state.next_seq = seq + 1
-            self.state.save()
+            self.state.save(durable=True)
             self.spool.append(seq, body, self.now())
             self.state.watermark = new_wm
             self.state.save()
