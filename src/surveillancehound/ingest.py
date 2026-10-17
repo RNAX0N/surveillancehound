@@ -852,6 +852,14 @@ class _Server(ThreadingHTTPServer):
     # already learned this; the lesson did not get carried across.
     max_trusted = 512
 
+    #: How long a completed signed request keeps a source "proven".
+    #: A CLASS attribute rather than a `getattr` default, so both
+    #: readers below see the same value and a misspelled override
+    #: fails loudly instead of silently doing nothing. Overridden
+    #: per instance by tests that need to age the window out without
+    #: mutating a module global every other thread shares.
+    _trusted_ttl = _TRUSTED_TTL
+
     def active_slots(self) -> int:
         """Worker slots currently held, by source accounting."""
         with self._src_lock:
@@ -879,11 +887,8 @@ class _Server(ThreadingHTTPServer):
         time.
         """
         last = self._trusted.get(source)
-        # `_trusted_ttl` is an optional per-instance override, so a
-        # test can age the window out without touching a module
-        # global that every other thread shares.
-        ttl = getattr(self, "_trusted_ttl", _TRUSTED_TTL)
-        return last is not None and (time.monotonic() - last) < ttl
+        return last is not None and (
+            time.monotonic() - last) < self._trusted_ttl
 
     def mark_trusted(self, source: str) -> None:
         now = time.monotonic()
@@ -891,7 +896,10 @@ class _Server(ThreadingHTTPServer):
             self._trusted[source] = now
             if len(self._trusted) <= self.max_trusted:
                 return
-            cutoff = now - _TRUSTED_TTL
+            # Same TTL the proven check uses. Reading the module
+            # global here while `is_proven` read the override meant a
+            # shortened window pruned on the long one.
+            cutoff = now - self._trusted_ttl
             for k in [k for k, v in self._trusted.items() if v < cutoff]:
                 del self._trusted[k]
             # Still over: evict oldest. Losing a reservation costs a

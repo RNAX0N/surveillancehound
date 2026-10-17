@@ -3632,33 +3632,39 @@ def _check_admission_gates_are_live(tmp: Path) -> None:
 
     probe = _ingmod._Server.__new__(_ingmod._Server)
     probe._trusted = {}
-    # Move the TTL, not the clock. `_ingmod.time` IS the stdlib
-    # module, so assigning `time.monotonic` replaces it for every
-    # thread in the process — a reaper, a store busy-timeout, a
-    # pusher. Nothing is live at this exact point today, which is
-    # the only thing that made it safe, and a landmine in the one
-    # test written to remove a hidden dependency. A TTL far above
-    # the current uptime makes the same comparison negative without
-    # touching anything shared.
-    # An INSTANCE attribute, not the module global. `_TRUSTED_TTL`
-    # was still shared state, safe only because nothing live reads it
-    # at this point — which is the same argument that was rejected
-    # for patching `time.monotonic`. `is_proven` reads
-    # `self._trusted_ttl` when the probe defines it, so nothing
-    # outside this object is touched.
+    # Move the TTL, not the clock, and move it on the INSTANCE.
+    #
+    # `_ingmod.time` IS the stdlib module, so assigning
+    # `time.monotonic` replaces it for every thread in the process —
+    # a reaper, a store busy-timeout, a pusher. Patching the module
+    # global `_TRUSTED_TTL` is the same objection one step removed.
+    # A per-instance TTL far above the current uptime makes the same
+    # comparison negative while touching nothing outside this object.
     probe._trusted_ttl = _ingmod.time.monotonic() + 1e9
-    if True:
-        assert probe.is_proven("10.0.0.99") is False, (
-            "an address that has never completed a signed request "
-            "reads as proven 10 seconds after boot. The reserve is "
-            "then open to anyone for the first hour of uptime")
-        probe._trusted["10.0.0.98"] = _ingmod.time.monotonic()
-        assert probe.is_proven("10.0.0.98") is True, (
-            "a source that DID sign recently must still be proven")
-        probe._trusted["10.0.0.97"] = (
-            _ingmod.time.monotonic() - probe._trusted_ttl - 1)
-        assert probe.is_proven("10.0.0.97") is False, (
-            "a proof older than the TTL must expire")
+    assert probe.is_proven("10.0.0.99") is False, (
+        "an address that has never completed a signed request "
+        "reads as proven 10 seconds after boot. The reserve is "
+        "then open to anyone for the first hour of uptime")
+    probe._trusted["10.0.0.98"] = _ingmod.time.monotonic()
+    assert probe.is_proven("10.0.0.98") is True, (
+        "a source that DID sign recently must still be proven")
+    probe._trusted["10.0.0.97"] = (
+        _ingmod.time.monotonic() - probe._trusted_ttl - 1)
+    assert probe.is_proven("10.0.0.97") is False, (
+        "a proof older than the TTL must expire")
+
+    # The override must reach BOTH readers. `mark_trusted` pruned on
+    # the module global while `is_proven` read the override, so a
+    # shortened window kept entries the proven check already called
+    # expired — two TTLs in one mechanism.
+    probe._src_lock = __import__("threading").Lock()
+    probe.max_trusted = 1
+    probe._trusted_ttl = 0.001
+    probe._trusted = {"10.0.0.96": _ingmod.time.monotonic() - 1.0}
+    probe.mark_trusted("10.0.0.95")
+    assert "10.0.0.96" not in probe._trusted, (
+        "mark_trusted kept a source its own is_proven calls expired; "
+        "the TTL must be read from one place")
 
 
     print("  admission gates: 507 on low disk, 400 on a forged sequence "
@@ -5508,8 +5514,12 @@ def _check_relay_diagnostic_does_not_invent_a_backlog(tmp: Path) -> None:
                        "relay", str(cfg_path)],
                       capture_output=True, text=True, env=env)
         assert out.returncode == 0, out.stderr[-300:]
+        # startswith, not `in`: other lines mention the word
+        # "spooled" and matching one of those made the assertions
+        # below test a sentence rather than the count.
         return next(l for l in out.stdout.splitlines()
-                    if "spooled" in l), out.stdout + out.stderr
+                    if l.strip().startswith("spooled")), (
+                        out.stdout + out.stderr)
 
     line, _ = spooled_line()
     assert "2 batch" in line, f"healthy case is wrong already: {line!r}"
@@ -5525,8 +5535,38 @@ def _check_relay_diagnostic_does_not_invent_a_backlog(tmp: Path) -> None:
     assert "counters file is damaged" not in full, (
         "it blamed counters.json, which is intact; the unreadable "
         "file is state.json")
-    print("  hound relay: an unreadable state file does not invent a "
-          "backlog or blame the wrong file")
+
+    # A PARTIAL parse, which is the case the first fix missed.
+    # `instance_id` is the first field the loader reads, so a file
+    # whose `next_seq` is garbage left a plausible id beside a
+    # defaulted `next_seq = 1`. Gating the clamp on `instance_id`
+    # therefore walked straight back into the bug above — the gate
+    # has to mean "every field parsed", not "one field parsed".
+    (base / "state.json").write_text(
+        '{"instance_id": "inst-aaaa1111", "next_seq": "garbage"}')
+    line, full = spooled_line()
+    assert "2 batch" in line, (
+        f"a state.json with a readable instance_id but an unparseable "
+        f"next_seq reported {line.strip()!r} instead of 2. A gate on "
+        f"instance_id is not a gate on the file having loaded")
+    assert "counters file is damaged" not in full, (
+        "it blamed counters.json over a damaged state.json again, one "
+        "field across from where the first fix looked")
+
+    # And with BOTH damaged the command must not go quiet: it cannot
+    # clamp, so `spooled` undercounts while the daemon re-sends the
+    # lot. Under-reporting is the right way to fail — this command
+    # must never invent a backlog — but it has to say so.
+    (base / "counters.json").write_text(
+        '{"acked_through": 1000000000, "dropped_age": 0}')
+    line, full = spooled_line()
+    assert "may undercount" in full, (
+        "with state.json AND counters.json both damaged the command "
+        f"printed a bare {line.strip()!r} and said nothing about the "
+        f"impossible watermark it chose not to act on:\n{full}")
+
+    print("  hound relay: neither a torn nor a half-parsed state file "
+          "invents a backlog, and a double fault is declared")
 
 
 def _check_watermark_load_rejects_non_integers(tmp: Path) -> None:
@@ -5565,33 +5605,87 @@ def _check_watermark_load_rejects_non_integers(tmp: Path) -> None:
 
 
 def _check_drop_attribution_names_the_right_cap(tmp: Path) -> None:
-    """An age expiry must not be reported as a size eviction.
+    """An age expiry must not be reported as a size eviction, and an
+    eviction must not go uncounted because two entries share a sequence.
 
-    The dropped set was taken as `entries[:n]`, which assumes file
-    order is age order — and `replace()` deliberately breaks that,
-    since a split batch's parts inherit the original's timestamp and
-    land at the tail. The total stayed exact, so the ground-truth
-    harness passed, but the operator was pointed at
-    `spool_max_bytes` when the age cap was what discarded their data.
+    Two bugs, one line of code. The dropped set was first taken as
+    `entries[:n]`, which assumes file order is age order — and
+    `replace()` deliberately breaks that, since a split batch's parts
+    inherit the original's timestamp and land at the tail. The total
+    stayed exact, so the ground-truth harness passed, but the operator
+    was pointed at `spool_max_bytes` when the age cap was what
+    discarded their data.
+
+    Taking it as a set of SEQUENCES fixed the attribution and broke
+    the total: sequences repeat in the file, because `enqueue`
+    appends before it saves the advanced `next_seq`, so a kill
+    between those two writes leaves a sequence the next run mints
+    again. Evicting one of the pair found the survivor's sequence
+    among the kept and counted nothing at all.
+
+    The first scenario below must distinguish the positional form,
+    and the second must distinguish the sequence form. Both passed
+    unmodified against the bug they were meant to guard before this
+    was rewritten — a test that cannot fail is not a guard.
     """
     from surveillancehound.relay import Spool
 
-    # A huge byte cap, so nothing can legitimately be a size drop.
-    sp = Spool(tmp / "attrib", 64 * 1024 * 1024, 60.0)
+    # --- 1. attribution: an old entry sitting AFTER a newer kept one.
+    #
+    # The age cap starts far out so building the file does not sweep,
+    # then tightens. Without a survivor ahead of the expired tail
+    # entry, the positional slice and the correct set are the same
+    # list and the check proves nothing.
+    sp = Spool(tmp / "attrib", 64 * 1024 * 1024, 10_000.0)
     sp.append(1, b'{"old":1}', T0)
-    sp.append(2, b'{"new":1}', T0 + 10)
-    # Put a tail entry carrying an OLD timestamp, as `replace` does.
-    sp.replace(2, [(3, b'{"part":1}')])
-    sp.append(4, b'{"fresh":1}', T0 + 5000)      # forces the sweep
+    sp.append(2, b'{"keep":1}', T0 + 5000)
+    sp.replace(1, [(3, b'{"part":1}')])     # seq 3 inherits T0, at the tail
+    sp.max_age = 100.0
+    sp.append(4, b'{"fresh":1}', T0 + 5000)  # within the tightened cap
     st = sp.stats(T0 + 5000)
     assert st.dropped_size == 0, (
         f"{st.dropped_size} expiries were blamed on the byte cap on a "
         f"spool at a fraction of a percent of it. The operator is "
         f"then told to raise spool_max_bytes when "
         f"spool_max_age_seconds is what discarded the data")
-    assert st.dropped_age > 0, st.dropped_age
-    print(f"  drop attribution: {st.dropped_age} expiries reported "
-          f"against the age cap, none mis-blamed on the byte cap")
+    assert st.dropped_age == 1, (
+        f"expected exactly the one aged entry, got "
+        f"dropped_age={st.dropped_age} dropped_size={st.dropped_size}")
+    live = {q for q, _ in sp.pending(T0 + 5000)}
+    assert live == {2, 4}, f"wrong survivors {live}; the sweep took the wrong entry"
+
+    # --- 2. conservation: a duplicated sequence, one copy evicted.
+    #
+    # A crash between `append` and `state.save()` leaves seq N spooled
+    # with next_seq == N, and the next run mints N again. Pairing the
+    # dropped set by sequence found the survivor's number among the
+    # kept and moved NO counter, while `_write` removed the entry.
+    # Hiding loss is the same sin as reporting loss that did not
+    # happen, and the positional form it replaced at least got the
+    # total right.
+    sp2 = Spool(tmp / "dupseq", 64 * 1024 * 1024, 100.0)
+    sp2.append(5, b'{"a":1}', T0)            # expires
+    sp2.append(5, b'{"b":1}', T0 + 90)       # same seq, survives
+    sp2.append(6, b'{"c":1}', T0 + 90)
+    before = len(sp2._read())
+    sp2.append(7, b'{"d":1}', T0 + 150)      # forces the sweep
+    after = len(sp2._read())
+    st2 = sp2.stats(T0 + 150)
+    removed = before + 1 - after
+    counted = st2.dropped_age + st2.dropped_size
+    assert removed == 1, f"expected one eviction, {removed} were removed"
+    assert counted == removed, (
+        f"{removed} entry was removed from the spool and {counted} were "
+        f"counted. A duplicated sequence must not let an eviction go "
+        f"unrecorded — an operator reading zero drops has no way to "
+        f"know data was discarded")
+    assert st2.dropped_age == 1, (
+        f"the eviction was an age expiry; reported "
+        f"age={st2.dropped_age} size={st2.dropped_size}")
+
+    print(f"  drop attribution: an expiry behind a kept entry is blamed "
+          f"on the age cap, and an eviction with a duplicated sequence "
+          f"is still counted")
 
 
 def _check_hound_relay_reports_duplicates(tmp: Path) -> None:
@@ -6022,6 +6116,36 @@ def _check_delivered_entries_are_not_counted_as_aged_out(tmp: Path) -> None:
                for lv, m in said), (
         f"a watermark above anything ever minted was accepted without "
         f"a word: {said}")
+    msg = next(m for lv, m in said if "watermark" in m)
+    live = len(cl2.spool.pending(T0))
+    assert f"so {live} spooled batch(es) are re-sent" in msg, (
+        f"the warning must state the number it can actually re-send; "
+        f"{live} are pending and it said: {msg}")
+
+    # The other half of the same sentence: when the clamp re-exposes
+    # entries that are ALL past a cap, nothing is re-sent and the
+    # message must say they are lost. Re-exposing is not re-sending,
+    # and an operator reading "re-sent" of data about to be swept is
+    # as badly served as by the original silent discard.
+    sp3 = Spool(tmp / "allstale", 64 * 1024 * 1024, 100.0)
+    sp3.append(1, b'{"a":1}', T0)
+    sp3.append(2, b'{"b":1}', T0)
+    sp3._acked_through = 10 ** 18
+    said.clear()               # `_G` appends here; reuse the handler
+    lg.addHandler(g)
+    try:
+        # now is far past the age cap, so neither entry is deliverable
+        sp3.reconcile_watermark(2, T0 + 10_000)
+    finally:
+        lg.removeHandler(g)
+    msg2 = next(m for lv, m in said if "watermark" in m)
+    assert "re-sent" not in msg2.replace("can be re-sent", ""), (
+        f"every re-exposed batch is past the age cap and will be "
+        f"swept, but the warning still promised a re-send: {msg2}")
+    assert "lost" in msg2, (
+        f"observations are about to be discarded and the warning does "
+        f"not say so: {msg2}")
+    assert not sp3.pending(T0 + 10_000), "nothing should be deliverable"
     print("  ack watermark: delivered entries never counted as aged "
           "out, survives restart, five corruption modes re-send "
           "rather than discard, and a planted value is clamped and "

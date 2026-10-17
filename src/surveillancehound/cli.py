@@ -688,31 +688,52 @@ def cmd_relay(args: argparse.Namespace) -> int:
     # project's cardinal sin, and this is the command documented to
     # work when things are broken.
     #
-    # `instance_id` is the readable-state signal: the daemon writes
-    # it on first run and never clears it. The daemon's own path is
+    # `state.loaded` is the signal, NOT `instance_id`. The id is the
+    # first field the parser assigns, so a file whose `next_seq` is
+    # garbage left a plausible id beside a defaulted `next_seq = 1`
+    # and walked straight back into the bug above. `loaded` is set
+    # only after every field parses. The daemon's own path is
     # unaffected — there a fresh identity is real.
     #
     # Safe on a readonly Spool either way: `_save_counters` is a
     # no-op there, so the clamp applies to this process's view and
     # nothing is written under a running daemon.
-    if state.instance_id:
-        spool.reconcile_watermark(state.next_seq - 1)
+    if state.loaded:
+        spool.reconcile_watermark(state.next_seq - 1, time.time())
     st = spool.stats(time.time())
     print(f"relay: agent {r.sensor_id!r} -> {r.url}")
-    if state.instance_id:
+    if state.loaded:
         print(f"  instance      {state.instance_id}")
         print(f"  next sequence {state.next_seq}")
         thru = spool.acked_through
         print(f"  delivered thru "
               f"{thru if thru >= 0 else 'none yet'}")
     else:
-        # readonly load mints nothing, so an absent id means the agent
-        # has never run OR its state file is unreadable. Printing a
-        # blank instance and "next sequence 1" as fact would be stating
-        # something this command cannot actually see.
+        # readonly load mints nothing, so an unloaded state means the
+        # agent has never run OR its state file is unreadable. Printing
+        # a blank instance and "next sequence 1" as fact would be
+        # stating something this command cannot actually see.
         print("  instance      unknown — no readable state file at "
               f"{base / 'state.json'}")
         print("  next sequence unknown (the agent mints state on first run)")
+        # With the state file unreadable the clamp is skipped, so an
+        # ALSO-damaged counters file keeps hiding the spool and
+        # `spooled` below can read 0 while the daemon re-sends the lot.
+        # Under-reporting is the right way round to fail here — this
+        # command must not invent a backlog — but it must not be
+        # silent about it either.
+        #
+        # Only when the watermark is IMPOSSIBLE against the file
+        # itself. A watermark that merely hides most of the spool is
+        # the ordinary healthy case, and warning about it would make
+        # the broken-state output cry wolf on every run.
+        high = spool.highest_spooled_seq()
+        if high is not None and spool.acked_through > high:
+            print(f"  warning       counters claim delivery through "
+                  f"{spool.acked_through}, above every sequence in the "
+                  f"spool ({high}). With no readable state file this "
+                  f"command will not act on that, so `spooled` below "
+                  f"may undercount; the daemon will re-send them.")
     if state.last_push_ts:
         print(f"  last push     {_dur(time.time() - state.last_push_ts)} ago")
     else:

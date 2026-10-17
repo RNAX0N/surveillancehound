@@ -248,23 +248,43 @@ docker volume rm agent_hound-state
 
 ### Reading `hound relay` on the agent
 
+Real output, with the `dropped` and `duplicates` lines shown — both are
+printed only when their counters are non-zero, so a healthy agent ends
+at `spooled`:
+
 ```
-  instance      01K8...          this run's identity; part of every row's key
-  next sequence 4312             the next batch number this agent will mint
-  delivered thru 4309            the collector has acknowledged every batch
-                                 at or below this; prints "none yet" before
-                                 the first ack. Entries at or below it are
-                                 dead weight in the spool file and are swept
-                                 on the next compaction — they are NOT a
-                                 backlog, and `spooled` already excludes them.
-  spooled       2 batch(es)      undelivered; this is the real backlog
-  duplicates    1                409s — already held by the collector, not loss
-  dropped       0 / 0 / 0        size / age / rejected — these ARE loss
+relay: agent 'frigate' -> https://88.255.5.1:18443/ingest/v1
+  instance      9f3c1a8b2d4e6f70
+  next sequence 4312
+  delivered thru 4309
+  last push     12s ago
+  spooled       2 batch(es), 7.2 KiB, oldest 24s
+  dropped       0 over size, 3 over age, 0 rejected
+                these are observations that did NOT reach the collector
+  duplicates    1 batch(es) the collector already had (delivered, not lost)
 ```
 
-On a healthy agent `delivered thru` tracks `next sequence - 1`. A gap
-between them with `spooled 0` means batches left the spool without ever
-being acknowledged — check the `dropped` line, which is where they went.
+- **instance** — the agent's identity. Minted **once**, on first run,
+  and kept across restarts. A *changed* instance id means the state
+  volume was wiped; a stable one is normal.
+- **next sequence** — the next batch number this agent will mint.
+- **delivered thru** — the collector has acknowledged every batch at or
+  below this. Prints `none yet` before the first ack. Entries at or
+  below it are dead weight in the spool file, swept at the next
+  compaction; they are **not** a backlog, and `spooled` already
+  excludes them.
+- **spooled** — undelivered batches. This is the real backlog.
+- **dropped** — size / age / rejected. These **are** lost observations.
+- **duplicates** — the collector answered `409`, meaning it already
+  held the batch. Not loss, which is why it is not under `dropped`.
+
+A gap between `delivered thru` and `next sequence - 1` with `spooled 0`
+means batches left the spool unacknowledged. Check `dropped` — but note
+that the counters only move when the **daemon** sweeps the spool. This
+command never mutates the spool (so a diagnostic can never destroy what
+it reports on), so on a *stopped* agent you can see the gap with no
+`dropped` line at all: the entries are still in `spool.jsonl`, already
+past their cap, and will be counted the moment the agent next runs.
 
 ## What the agent does and does not do
 
