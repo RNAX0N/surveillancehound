@@ -30,6 +30,29 @@ anyone with a checkout and no tooling beyond `sha256sum`.
 
 ## Milestones
 
+### `ee2ab22` — relay/agent mode, 31 review rounds (2026-10-17)
+
+Both reviewers APPROVED at `96dbcd3`; this commit closes their
+follow-ups. 8/8 verification suites green. Nothing pushed to `origin`.
+
+```
+ca11aaeeeabc750899d36c258dea475c090b95e1fdd88e9211b324fee25740b8  src/surveillancehound/relay.py
+082cb8f974cfcb93e3763851055f4c3a328e2a9ff9e0693b6dcc4f42a71c4389  src/surveillancehound/ingest.py
+8c1872b4466a52693b0562d75d88b9258ab30f7c8eafc0742fbb0efa9a20586a  src/surveillancehound/validate.py
+08af1cf725dd56003b3e8569f75908530f61e25659c49570cb972eadabd38865  src/surveillancehound/store.py
+c990d34d19fd5c639e2c64cf158b1204a54ac6a56a215434fd72fcb07cdc44b7  src/surveillancehound/cli.py
+b047e6439483370c5cdd55741a87dc3149ebfe004a78443b6f1cc1b5b16739c5  tests/verify_relay.py
+35c72828d1d8fb0b6491a2eb9e42a1313a9969651f783b98a06745d2c90491ff  deploy/agent/README.md
+963924573c5bcebfa2f7ae408e4525aa6947f0f35257650f206b01eaa5ba06b0  hound.toml.example
+```
+
+- commit: `ee2ab22c63e8eecc7bb02769bdc2ab90a5417f63`
+- tree:   `305d664df66e1bc20b2911c6eea955161f9eef7e`
+
+> As with every block here, the hashes are of the tree *before* this
+> file recorded them. `git show --stat ee2ab22` confirms the listed
+> files are unchanged by the commit that adds the block.
+
 ### `0fb1b86` — relay/agent mode complete (2026-10-17)
 
 Multi-sensor relay: agent spools signed observations and ships them
