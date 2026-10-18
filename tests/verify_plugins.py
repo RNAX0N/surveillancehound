@@ -178,6 +178,58 @@ def _check_php_brace_balance() -> None:
         for bad in ("‘", "’", "“", "”"):
             assert bad not in text, f"{f}: contains curly-quote {bad!r}"
     print(f"  PHP structural lint: {len(phps)} file(s)")
+    _check_php_real_parser(phps)
+
+
+def _check_php_real_parser(phps) -> None:
+    """Run a REAL PHP parser over every file, if one can be reached.
+
+    The structural lint above is a balance check, not a parser. It
+    cannot see an undefined constant, a bad heredoc terminator or a
+    stray `=>` — and `hound.inc` renders the whole config file from a
+    heredoc, so a parse error there ships a plugin that fatals on
+    save. The project has carried "PHP changes still need a real
+    `php -l` before shipping" as an unclosable manual step; it is
+    closable, because `php -l` can come from a container when the
+    host has no php-cli.
+
+    SKIPPED LOUDLY when neither is available. A check that silently
+    passes when it did not run is worse than no check: it converts an
+    open gate into a green tick.
+    """
+    import shutil
+    import subprocess
+
+    php = shutil.which("php")
+    if php:
+        runner = lambda f: subprocess.run(            # noqa: E731
+            [php, "-l", str(f)], capture_output=True, text=True, timeout=60)
+        how = "host php-cli"
+    elif shutil.which("docker"):
+        runner = lambda f: subprocess.run(            # noqa: E731
+            ["docker", "run", "--rm", "--network=none",
+             "-v", f"{f.parent}:/src:ro", "php:8.3-cli",
+             "php", "-l", f"/src/{f.name}"],
+            capture_output=True, text=True, timeout=300)
+        how = "php:8.3-cli container"
+    else:
+        print("  PHP real parser: SKIPPED — no php-cli and no docker. "
+              "This gate is OPEN; run it before shipping a PHP change.")
+        return
+
+    for f in phps:
+        try:
+            r = runner(f)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            print(f"  PHP real parser: SKIPPED — {type(exc).__name__} "
+                  f"({exc}). This gate is OPEN.")
+            return
+        assert r.returncode == 0, (
+            f"{f}: php -l reported a parse error. The structural lint "
+            f"cannot see these, and a renderer that will not parse "
+            f"fatals the firewall's config page on save:\n"
+            f"{r.stdout}{r.stderr}")
+    print(f"  PHP real parser: {len(phps)} file(s) parse clean ({how})")
 
 
 # ---------------------------------------------------------------------------
