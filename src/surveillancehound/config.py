@@ -63,6 +63,7 @@ Schema (see hound.toml.example):
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
 import tomllib
 from dataclasses import dataclass, field
@@ -448,6 +449,37 @@ def unknown_sections(data: dict) -> list[str]:
     """Top-level keys the loader will ignore. Typos, or settings for a
     version that is not this one. Either way the operator should hear it."""
     return sorted(k for k in data if k not in KNOWN_SECTIONS)
+
+
+def unknown_notify_keys(data: dict) -> list[tuple[int, str]]:
+    """Keys inside a `[[notify]]` block that the loader will ignore.
+
+    Returns `(block index, key)` pairs, 1-based for the operator.
+
+    The same argument as `unknown_sections`, one level down, and with
+    sharper teeth: a notify block decides WHETHER YOU ARE TOLD. Writing
+    `min_severity = "critical"` — the key `[snapshot]` really does use —
+    leaves `level` at its "low" default, so the channel silently carries
+    everything; and the reverse mistake leaves a channel quieter than
+    the operator believes. Either way `config-check` said the config was
+    fine. Found by making exactly that mistake while configuring a real
+    sensor.
+
+    DERIVED from the dataclass rather than hand-listed, for the reason
+    `validate.ALERT_KINDS` is derived from `alerts.py`: a copied list
+    drifts the moment someone adds a field, and a stale allow-list here
+    would start warning about perfectly good config.
+    """
+    valid = {f.name for f in dataclasses.fields(NotifyChannelCfg)}
+    raw = data.get("notify")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for i, block in enumerate(raw, 1):
+        if not isinstance(block, dict):
+            continue
+        out.extend((i, k) for k in sorted(block) if k not in valid)
+    return out
 
 
 def _addresses(section: dict, key: str) -> list[str]:

@@ -997,13 +997,24 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     # and the settings simply never take effect.
     try:
         with open(args.config, "rb") as fh:
-            unknown = config.unknown_sections(tomllib.load(fh))
+            raw_toml = tomllib.load(fh)
+            unknown = config.unknown_sections(raw_toml)
+            bad_notify_keys = config.unknown_notify_keys(raw_toml)
     except (OSError, tomllib.TOMLDecodeError):
         unknown = []
+        bad_notify_keys = []
     if unknown:
         print(f"  WARNING: ignored unknown section(s): {', '.join(unknown)}")
         print("    These are not read by this version. Anything you set in "
               "them has no effect.")
+    for idx, key in bad_notify_keys:
+        print(f"  WARNING: [[notify]] block {idx}: '{key}' is not a notify "
+              f"setting and is being IGNORED.")
+        if key in ("min_severity", "severity", "min_level"):
+            print("           Did you mean `level`? That is the key that "
+                  "decides what this channel carries; left unset it")
+            print("           defaults to 'low', so the channel is NOT "
+                  "filtered the way you think.")
 
     print(f"  capture: interface={cfg.capture.interface!r} "
           f"pcap_file={cfg.capture.pcap_file!r} bpf={cfg.capture.bpf!r}")

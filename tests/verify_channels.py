@@ -313,12 +313,56 @@ def _check_dispatcher_audit() -> None:
             store.close()
 
 
+def _check_unknown_notify_keys() -> None:
+    """A key a notify block does not read must be REPORTED, not ignored.
+
+    `[snapshot]` uses `min_severity`; `[[notify]]` uses `level`. Writing
+    the first in a notify block is the natural mistake, and it used to
+    be accepted silently — leaving `level` at its "low" default while
+    the operator believed they had set a threshold. A channel that
+    carries more or less than you think, with `config-check` calling the
+    config fine, is the exact failure `unknown_sections` exists to
+    prevent one level up. Made this mistake on a real sensor; hence the
+    check and hence this test.
+    """
+    from surveillancehound.config import unknown_notify_keys
+
+    found = unknown_notify_keys({
+        "notify": [
+            {"type": "logfile", "path": "/tmp/x", "min_severity": "critical"},
+            {"type": "stdout", "level": "high"},          # clean
+            {"type": "stdout", "nonsense": 1, "typo": 2},
+        ]
+    })
+    assert found == [(1, "min_severity"), (3, "nonsense"), (3, "typo")], found
+
+    # Every real field must pass, and the set is DERIVED from the
+    # dataclass so adding a field cannot turn valid config into a
+    # warning. Assert that derivation really happened.
+    import dataclasses
+    from surveillancehound.config import NotifyChannelCfg
+    every = {f.name: "x" for f in dataclasses.fields(NotifyChannelCfg)}
+    assert unknown_notify_keys({"notify": [every]}) == [], (
+        "a declared NotifyChannelCfg field was reported as unknown; the "
+        "valid set is not derived from the dataclass")
+
+    # Shapes that must not raise: no notify at all, and a malformed block.
+    assert unknown_notify_keys({}) == []
+    assert unknown_notify_keys({"notify": "not-a-list"}) == []
+    assert unknown_notify_keys({"notify": [None, 5, "x"]}) == []
+
+    print(f"  unknown notify keys: reported with the block number, "
+          f"derived from {len(every)} dataclass fields, malformed "
+          f"blocks do not raise")
+
+
 def main() -> int:
     _check_syslog_udp()
     _check_syslog_tcp()
     _check_email()
     _check_ftp_error_path()
     _check_build_channel_validation()
+    _check_unknown_notify_keys()
     _check_dispatcher_audit()
     print("\nCHANNELS VERIFICATION PASSED")
     return 0
