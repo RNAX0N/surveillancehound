@@ -50,7 +50,15 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 PrivateTmp=yes
-PrivateDevices=no                 # tcpdump needs /dev/bpf* on BSD; harmless on Linux
+# tcpdump needs /dev/bpf* on BSD; harmless on Linux. On its own line:
+# systemd has NO trailing comments, so `PrivateDevices=no  # ...` failed
+# to parse and was IGNORED, logging
+#   Failed to parse PrivateDevices=no ... ignoring: Invalid argument
+# on every single start. Harmless here only because `no` is already the
+# default — written as `yes` it would have silently not hardened
+# anything, which is the same class of defect as a config key that does
+# nothing. Found on a real Debian 13 host.
+PrivateDevices=no
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

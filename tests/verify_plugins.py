@@ -181,6 +181,41 @@ def _check_php_brace_balance() -> None:
     _check_php_real_parser(phps)
 
 
+def _check_systemd_unit_parses() -> None:
+    """No systemd directive may carry a trailing `#` comment.
+
+    systemd does NOT support end-of-line comments. `PrivateDevices=no
+    # tcpdump needs /dev/bpf* on BSD` therefore failed to parse and was
+    IGNORED, logging "Failed to parse PrivateDevices=no ... Invalid
+    argument" on every start of the shipped unit. It was harmless only
+    by luck, `no` being the default already — written as `yes` it would
+    have silently hardened nothing.
+
+    Same class as `unknown_sections`: a setting that looks set and does
+    nothing. Caught on a real Debian 13 host, not here.
+    """
+    import configparser
+
+    units = list(DEPLOY.rglob("*.service"))
+    assert units, "no systemd units found under deploy/"
+    for u in units:
+        for n, line in enumerate(u.read_text().splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+            if "=" in line and "#" in line.split("=", 1)[1]:
+                raise AssertionError(
+                    f"{u}:{n}: systemd has no trailing comments, so this "
+                    f"directive will be IGNORED at runtime — move the "
+                    f"comment to its own line:\n    {line}")
+        # And it must parse as INI at all, which is what systemd expects.
+        cp = configparser.ConfigParser(strict=False)
+        cp.read_string(u.read_text())
+        assert "Service" in cp, f"{u}: no [Service] section"
+        assert cp["Service"].get("ExecStart"), f"{u}: no ExecStart"
+    print(f"  systemd units: {len(units)} parse clean, no trailing comments")
+
+
 def _check_php_real_parser(phps) -> None:
     """Run a REAL PHP parser over every file, if one can be reached.
 
@@ -1136,6 +1171,7 @@ def main() -> int:
     _check_xml_wellformed()
     _check_sh_syntax()
     _check_php_brace_balance()
+    _check_systemd_unit_parses()
     _check_opnsense_layout()
     _check_opnsense_menu_xml()
     _check_opnsense_form_ids()
