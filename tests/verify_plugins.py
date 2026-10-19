@@ -224,6 +224,18 @@ def _check_php_real_parser(phps) -> None:
             print(f"  PHP real parser: SKIPPED — {type(exc).__name__} "
                   f"({exc}). This gate is OPEN.")
             return
+        # Distinguish "php found a problem" from "php never ran".
+        # A non-zero exit also covers an image that cannot be pulled,
+        # a dead docker daemon and a denied socket — on a host with no
+        # HTTPS egress the pull fails and this reported a PARSE ERROR
+        # in a file that parses fine. Observed on the NVR, which has
+        # docker but cannot reach the registry.
+        out = (r.stdout or "") + (r.stderr or "")
+        if r.returncode != 0 and "syntax error" not in out.lower():
+            print(f"  PHP real parser: SKIPPED — the parser could not "
+                  f"run ({how}): {out.strip().splitlines()[-1][:90] if out.strip() else 'no output'}. "
+                  f"This gate is OPEN.")
+            return
         assert r.returncode == 0, (
             f"{f}: php -l reported a parse error. The structural lint "
             f"cannot see these, and a renderer that will not parse "

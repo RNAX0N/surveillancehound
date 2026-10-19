@@ -3981,11 +3981,39 @@ def _check_listener_limits(tmp: Path) -> None:
                 bad, server_hostname="x")
             try:
                 bw.sendall(b"GARBAGE LINE WITH TOO MANY PARTS\r\n\r\n")
-                first = bw.recv(200).split(b"\r\n")[0]
-                assert first.startswith(b"HTTP/"), (
-                    f"a malformed request line got no status line "
-                    f"({first!r}); an exception was swallowed and the "
-                    f"connection closed silently"
+                raw = bw.recv(200)
+                # The CLIENT MUST GET SOMETHING. That is the whole
+                # point: the AttributeError this guards against was
+                # swallowed by handle_error and the peer saw a silent
+                # close with no reply at all.
+                #
+                # It must NOT require a status line, because the
+                # stdlib's answer to a bad request line changed:
+                #
+                #   3.14+  -> "HTTP/1.0 400 Bad request version (...)"
+                #   <=3.13 -> the HTML body, bare, no status, no
+                #             headers
+                #
+                # `parse_request` sets `request_version` to
+                # `default_request_version` ("HTTP/0.9") before it
+                # validates the line, and on 3.13 and earlier
+                # `send_response_only`/`end_headers` suppress the
+                # status line and headers for HTTP/0.9 — correct
+                # HTTP/0.9 behaviour, body only. Asserting the 3.14
+                # shape made this suite FAIL on the Python the project
+                # actually deploys to (Debian 13 ships 3.13, and
+                # `pyproject.toml` claims 3.11+). Verified against
+                # plain `BaseHTTPRequestHandler` with no project code
+                # involved, on 3.13.5 and 3.14.7.
+                assert raw, (
+                    "a malformed request line got NO reply at all; an "
+                    "exception was swallowed and the connection closed "
+                    "silently"
+                )
+                assert (raw.startswith(b"HTTP/")
+                        or b"Error response" in raw), (
+                    f"a malformed request line got neither a status "
+                    f"line nor an error body ({raw[:80]!r})"
                 )
             finally:
                 try:
