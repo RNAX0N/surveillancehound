@@ -33,6 +33,28 @@ capture to the camera segment is far cheaper than any optimisation
 inside the pipeline.
 
 Reports CPU time (time.process_time), not wall clock.
+
+CALIBRATION AGAINST A REAL DEPLOYMENT. This benchmark measures the
+PYTHON per-packet path only. It excludes tcpdump (a separate process
+doing the capture, the BPF filter and the pipe write), the SQLite
+writes, flow eviction, the uptime tick and the relay client's TLS. The
+full-system cost is therefore several times what the steady-state
+figure below suggests, and the gap is not small:
+
+    measured here, per-packet path, i7-14700K .... 3.2-7.7 us/packet
+    measured on the real NVR, WHOLE agent + tcpdump,
+    Threadripper 2950X, 5,736 packets/sec from 12
+    cameras on 802.1Q VLANs ...................... ~27 us/packet
+                                                   9.47 CPU-s / 60.4 s
+                                                   = 15.7% of one core
+                                                   = 0.49% of 32 threads
+                                                   29 MB peak RSS
+
+Treat the numbers below as a FLOOR on the per-packet path, not as a
+prediction of what the daemon costs. For the real figure, run the
+daemon itself for a minute and divide:
+
+    /usr/bin/time -v timeout 60 hound run /etc/hound/hound.toml
 """
 from __future__ import annotations
 
