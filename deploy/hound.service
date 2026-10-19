@@ -60,6 +60,22 @@ SystemCallArchitectures=native
 # Allow network syscalls (tcpdump needs them); block raw filesystem mounts etc.
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @mount @debug @cpu-emulation @obsolete
+# Re-allow exactly the privilege-drop family, which the line above denies
+# as part of @privileged.
+#
+# Debian's tcpdump is built --with-user=tcpdump and drops privileges to
+# that account on startup. Under the deny line those setuid/setgid calls
+# are killed by seccomp with SIGSYS, which produces NO stderr at all —
+# so the daemon reported only "tcpdump did not produce a valid pcap
+# stream (leading bytes b'')" and the service restart-looped. Verified on
+# a real Debian 13 NVR: with the deny line alone tcpdump exits 255 and
+# writes nothing; with this line it captures normally.
+#
+# Not a hole worth worrying about: the unit already runs as a
+# DynamicUser with only CAP_NET_RAW and CAP_NET_ADMIN, so there is no
+# privileged uid for these calls to reach. tcpdump is merely dropping to
+# an even less privileged account than the one it started in.
+SystemCallFilter=setuid setgid setgroups setresuid setresgid
 
 # Resource bounds — defensive, not aggressive
 MemoryMax=512M

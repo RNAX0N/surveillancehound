@@ -109,8 +109,10 @@ install -d -m 0755 "$LOG_DIR"
 ok "state: $STATE_DIR   logs: $LOG_DIR"
 
 # --- 5. unprivileged capture ------------------------------------------
-# The unit grants the SERVICE CAP_NET_RAW, but tcpdump is a separate
-# process and Linux file capabilities are what let it keep them.
+# For running `hound run` BY HAND as a non-root user. The systemd unit
+# does not need this — it grants CAP_NET_RAW ambiently, and verified on
+# Debian 13 the file caps neither help nor hinder it. Harmless to have
+# both, and without it a manual run as yourself cannot capture.
 if command -v setcap >/dev/null 2>&1; then
     setcap cap_net_raw,cap_net_admin=eip "$TCPDUMP" \
         && ok "setcap on $TCPDUMP (capture without root)"
