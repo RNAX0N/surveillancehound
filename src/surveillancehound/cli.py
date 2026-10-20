@@ -138,6 +138,30 @@ def cmd_flows(args: argparse.Namespace) -> int:
 
 def cmd_devices(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
+    if getattr(args, "forget", None):
+        # Writable: this one mutates. Everything else here is read-only.
+        store = HoundStore(path=cfg.store.path)
+        try:
+            ip = args.forget
+            live = {*cfg.network.camera_ips, *cfg.network.nvr_ips}
+            if ip in live:
+                print(f"{ip} is still listed in the config as a camera or "
+                      f"NVR — remove it there first, or the next packet "
+                      f"from it puts the row straight back.")
+                return 1
+            gone = store.forget_device(ip)
+            total = sum(gone.values())
+            if not total:
+                print(f"nothing stored for {ip}")
+                return 0
+            print(f"forgot {ip}: " + ", ".join(
+                f"{n} {t} row(s)" for t, n in gone.items() if n))
+            print("  The daemon rebuilds a device row the moment it sees "
+                  "that address again; it only comes back as a camera if "
+                  "the config or the port heuristics still say so.")
+        finally:
+            store.close()
+        return 0
     store = _ro_store(cfg)
     try:
         rows = store.list_devices()
@@ -1157,6 +1181,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_d = sub.add_parser("devices", help="show observed devices")
     p_d.add_argument("config")
+    p_d.add_argument("--forget", metavar="IP",
+                     help="delete a device and its outage history — for an "
+                          "address the config no longer claims. Stored "
+                          "roles never downgrade, so removing an IP from "
+                          "the camera list does not on its own stop it "
+                          "being reported as a camera that is down.")
     p_d.set_defaults(func=cmd_devices)
 
     p_u = sub.add_parser(

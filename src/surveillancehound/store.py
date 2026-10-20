@@ -738,6 +738,40 @@ class HoundStore:
                 (ip, role, fs, ts, packets, bytes_),
             )
 
+    def forget_device(self, ip: str) -> dict[str, int]:
+        """Delete a device and the liveness history attached to it.
+
+        For an address the configuration no longer claims. Removing an
+        IP from `camera_ips` does NOT currently change anything an
+        operator can see, for two compounding reasons:
+
+        * `uptime_report` lists `devices WHERE role IN ('camera','nvr')`
+          — the stored role, never the live config.
+        * `upsert_device` ratchets the role: `other` may become
+          something, but nothing ever becomes `other` again. A device
+          classified once stays classified forever.
+
+        The ratchet is deliberate — a camera that goes quiet must not
+        silently lose its monitoring — but it also means an EXPLICIT
+        operator decision is silently ignored, and the row cannot be
+        removed by any other means: `prune()` only deletes CLOSED
+        outages, and a camera nothing will ever observe again keeps its
+        outage open forever. Those rows are therefore permanent, and
+        read as real cameras that are really down.
+
+        Returns the row counts removed, so the caller can say what it
+        did rather than claiming success blindly.
+        """
+        out: dict[str, int] = {}
+        with self._lock, self._conn:
+            for table, col in (("outages", "camera_ip"),
+                               ("devices", "ip")):
+                cur = self._conn.execute(
+                    f"DELETE FROM {table} WHERE {col} = ?", (ip,))
+                out[table] = cur.rowcount
+        return out
+
+
     def get_device(self, ip: str) -> DeviceRow | None:
         with self._lock:
             r = self._conn.execute(

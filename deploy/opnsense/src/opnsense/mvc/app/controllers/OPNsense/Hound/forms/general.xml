@@ -64,7 +64,14 @@
         <type>select_multiple</type>
         <style>tokenize</style>
         <allownew>true</allownew>
-        <help>One IP per entry. Type a value and press enter to add it.</help>
+        <help>
+              APPLIES TO WHICHEVER BOX CAN SEE THE CAMERAS. If an agent elsewhere
+              watches them and relays here, LEAVE THIS EMPTY: this box has no path
+              to those addresses, and listing them makes it report cameras it can
+              never see as permanently 'never seen'. The agent's cameras appear on
+              the dashboard by themselves, tagged with its sensor id. One IP per
+              entry. Type a value and press enter to add it.
+              </help>
     </field>
     <field>
         <id>hound.network.camera_subnets</id>
@@ -72,9 +79,12 @@
         <type>select_multiple</type>
         <style>tokenize</style>
         <allownew>true</allownew>
-        <help>One CIDR per entry. Anything in here is treated as a camera
-              unless also listed as an NVR.
-              Type a value and press enter to add it.</help>
+        <help>
+              Same rule as Camera IPs: only on the box whose capture interface
+              actually carries the camera traffic. One CIDR per entry. Anything in
+              here is treated as a camera unless also listed as an NVR. Type a
+              value and press enter to add it.
+              </help>
     </field>
     <field>
         <id>hound.network.nvr_ips</id>
@@ -82,10 +92,12 @@
         <type>select_multiple</type>
         <style>tokenize</style>
         <allownew>true</allownew>
-        <help>The recorder(s) the cameras stream to. A device talking to
-              three or more cameras is detected as an NVR anyway; naming
-              it here is for when you want it certain.
-              Type a value and press enter to add it.</help>
+        <help>
+              The recorder the cameras stream to, as seen from THIS box. The
+              recorder(s) the cameras stream to. A device talking to three or more
+              cameras is detected as an NVR anyway; naming it here is for when you
+              want it certain. Type a value and press enter to add it.
+              </help>
     </field>
     <field>
         <id>hound.network.lan_subnets</id>
@@ -93,12 +105,16 @@
         <type>select_multiple</type>
         <style>tokenize</style>
         <allownew>true</allownew>
-        <help>Which prefixes count as "this network". Leave empty to treat
-              RFC-1918 space as local. Add a tunnel or carrier-assigned
-              range here if it looks public but is genuinely yours -
-              otherwise traffic to it is scored as off-network telemetry,
-              and a relay to a collector on it is refused.
-              Type a value and press enter to add it.</help>
+        <help>
+              Applies to every role, and matters most where the addressing is
+              unusual: if your own network uses public space, list it here or your
+              own traffic is scored as off-network telemetry. Which prefixes count
+              as "this network". Leave empty to treat RFC-1918 space as local. Add
+              a tunnel or carrier-assigned range here if it looks public but is
+              genuinely yours - otherwise traffic to it is scored as off-network
+              telemetry, and a relay to a collector on it is refused. Type a value
+              and press enter to add it.
+              </help>
     </field>
     <field>
         <id>hound.network.manufacturer_allowlist</id>
@@ -106,9 +122,11 @@
         <type>select_multiple</type>
         <style>tokenize</style>
         <allownew>true</allownew>
-        <help>One CIDR per entry: the vendor cloud your cameras legitimately
-              talk to.
-              Type a value and press enter to add it.</help>
+        <help>
+              Applies to the box that sees the cameras. One CIDR per entry: the
+              vendor cloud your cameras legitimately talk to. Type a value and
+              press enter to add it.
+              </help>
     </field>
 
     <field>
@@ -258,80 +276,112 @@
         <id>hound.relay.listen_host</id>
         <label>Listen address (collector)</label>
         <type>text</type>
-        <help>The address agents connect to. Name a specific interface
-              address; 0.0.0.0 is refused, because a relay listener should
-              not be reachable from every interface by accident.</help>
+        <help>
+              COLLECTOR ONLY - ignored in Agent and Off modes. The address agents
+              connect to. Name a specific interface address; 0.0.0.0 is refused,
+              because a relay listener should not be reachable from every
+              interface by accident.
+              </help>
     </field>
     <field>
         <id>hound.relay.listen_port</id>
         <label>Listen port (collector)</label>
         <type>text</type>
-        <help>Default 18443. Remember to add a firewall rule permitting your
-              agents to reach it.</help>
+        <help>
+              COLLECTOR ONLY - ignored in Agent and Off modes. Default 18443.
+              Remember to add a firewall rule permitting your agents to reach it.
+              </help>
     </field>
     <field>
         <id>hound.relay.cert_file</id>
         <label>Ingest TLS cert (collector)</label>
         <type>text</type>
-        <help>Absolute path to the PEM certificate the listener presents.
-              Agents pin its fingerprint; run "hound relay" on this box to
-              print the fingerprint to paste into each agent.</help>
+        <help>
+              COLLECTOR ONLY - ignored in Agent and Off modes. Absolute path to
+              the PEM certificate the listener presents. Agents pin its
+              fingerprint; run "hound relay" on this box to print the fingerprint
+              to paste into each agent.
+              </help>
     </field>
     <field>
         <id>hound.relay.key_file</id>
         <label>Ingest TLS key (collector)</label>
         <type>text</type>
-        <help>Absolute path to the matching PEM private key.</help>
+        <help>
+              COLLECTOR ONLY - ignored in Agent and Off modes. Absolute path to
+              the matching PEM private key.
+              </help>
     </field>
     <field>
         <id>hound.relay.sensors</id>
         <label>Authorised sensors (collector)</label>
         <type>textbox</type>
-        <help>One per line, as "id = shared-secret". Each agent signs every
-              batch with its secret, and an id with no entry here is
-              rejected. Give every agent its own id and its own secret.</help>
+        <help>
+              COLLECTOR ONLY - ignored in Agent and Off modes. One per line, as
+              "id = shared-secret". Each agent signs every batch with its secret,
+              and an id with no entry here is rejected. Give every agent its own
+              id and its own secret.
+              </help>
     </field>
     <field>
         <id>hound.relay.remote_retention_days</id>
         <label>Relayed history (days)</label>
         <type>text</type>
-        <help>How long to keep relayed rows. 0 keeps them forever.</help>
+        <help>
+              COLLECTOR ONLY - applies to relayed rows, not this box's own. How
+              long to keep relayed rows. 0 keeps them forever.
+              </help>
     </field>
     <field>
         <id>hound.relay.max_rows_per_sensor</id>
         <label>Row cap per sensor</label>
         <type>text</type>
-        <help>Per table; the oldest rows are trimmed past this. An agent
-              holding a valid key is still a host you do not control, so its
-              data is bounded by count as well as by age. 0 disables.</help>
+        <help>
+              COLLECTOR ONLY. Per table; the oldest rows are trimmed past this. An
+              agent holding a valid key is still a host you do not control, so its
+              data is bounded by count as well as by age. 0 disables.
+              </help>
     </field>
     <field>
         <id>hound.relay.min_free_disk_mb</id>
         <label>Minimum free disk (MB)</label>
         <type>text</type>
-        <help>Refuse relayed data below this much free space, so a remote
-              sensor can never fill the disk local capture depends on.
-              Agents spool and resend what is refused. 0 disables.</help>
+        <help>
+              COLLECTOR ONLY. Refuse relayed data below this much free space, so a
+              remote sensor can never fill the disk local capture depends on.
+              Agents spool and resend what is refused. 0 disables.
+              </help>
     </field>
     <field>
         <id>hound.relay.sensor_id</id>
         <label>This sensor's id (agent)</label>
         <type>text</type>
-        <help>Unique name for this box, as the collector will show it.</help>
+        <help>
+              AGENT ONLY - ignored in Collector and Off modes, so a value left
+              here on a collector does nothing. Unique name for this box, as the
+              collector will show it.
+              </help>
     </field>
     <field>
         <id>hound.relay.url</id>
         <label>Collector URL (agent)</label>
         <type>text</type>
-        <help>For example https://10.0.0.1:18443/ingest/v1 - https with an
-              IP literal. A destination outside private space is refused
-              unless it is covered by LAN subnets above.</help>
+        <help>
+              AGENT ONLY - ignored in Collector and Off modes. For example
+              https://10.0.0.1:18443/ingest/v1 - https with an IP literal. A
+              destination outside private space is refused unless it is covered by
+              LAN subnets above.
+              </help>
     </field>
     <field>
         <id>hound.relay.key</id>
         <label>Shared secret (agent)</label>
         <type>text</type>
-        <help>Must match this sensor's entry in the collector's list.</help>
+        <help>
+              AGENT ONLY - ignored in Collector and Off modes. On the collector
+              the same secret goes in Authorised sensors instead. Must match this
+              sensor's entry in the collector's list.
+              </help>
     </field>
     <field>
         <id>hound.relay.tls_fingerprint</id>
@@ -339,10 +389,13 @@
         <type>select_multiple</type>
         <style>tokenize</style>
         <allownew>true</allownew>
-        <help>The collector's certificate is self-signed, so there is no CA
-              to check it against and this pin is the trust decision. Run
-              "hound relay" on the collector to print it. Verify it out of
-              band the first time.
-              Type a value and press enter to add it.</help>
+        <help>
+              AGENT ONLY - ignored in Collector and Off modes. This is the pin for
+              the collector THIS AGENT talks to; a collector does not pin itself.
+              The collector's certificate is self-signed, so there is no CA to
+              check it against and this pin is the trust decision. Run "hound
+              relay" on the collector to print it. Verify it out of band the first
+              time. Type a value and press enter to add it.
+              </help>
     </field>
 </form>

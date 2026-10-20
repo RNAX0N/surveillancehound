@@ -515,6 +515,58 @@ def _check_relay_agent_round_trip() -> None:
           "drops malformed and duplicate entries")
 
 
+def _check_relay_fields_declare_their_role() -> None:
+    """Every [relay] field must say which role it belongs to.
+
+    The form shows agent and collector settings together, with only a
+    "(agent)" / "(collector)" suffix on the LABEL to tell them apart.
+    An operator configuring a collector filled in the agent's
+    fingerprint field, which `render_config.py` silently ignores in
+    collector mode — no error, no rendered line, nothing to notice.
+    The same page also let a collector keep camera IPs it has no
+    physical path to, which is what produced a wall of permanently
+    "never seen" cameras.
+
+    Nothing here is a behaviour change; it is the help text carrying
+    the one fact that decides whether a field does anything at all.
+    """
+    import re as _re
+
+    form = (PLUGIN / "controllers/OPNsense/Hound/forms/general.xml").read_text()
+    # Which keys render_config actually reads in each branch.
+    agent_only = {"sensor_id", "url", "key", "tls_fingerprint"}
+    collector_only = {"listen_host", "listen_port", "cert_file", "key_file",
+                      "sensors", "remote_retention_days",
+                      "max_rows_per_sensor", "min_free_disk_mb"}
+
+    missing = []
+    for block in _re.findall(r"<field>(.*?)</field>", form, _re.S):
+        fid = (_re.search(r"<id>(.*?)</id>", block) or [None, ""])[1]
+        if not fid.startswith("hound.relay."):
+            continue
+        leaf = fid.split(".")[-1]
+        helps = ((_re.search(r"<help>(.*?)</help>", block, _re.S)
+                  or [None, ""])[1]).upper()
+        if leaf in agent_only and "AGENT ONLY" not in helps:
+            missing.append(f"{fid} (agent-only, unmarked)")
+        if leaf in collector_only and "COLLECTOR ONLY" not in helps:
+            missing.append(f"{fid} (collector-only, unmarked)")
+    assert not missing, (
+        "relay fields that do nothing in the other mode must say so: "
+        + ", ".join(missing))
+
+    # And the field that caused the wall of phantom cameras.
+    cam = _re.search(
+        r"<id>hound\.network\.camera_ips</id>.*?<help>(.*?)</help>",
+        form, _re.S).group(1).upper()
+    assert "LEAVE THIS EMPTY" in cam, (
+        "Camera IPs must tell a collector operator to leave it empty "
+        "when an agent owns the cameras; otherwise the box reports "
+        "cameras it has no route to as permanently never seen")
+    print("  relay fields: agent-only and collector-only settings are "
+          "labelled as such in their help")
+
+
 def _check_csv_masks_accept_lists() -> None:
     """A CSVListField holds "a,b,c" — its Mask must accept that.
 
@@ -719,6 +771,7 @@ def main() -> int:
     _check_interface_is_resolved()
     _check_ui_endpoints_exist()
     _check_csv_masks_accept_lists()
+    _check_relay_fields_declare_their_role()
     _check_tokenize_fields_say_how_to_use_them()
     _check_volt_renders_relayed_data()
     _check_enable_is_wired()
