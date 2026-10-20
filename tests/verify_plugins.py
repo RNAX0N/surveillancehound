@@ -181,6 +181,40 @@ def _check_php_brace_balance() -> None:
     _check_php_real_parser(phps)
 
 
+def _check_dashboard_reports_its_own_failure() -> None:
+    """A failed dashboard load must not keep saying "Loading...".
+
+    The monitor banner ships reading "Loading..." and was replaced only
+    on the SUCCESS path, so a backend that never answered left the one
+    panel whose job is to say whether the monitor is alive reading
+    "Loading..." and "-" indefinitely, indistinguishable from a request
+    still in flight. Seen on a real firewall.
+
+    Both failure branches must now put it into an explicit unknown
+    state. Checked structurally, there being no JS runtime here.
+    """
+    volt = next(OPNSENSE.rglob("index.volt"))
+    text = volt.read_text()
+
+    assert "function dashFailed(" in text, (
+        f"{volt}: no dashFailed() - the failure paths have nothing to "
+        f"put the monitor banner into a known state with")
+
+    # Defined once, plus one call per failure branch. Both branches that
+    # surface an error must also clear the banner.
+    calls = text.count("dashFailed(")
+    assert calls >= 3, (
+        f"{volt}: dashFailed is defined but called only {calls - 1} "
+        f"time(s); every path that surfaces an error must also clear "
+        f"the 'Loading' banner")
+
+    # The error div and the banner are separate elements; showing one
+    # while leaving the other stale is exactly the bug.
+    assert "#hound-monitor" in text and "#hound-dash-error" in text, (
+        f"{volt}: expected both the monitor banner and the error div")
+    print("  dashboard: both failure paths clear the 'Loading' banner")
+
+
 def _check_systemd_unit_parses() -> None:
     """No systemd directive may carry a trailing `#` comment.
 
@@ -1172,6 +1206,7 @@ def main() -> int:
     _check_sh_syntax()
     _check_php_brace_balance()
     _check_systemd_unit_parses()
+    _check_dashboard_reports_its_own_failure()
     _check_opnsense_layout()
     _check_opnsense_menu_xml()
     _check_opnsense_form_ids()

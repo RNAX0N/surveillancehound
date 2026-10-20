@@ -118,6 +118,20 @@ $(document).ready(function() {
                esc(String(state).replace('_', ' ')) + '</span>';
     }
 
+    /* Put every panel into an explicit unknown state.
+     *
+     * The monitor banner starts as "Loading…" and was only ever replaced
+     * on the SUCCESS path, so a backend that never answered left the
+     * dashboard saying "Loading…" and "—" indefinitely — indistinguishable
+     * from a request still in flight, on the one panel whose job is to say
+     * whether the monitor is alive. A surface that cannot tell you it
+     * failed is the same defect as one that reports a figure it did not
+     * observe. */
+    function dashFailed(text) {
+        $("#hound-monitor").attr('class', 'alert alert-warning').text(text);
+        $("#stat-cameras,#stat-nvrs,#stat-devices,#stat-alerts").text('?');
+    }
+
     function loadDashboard() {
         $("#hound-dash-error").hide();
         ajaxGet("/api/hound/dashboard/data", {}, function (d, status) {
@@ -126,6 +140,7 @@ $(document).ready(function() {
                     ? d.message
                     : "{{ lang._('Could not reach the hound backend.') }}";
                 $("#hound-dash-error").text(msg).show();
+                dashFailed("{{ lang._('Monitor state unknown — the backend did not answer.') }}");
                 return;
             }
 
@@ -266,6 +281,7 @@ $(document).ready(function() {
             $("#hound-dash-error")
                 .text("{{ lang._('Request to the hound backend failed.') }}")
                 .show();
+            dashFailed("{{ lang._('Monitor state unknown — the request failed.') }}");
         });
     }
 
