@@ -1303,7 +1303,14 @@ class RelayClient:
     processing for ten seconds out of every tick.
     """
 
-    def __init__(self, cfg, store, now=time.time):
+    def __init__(self, cfg, store, now=time.time, stall_seconds=120.0):
+        # `stall_seconds` is the AGENT'S OWN capture-stall threshold, so
+        # the health it reports to the collector agrees with the health
+        # it reports locally. It was hardcoded 120.0 in `_monitor`, which
+        # silently disagreed with `[uptime] capture_stall_seconds`: raise
+        # that to 600 and the collector was still told "blind" at 120,
+        # rendering a stall banner for a sensor that was fine.
+        self.stall_seconds = float(stall_seconds) or 120.0
         self.cfg = cfg
         self.store = store
         self.now = now
@@ -1528,8 +1535,14 @@ class RelayClient:
         last_packet, updated = self.store.heartbeat()
         now = self.now()
         return {
-            "alive": (now - updated) < 30.0 if updated else False,
-            "blind": bool(last_packet and (now - last_packet) > 120.0),
+            # The daemon rewrites the heartbeat every tick (_TICK_S = 5s).
+            # Allow several missed ticks, and scale with the push cadence
+            # so an agent on a slow batch interval is not called dead
+            # between two healthy pushes.
+            "alive": (now - updated) < max(30.0, 4.0 * self.cfg.batch_seconds)
+            if updated else False,
+            "blind": bool(last_packet
+                          and (now - last_packet) > self.stall_seconds),
             "last_activity_ts": last_packet,
         }
 

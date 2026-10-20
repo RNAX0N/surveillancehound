@@ -255,7 +255,9 @@ class Hound:
         self._gate = None
         if cfg.relay.is_agent:
             from surveillancehound.relay import RelayClient
-            self.relay = RelayClient(cfg.relay, self.store, now=time.time)
+            self.relay = RelayClient(
+                cfg.relay, self.store, now=time.time,
+                stall_seconds=cfg.uptime.capture_stall_seconds)
         elif cfg.relay.is_collector:
             from surveillancehound.ingest import IngestServer
             from surveillancehound.relay import CaptureGate
@@ -616,7 +618,8 @@ class Hound:
             was_down = sensor_id in self._sensors_down
             if silent > timeout and not was_down:
                 self._sensors_down[sensor_id] = last_seen
-                alert = self.alerts.sensor_offline(sensor_id, silent, now)
+                alert = self.alerts.sensor_offline(
+                    sensor_id, silent, now, since=last_seen)
                 if alert is not None:
                     self._emit(alert)
             elif silent <= timeout and was_down:

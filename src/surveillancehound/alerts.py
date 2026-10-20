@@ -209,7 +209,7 @@ class AlertEngine:
         return None
 
     def sensor_offline(self, sensor_id: str, silent_for: float,
-                       now: float) -> Alert | None:
+                       now: float, *, since: float | None = None) -> Alert | None:
         """A relay agent has stopped reporting.
 
         This is not a camera alert and must not be mistaken for one. The
@@ -224,7 +224,15 @@ class AlertEngine:
         routine housekeeping.
         """
         return self._mk(
-            f"sensor_offline:{sensor_id}", now,
+            # `since` is the incident anchor — the last time this sensor
+            # reported — and the caller already holds it. Without it in
+            # the key, a sensor that went down -> up -> down inside
+            # `dedup_window_seconds` had its SECOND outage swallowed, and
+            # a flapping relay link is exactly when you want to hear
+            # about it twice. The camera path fixed this with the outage
+            # id; this is the same fix with the anchor the daemon has.
+            f"sensor_offline:{sensor_id}"
+            + (f":{int(since)}" if since is not None else ""), now,
             device_ip="", kind=KIND_SENSOR_OFFLINE, severity="high",
             summary=(
                 f"relay sensor {sensor_id!r} has not reported for "

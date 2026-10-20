@@ -150,7 +150,22 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             recent = store.recent_flows(limit=1)
             last_flow_ts = recent[0].last_seen if recent else 0.0
-            alive = (time.time() - last_flow_ts) < _LIVENESS_WINDOW_SECONDS
+            # Liveness from `monitor_heartbeat`, which the daemon
+            # rewrites every tick for exactly this, NOT from the newest
+            # flow row. `flows` is written only on EVICTION, so a sensor
+            # whose traffic is long-lived camera streams has no recent
+            # flow rows at all and read as dead while it was working
+            # perfectly — the failure mode the heartbeat table exists to
+            # prevent, and CLAUDE.md says so in as many words.
+            hb_last_packet, hb_updated = store.heartbeat()
+            alive = (
+                (time.time() - hb_updated) < _LIVENESS_WINDOW_SECONDS
+                if hb_updated else
+                # No heartbeat at all: either a pre-heartbeat store or a
+                # daemon that has never run. Fall back to the old
+                # heuristic rather than reporting a working daemon dead.
+                (time.time() - last_flow_ts) < _LIVENESS_WINDOW_SECONDS
+            )
             alerts = store.list_alerts(limit=1)
             devices = store.list_devices()
             baselines = store.load_baselines()
