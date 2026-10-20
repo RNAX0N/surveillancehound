@@ -296,7 +296,7 @@ $(document).ready(function() {
                         sensor: sensor, src_ip: f.src_ip, dst_ip: f.dst_ip,
                         dst_port: f.dst_port, proto: f.proto,
                         classification: f.classification,
-                        packets: 0, bytes: 0, n: 0, last: 0
+                        packets: 0, bytes: 0, n: 0, last: 0, sortk: 0
                     };
                     order.push(g);
                 }
@@ -304,8 +304,15 @@ $(document).ready(function() {
                 g.bytes += num(f.bytes);
                 g.n += 1;
                 g.last = Math.max(g.last, num(f.last_seen));
+                /* Sort on OUR clock, display THEIRS. `last_seen` comes
+                   from the sensor, so ordering on it lets one
+                   future-dated relayed row pin itself to the top of the
+                   dashboard forever — which is exactly what the
+                   server-side ORDER BY ingested_at was changed to
+                   close. Grouping must not quietly undo that. */
+                g.sortk = Math.max(g.sortk, num(f.ingested_at || f.last_seen));
             });
-            order.sort(function (x, y) { return y.last - x.last; });
+            order.sort(function (x, y) { return y.sortk - x.sortk; });
 
             $.each(order, function (i, g) {
                 /* "x12" only when it really is several, so a single

@@ -576,7 +576,9 @@ def _check_volt_renders_relayed_data() -> None:
     fhead = text[text.index('id="tbl-flows"'):]
     fhead = fhead[:fhead.index("</thead>")]
     f_head = fhead.count("<th>")
-    fbody = text[text.index("$.each(flows"):]
+    # The flow table groups repeated conversations, so the row-emitting
+    # loop iterates the grouped list, not the raw one.
+    fbody = text[text.index("$.each(order"):]
     fbody = fbody[:fbody.index('$("#tbl-flows')]
     f_body = fbody.count("'<td>")
     assert f_head == f_body, (
