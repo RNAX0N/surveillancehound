@@ -73,7 +73,8 @@
         <style>tokenize</style>
         <allownew>true</allownew>
         <help>One CIDR per entry. Anything in here is treated as a camera
-              unless also listed as an NVR.</help>
+              unless also listed as an NVR.
+              Type a value and press enter to add it.</help>
     </field>
     <field>
         <id>hound.network.nvr_ips</id>
@@ -81,6 +82,10 @@
         <type>select_multiple</type>
         <style>tokenize</style>
         <allownew>true</allownew>
+        <help>The recorder(s) the cameras stream to. A device talking to
+              three or more cameras is detected as an NVR anyway; naming
+              it here is for when you want it certain.
+              Type a value and press enter to add it.</help>
     </field>
     <field>
         <id>hound.network.lan_subnets</id>
@@ -92,7 +97,8 @@
               RFC-1918 space as local. Add a tunnel or carrier-assigned
               range here if it looks public but is genuinely yours -
               otherwise traffic to it is scored as off-network telemetry,
-              and a relay to a collector on it is refused.</help>
+              and a relay to a collector on it is refused.
+              Type a value and press enter to add it.</help>
     </field>
     <field>
         <id>hound.network.manufacturer_allowlist</id>
@@ -101,7 +107,8 @@
         <style>tokenize</style>
         <allownew>true</allownew>
         <help>One CIDR per entry: the vendor cloud your cameras legitimately
-              talk to.</help>
+              talk to.
+              Type a value and press enter to add it.</help>
     </field>
 
     <field>
@@ -335,6 +342,7 @@
         <help>The collector's certificate is self-signed, so there is no CA
               to check it against and this pin is the trust decision. Run
               "hound relay" on the collector to print it. Verify it out of
-              band the first time.</help>
+              band the first time.
+              Type a value and press enter to add it.</help>
     </field>
 </form>

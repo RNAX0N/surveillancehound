@@ -515,6 +515,100 @@ def _check_relay_agent_round_trip() -> None:
           "drops malformed and duplicate entries")
 
 
+def _check_csv_masks_accept_lists() -> None:
+    """A CSVListField holds "a,b,c" — its Mask must accept that.
+
+    Every one of these was anchored ^...$ around a SINGLE value, so the
+    field accepted one entry and rejected two, showing a
+    ValidationMessage that describes exactly what the operator had
+    typed. Hit on a real firewall entering two LAN subnets; it only
+    surfaced then because clearing Camera IPs left `lan_subnets` as the
+    one field with more than a single value.
+
+    The repetition group is correct whether OPNsense applies the mask
+    per item or to the joined string, so this does not depend on which.
+    """
+    import re as _re
+    import xml.etree.ElementTree as _ET
+
+    model = (PLUGIN / "models/OPNsense/Hound/Hound.xml").read_text()
+    csv_fields = _re.findall(
+        r'<(\w+) type="CSVListField">(.*?)</\1>', model, _re.S)
+    assert csv_fields, "no CSVListField entries found"
+
+    for name, body in csv_fields:
+        mm = _re.search(r"<Mask>/(.*)/u</Mask>", body)
+        if not mm:
+            continue
+        rx = mm.group(1)
+        assert "," in rx, (
+            f"{name}: CSVListField stores a comma-separated list but its "
+            f"Mask has no comma, so a second entry makes the whole value "
+            f"fail and the field rejects input its own ValidationMessage "
+            f"calls correct")
+
+    def mask_for(field):
+        m = _re.search(rf'<{field} type="CSVListField">(.*?)</{field}>',
+                       model, _re.S)
+        return _re.search(r"<Mask>/(.*)/u</Mask>", m.group(1)).group(1)
+
+    # Concrete, including the exact values that failed on the firewall.
+    cases = [
+        ("lan_subnets", "88.255.0.0/16", True),
+        ("lan_subnets", "88.255.0.0/16,117.111.0.0/16", True),
+        ("lan_subnets", "88.255.0.0/16, 117.111.0.0/16", True),
+        ("lan_subnets", "88.255.0.0/99", False),
+        ("lan_subnets", "nonsense", False),
+        ("camera_ips", "117.111.101.2", True),
+        ("camera_ips", "117.111.101.2,117.111.102.2", True),
+        ("camera_ips", "117.111.101.2,junk", False),
+        ("camera_ips", "999.1.1.1", False),
+    ]
+    for field, value, want in cases:
+        got = bool(_re.match(mask_for(field), value))
+        assert got == want, (
+            f"{field} mask {'rejected' if want else 'accepted'} "
+            f"{value!r} and should not have")
+
+    _ET.parse(PLUGIN / "models/OPNsense/Hound/Hound.xml")
+    print(f"  csv masks: {len(csv_fields)} CSVListField(s) accept lists, "
+          f"single values and still reject malformed entries")
+
+
+def _check_tokenize_fields_say_how_to_use_them() -> None:
+    """Every tokenizer field must tell the operator to press Enter.
+
+    `style: tokenize` means the value only becomes a token on Enter.
+    Paste two CIDRs on two lines and you get ONE invalid token, and the
+    field rejects input that its own ValidationMessage describes as
+    correct — "Enter CIDR ranges such as 192.168.0.0/16" while refusing
+    exactly that. An operator hit this on a real firewall and had no
+    way to tell the UI apart from a broken validator.
+
+    Only `camera_ips` said it. Five fields did not, including
+    `tls_fingerprint`, which takes a long pasted value and is the next
+    field anyone wiring up a relay uses.
+    """
+    import re as _re
+
+    form = (PLUGIN / "controllers/OPNsense/Hound/forms/general.xml").read_text()
+    missing = []
+    for block in _re.findall(r"<field>(.*?)</field>", form, _re.S):
+        if "tokenize" not in block:
+            continue
+        fid = (_re.search(r"<id>(.*?)</id>", block) or [None, "?"])[1]
+        helps = (_re.search(r"<help>(.*?)</help>", block, _re.S)
+                 or [None, ""])[1]
+        if "press enter" not in helps.lower():
+            missing.append(fid)
+    assert not missing, (
+        f"tokenize field(s) {missing} never say the value must be "
+        f"committed with Enter. Pasting a multi-line list into one "
+        f"makes a single invalid token and the field then rejects "
+        f"input its own help text calls correct")
+    print("  tokenize fields: all say how to commit a value")
+
+
 def _check_volt_renders_relayed_data() -> None:
     """The plugin view must render relayed sensors, not just local rows.
 
@@ -624,6 +718,8 @@ def main() -> int:
     _check_relay_agent_round_trip()
     _check_interface_is_resolved()
     _check_ui_endpoints_exist()
+    _check_csv_masks_accept_lists()
+    _check_tokenize_fields_say_how_to_use_them()
     _check_volt_renders_relayed_data()
     _check_enable_is_wired()
     print("\nOPNSENSE FIELD VERIFICATION PASSED")
