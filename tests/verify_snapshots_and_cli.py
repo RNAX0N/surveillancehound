@@ -562,6 +562,82 @@ def _check_rotate_helper(td: Path) -> None:
     print(f"  rotation helper: cap respected ({len(files)} files)")
 
 
+def _check_export_survives_missing_relay_tables(tmp: Path) -> None:
+    """A collector store without the relay tables must still export.
+
+    `HoundStore(readonly=True)` will not run the schema — a diagnostic
+    must not alter what it reports on — so on a collector whose
+    database predates relay support every `remote_*` read raises "no
+    such table" until the daemon next opens it writably. This document
+    is the ONLY source the OPNsense dashboard reads, so that one
+    missing table blanked the whole page: no cameras, no alerts, no
+    monitor state. Seen on a real firewall.
+
+    Local data must survive, and the document must say why the relay
+    panels are empty instead of implying no sensor ever reported.
+    """
+    import json as _json
+    import sqlite3 as _sq
+    import subprocess as _sp
+    import sys as _sys
+    from surveillancehound.store import AlertRow
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    t0 = time.time() - 60.0
+    home = tmp / "norelay"
+    home.mkdir()
+    db = home / "h.sqlite"
+    store = HoundStore(path=db)
+    store.upsert_device("10.9.0.5", "camera", t0, 10, 1000,
+                        first_seen=t0 - 50)
+    store.insert_alert(AlertRow(
+        id=None, ts=t0, device_ip="10.9.0.5", kind="new_device",
+        severity="low", summary="local one", detail="", dedup_key="k1"))
+    store.close()
+
+    # Exactly what an older store looks like.
+    con = _sq.connect(db)
+    for t in ("remote_sensors", "remote_devices", "remote_flows",
+              "remote_alerts", "remote_outages", "remote_uptime",
+              "remote_notifications"):
+        con.execute(f"DROP TABLE IF EXISTS {t}")
+    con.commit()
+    con.close()
+
+    cfg_path = home / "c.toml"
+    cfg_path.write_text(
+        "[capture]\npcap_file = '/nonexistent.pcap'\n"
+        "[network]\ncamera_ips = ['10.9.0.5']\n"
+        f"[store]\npath = {str(db)!r}\n"
+        "[relay]\nmode = 'collector'\nlisten_host = '127.0.0.1'\n"
+        "listen_port = 18443\n"
+        f"cert_file = {str(fixtures / 'ingest-test.crt')!r}\n"
+        f"key_file = {str(fixtures / 'ingest-test.key')!r}\n"
+        "[[relay.sensor]]\nid = 'frigate'\nkey = 'shared-secret-abcdef'\n")
+
+    out = _sp.run([_sys.executable, "-m", "surveillancehound.cli",
+                   "export", str(cfg_path)], capture_output=True, text=True,
+                  env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    assert out.returncode == 0, out.stderr[-400:]
+    doc = _json.loads(out.stdout)
+
+    assert doc.get("status") != "failed", (
+        f"one missing relay table killed the whole export, which is the "
+        f"only thing the OPNsense dashboard reads: {doc.get('message')}")
+    assert doc["counts"]["cameras"] == 1, doc["counts"]
+    assert len(doc["alerts"]) == 1, doc["alerts"]
+    assert "monitor" in doc, "the monitor panel lost its data"
+    assert doc.get("relay_unavailable"), (
+        "the relay panels are empty and the document does not say why, "
+        "which reads as 'no sensor has ever reported'")
+    assert "remote_sensors" in doc["relay_unavailable"], \
+        doc["relay_unavailable"]
+    assert doc["remote_alerts"] == [] and doc["sensors"] == []
+
+    print("  export: a store with no relay tables still yields local "
+          "data, and says why the relay panels are empty")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -585,6 +661,7 @@ def main() -> int:
         _check_export_cli(cfg_path, root / "does-not-exist.toml")
         _check_readers_do_not_write(root)
         _check_export_counts_are_counts(cfg_path)
+        _check_export_survives_missing_relay_tables(root)
         _check_web(cfg)
         _check_web_https(cfg, root)
         _check_web_cfg_validation()

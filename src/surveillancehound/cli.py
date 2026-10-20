@@ -496,8 +496,38 @@ def _export_body(args, cfg, store, window, now) -> int:
         report = store.uptime_report(window, now)
         alerts = store.list_alerts(limit=args.limit)
         flows = store.recent_flows(limit=args.limit)
-        sensors = (store.list_remote_sensors()
-                   if cfg.relay.is_collector else [])
+        # EVERY relay read goes through `_relay`, and a missing table
+        # degrades the document instead of destroying it.
+        #
+        # A collector whose store predates relay support has no
+        # `remote_*` tables. The daemon creates them on its next
+        # writable open, but a reader cannot: `HoundStore(readonly=True)`
+        # deliberately will not run the schema, because a diagnostic
+        # must not be able to alter what it reports on. So until the
+        # daemon restarts, every one of these raises "no such table" —
+        # and this document is the ONLY source the OPNsense dashboard
+        # reads, so one missing table blanked the entire page: no
+        # cameras, no alerts, no monitor state, nothing but "Loading…".
+        #
+        # Observed on a real firewall whose store was created before
+        # relay mode existed. Local data is still perfectly readable
+        # and is what the operator needs most; withholding all of it
+        # because an optional, empty-anyway table is absent is the
+        # wrong trade. Say so in the document and carry on.
+        relay_missing: list[str] = []
+
+        def _relay(default, read):
+            if not cfg.relay.is_collector:
+                return default
+            try:
+                return read()
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+                relay_missing.append(str(exc))
+                return default
+
+        sensors = _relay([], store.list_remote_sensors)
         # Gated like the API. `hound export` is the ONLY source the
         # OPNsense dashboard reads, so leaving it ungated was the half
         # of the inconsistency that actually reached an operator.
@@ -521,13 +551,15 @@ def _export_body(args, cfg, store, window, now) -> int:
         # stall signal could never show. A permanent false alarm and a
         # destroyed real one, from a rebound name.
         blind_sensor_ids = [x.sensor_id for x in sensors if x.mon_blind]
-        remote_up = (
-            store.remote_uptime_report(now, cfg.relay.sensor_timeout_seconds,
-                                       blind_sensors=blind_sensor_ids)
-            if is_collector else []
-        )
-        remote_alerts = (store.list_remote_alerts(limit=args.limit)
-                         if is_collector else [])
+        remote_up = _relay([], lambda: store.remote_uptime_report(
+            now, cfg.relay.sensor_timeout_seconds,
+            blind_sensors=blind_sensor_ids))
+        remote_alerts = _relay(
+            [], lambda: store.list_remote_alerts(limit=args.limit))
+        remote_flows = _relay(
+            [], lambda: store.list_remote_flows(limit=args.limit))
+        remote_alerts_24h = _relay(
+            0, lambda: store.count_remote_alerts_since(now - 86400))
         doc = {
             "now": now,
             "window_seconds": window,
@@ -554,11 +586,8 @@ def _export_body(args, cfg, store, window, now) -> int:
                 # and the OPNsense dashboard clamps limit to 500, so
                 # the "Alerts (24h)" tile under-reported precisely
                 # during the flood that makes it worth reading.
-                "alerts_24h": (
-                    store.count_alerts_since(now - 86400)
-                    + (store.count_remote_alerts_since(now - 86400)
-                       if is_collector else 0)
-                ),
+                "alerts_24h": (store.count_alerts_since(now - 86400)
+                               + remote_alerts_24h),
             },
             "uptime": [dict(r.__dict__, sensor="local") for r in report],
             "remote_uptime": remote_up,
@@ -574,9 +603,19 @@ def _export_body(args, cfg, store, window, now) -> int:
             # The OPNsense dashboard renders THIS document and cannot
             # reach /api/flows, so omitting relayed flows here made them
             # invisible on the collector's own platform.
-            "remote_flows": (store.list_remote_flows(limit=args.limit)
-                             if is_collector else []),
+            "remote_flows": remote_flows,
         }
+        if relay_missing:
+            # Named in the document so the dashboard can say WHY the
+            # relay panels are empty, rather than implying no sensor
+            # has ever reported.
+            doc["relay_unavailable"] = (
+                "This collector's database has no relay tables yet "
+                "(%s). Local monitoring is unaffected and is shown "
+                "below; relayed sensor data will appear once the "
+                "daemon has restarted, which creates them."
+                % relay_missing[0]
+            )
     finally:
         # The store is closed by cmd_export's own `finally`, which owns
         # it on both the success and the in-document-failure path.

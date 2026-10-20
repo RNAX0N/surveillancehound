@@ -144,6 +144,18 @@ $(document).ready(function() {
                 return;
             }
 
+            /* A collector whose store predates relay support has no
+               remote_* tables yet. The document still carries all the
+               local data; say why the relay panels are empty rather
+               than letting them read as "no sensor ever reported". */
+            if (d.relay_unavailable) {
+                $("#hound-dash-error")
+                    .attr('class', 'alert alert-warning')
+                    .text(d.relay_unavailable).show();
+            } else {
+                $("#hound-dash-error").attr('class', 'alert alert-danger');
+            }
+
             $("#stat-cameras").text(d.counts.cameras);
             $("#stat-nvrs").text(d.counts.nvrs);
             $("#stat-devices").text(d.counts.devices);
