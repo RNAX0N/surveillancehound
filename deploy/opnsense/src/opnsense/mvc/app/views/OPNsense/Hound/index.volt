@@ -270,21 +270,60 @@ $(document).ready(function() {
                 '<tr><td colspan="6">' + "{{ lang._('No alerts yet.') }}" + '</td></tr>');
 
             rows = '';
-            var flows = (d.flows || []).concat(d.remote_flows || [])
-                .sort(function (x, y) {
-                    return num(y.ingested_at || y.last_seen) -
-                           num(x.ingested_at || x.last_seen);
-                });
-            $.each(flows, function (i, f) {
+            /* COLLAPSE REPEATED CONVERSATIONS.
+             *
+             * A flow is keyed on the full 5-tuple, and the client's
+             * source port is ephemeral — a new one for every NTP poll
+             * and every DNS lookup. So one chatty pair produced one row
+             * per exchange and pushed everything else off the table: on
+             * a real firewall this list was 100% NTP and DNS to the
+             * gateway, repeating every 65 seconds, with nothing else
+             * visible at all.
+             *
+             * Group on everything EXCEPT the ephemeral source port, sum
+             * the counters, and keep the most recent timestamp. The
+             * underlying rows are untouched — `hound flows` still shows
+             * every one — this is a reading of them, and a dashboard
+             * that cannot be read is not reporting. */
+            var groups = {}, order = [];
+            $.each((d.flows || []).concat(d.remote_flows || []), function (i, f) {
+                var sensor = f.sensor || f.sensor_id || 'local';
+                var k = [sensor, f.src_ip, f.dst_ip, f.dst_port, f.proto,
+                         f.classification].join('|');
+                var g = groups[k];
+                if (!g) {
+                    g = groups[k] = {
+                        sensor: sensor, src_ip: f.src_ip, dst_ip: f.dst_ip,
+                        dst_port: f.dst_port, proto: f.proto,
+                        classification: f.classification,
+                        packets: 0, bytes: 0, n: 0, last: 0
+                    };
+                    order.push(g);
+                }
+                g.packets += num(f.packets);
+                g.bytes += num(f.bytes);
+                g.n += 1;
+                g.last = Math.max(g.last, num(f.last_seen));
+            });
+            order.sort(function (x, y) { return y.last - x.last; });
+
+            $.each(order, function (i, g) {
+                /* "x12" only when it really is several, so a single
+                   conversation does not read as a summary of one. */
+                var times = g.n > 1
+                    ? ' <span class="badge" title="'
+                      + "{{ lang._('conversations collapsed into this row') }}"
+                      + '">x' + g.n + '</span>'
+                    : '';
                 rows += '<tr>' +
-                    '<td>' + esc(new Date(num(f.last_seen) * 1000).toLocaleTimeString()) + '</td>' +
-                    '<td>' + esc(f.sensor || f.sensor_id || 'local') + '</td>' +
-                    '<td>' + esc(f.src_ip) + ':' + esc(f.src_port) + '</td>' +
-                    '<td>' + esc(f.dst_ip) + ':' + esc(f.dst_port) + '</td>' +
-                    '<td>' + esc(f.proto) + '</td>' +
-                    '<td>' + num(f.packets) + '</td>' +
-                    '<td>' + fmtBytes(num(f.bytes)) + '</td>' +
-                    '<td><code>' + esc(f.classification) + '</code></td>' +
+                    '<td>' + esc(new Date(g.last * 1000).toLocaleTimeString()) + times + '</td>' +
+                    '<td>' + esc(g.sensor) + '</td>' +
+                    '<td>' + esc(g.src_ip) + '</td>' +
+                    '<td>' + esc(g.dst_ip) + ':' + esc(g.dst_port) + '</td>' +
+                    '<td>' + esc(g.proto) + '</td>' +
+                    '<td>' + num(g.packets) + '</td>' +
+                    '<td>' + fmtBytes(num(g.bytes)) + '</td>' +
+                    '<td><code>' + esc(g.classification) + '</code></td>' +
                     '</tr>';
             });
             $("#tbl-flows tbody").html(rows ||
