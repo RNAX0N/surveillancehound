@@ -49,7 +49,62 @@ required_files="${hound_config}"
 
 start_precmd=hound_prestart
 
+# Recreate the service account if it has gone missing.
+#
+# Everything below assumes the `hound` user AND group exist. On a real
+# firewall the group was absent while the user was not, so all three
+# `install -d` calls failed with "install: unknown group hound", the
+# config kept whatever ownership it had, and the daemon died on
+# startup with
+#
+#   PermissionError: [Errno 13] Permission denied: /usr/local/etc/hound.toml
+#
+# which `daemon -r` then retried every 5 seconds forever. Because the
+# daemon never opened the store writably it never ran the schema, so
+# the dashboard's export failed on a missing table and the whole page
+# rendered blank. One absent group, four layers away from the symptom.
+#
+# Self-healing rather than an install-time check, because the account
+# can disappear AFTER installation — a firmware upgrade strips drop-in
+# plugins, and OPNsense regenerates system accounts from config.xml.
+hound_ensure_account() {
+    pw groupshow "${hound_user}" >/dev/null 2>&1 || {
+        echo "hound: group '${hound_user}' missing — creating it"
+        pw groupadd "${hound_user}" || {
+            echo "hound: FAILED to create group '${hound_user}'." >&2
+            return 1
+        }
+    }
+    pw usershow "${hound_user}" >/dev/null 2>&1 || {
+        echo "hound: user '${hound_user}' missing — creating it"
+        pw useradd "${hound_user}" -g "${hound_user}" \
+            -s /usr/sbin/nologin -d /var/lib/hound \
+            -c "SurveillanceHound daemon" || {
+            echo "hound: FAILED to create user '${hound_user}'." >&2
+            return 1
+        }
+    }
+    # The user may predate the group (that is exactly how this broke),
+    # leaving a primary GID that no longer names anything.
+    pw usermod "${hound_user}" -g "${hound_user}" 2>/dev/null || true
+}
+
+# The daemon reads its own config as ${hound_user}. configd renders it
+# with umask 027, and the renderer chowns it — but that chown fails
+# silently when the group does not exist, which is how an unreadable
+# config survived a "successful" save.
+hound_fix_config_perms() {
+    [ -f "${hound_config}" ] || return 0
+    chown "root:${hound_user}" "${hound_config}" 2>/dev/null || true
+    chmod 0640 "${hound_config}" 2>/dev/null || true
+    su -m "${hound_user}" -c "test -r ${hound_config}" 2>/dev/null || \
+        echo "hound: warning: ${hound_user} cannot read ${hound_config} —" \
+             "the daemon will exit immediately with a permission error" >&2
+}
+
 hound_prestart() {
+    hound_ensure_account || return 1
+    hound_fix_config_perms
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 /var/log/${name}
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 /var/lib/hound
     install -d -o "${hound_user}" -g "${hound_user}" -m 0755 "${piddir}"

@@ -115,6 +115,12 @@ ok "hound CLI → $BIN"
 # --- 3. service user + state/log dirs ---------------------------------------
 say "creating service user + directories"
 pw groupshow "$HOUND_GROUP" >/dev/null 2>&1 || pw groupadd "$HOUND_GROUP"
+# VERIFY, do not assume. Observed on a real firewall: this script
+# reported success while `pw groupshow hound` said the group did not
+# exist, and the failure only surfaced four layers later as a blank
+# dashboard. Everything below uses the group, so stop here instead.
+pw groupshow "$HOUND_GROUP" >/dev/null 2>&1 \
+    || die "group '$HOUND_GROUP' does not exist and could not be created"
 pw usershow  "$HOUND_USER"  >/dev/null 2>&1 || \
     pw useradd "$HOUND_USER" -g "$HOUND_GROUP" -s /usr/sbin/nologin -d "$STATE_DIR" \
         -c "SurveillanceHound daemon"
