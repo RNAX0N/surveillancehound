@@ -138,6 +138,61 @@ def cmd_flows(args: argparse.Namespace) -> int:
 
 def cmd_devices(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
+    if getattr(args, "forget_unclaimed", False):
+        # Every camera/nvr row this box can no longer justify holding.
+        #
+        # The device register is a UNION of what the config declared and
+        # what was observed, and nothing ever leaves it: `seed_device`
+        # adds configured cameras, `upsert_device` ratchets a role and
+        # never lowers it, and `prune()` deletes only CLOSED outages —
+        # so a camera nothing will ever see again keeps its outage open
+        # forever and stays on the dashboard as permanently down.
+        #
+        # On a collector that is the whole problem: the cameras live
+        # behind an agent, this box has no path to them, and every row
+        # it holds for them is a confident statement about something it
+        # cannot observe. Removing them is not losing data; it is
+        # declining to invent it.
+        import ipaddress as _ip
+
+        store = HoundStore(path=cfg.store.path)
+        try:
+            claimed = {*cfg.network.camera_ips, *cfg.network.nvr_ips}
+            nets = []
+            for c in (*cfg.network.camera_subnets, *cfg.network.nvr_ips):
+                try:
+                    nets.append(_ip.ip_network(c, strict=False))
+                except ValueError:
+                    continue
+
+            def _claimed(ip: str) -> bool:
+                if ip in claimed:
+                    return True
+                try:
+                    addr = _ip.ip_address(ip)
+                except ValueError:
+                    return False
+                return any(addr in n for n in nets)
+
+            stale = [d for d in store.list_devices()
+                     if d.role in ("camera", "nvr") and not _claimed(d.ip)]
+            if not stale:
+                print("nothing to forget: every camera/nvr row is still "
+                      "claimed by the config")
+                return 0
+            total = {"devices": 0, "outages": 0}
+            for d in stale:
+                gone = store.forget_device(d.ip)
+                for k, n in gone.items():
+                    total[k] = total.get(k, 0) + n
+                print(f"  forgot {d.ip:18s} ({d.role})")
+            print(f"removed {total.get('devices', 0)} device row(s) and "
+                  f"{total.get('outages', 0)} outage row(s)")
+            print("  Anything still on the wire comes back on the next "
+                  "packet, classified by the CURRENT config.")
+        finally:
+            store.close()
+        return 0
     if getattr(args, "forget", None):
         # Writable: this one mutates. Everything else here is read-only.
         store = HoundStore(path=cfg.store.path)
@@ -1181,6 +1236,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_d = sub.add_parser("devices", help="show observed devices")
     p_d.add_argument("config")
+    p_d.add_argument("--forget-unclaimed", action="store_true",
+                     help="delete every camera/nvr row the config no longer "
+                          "claims, with its outage history. For a collector "
+                          "whose cameras moved to an agent: this box cannot "
+                          "see them, so every row it keeps for them is a "
+                          "claim about something it cannot observe.")
     p_d.add_argument("--forget", metavar="IP",
                      help="delete a device and its outage history — for an "
                           "address the config no longer claims. Stored "

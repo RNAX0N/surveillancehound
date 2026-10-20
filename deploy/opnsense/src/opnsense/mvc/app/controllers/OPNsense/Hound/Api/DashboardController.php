@@ -26,6 +26,44 @@ use \OPNsense\Core\Backend;
 class DashboardController extends ApiControllerBase
 {
     /**
+     * Delete every camera/NVR row the running config no longer claims.
+     *
+     * The dashboard's device list is a register that only ever grows:
+     * configured cameras are seeded into it, observed roles ratchet
+     * upward and never fall back, and `prune()` removes only CLOSED
+     * outages — so a camera this box will never see again keeps an open
+     * outage and renders as permanently down, with no way to clear it
+     * from the UI at all.
+     *
+     * That bites hardest on a collector whose cameras sit behind an
+     * agent: it has no path to those addresses, so every row it holds
+     * for them is a confident claim about something it cannot observe.
+     *
+     * POST-only: it mutates.
+     *
+     * @return array
+     */
+    public function forgetUnclaimedAction()
+    {
+        if (!$this->request->isPost()) {
+            return ['status' => 'failed',
+                    'message' => gettext('POST required')];
+        }
+        $backend = new Backend();
+        $output = trim($backend->configdRun('hound forget-unclaimed'));
+        if ($output === '') {
+            return [
+                'status' => 'failed',
+                'message' => gettext(
+                    'No response from the hound backend. Run "configctl ' .
+                    'hound forget-unclaimed" from a shell to see why.'
+                ),
+            ];
+        }
+        return ['status' => 'ok', 'response' => $output];
+    }
+
+    /**
      * Return the dashboard document produced by `hound export`.
      *
      * @param string $limit max alert/flow rows; clamped, and validated as

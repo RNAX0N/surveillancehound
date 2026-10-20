@@ -221,16 +221,41 @@ $(document).ready(function() {
             // windows. Without the relayed rows this box — which is the
             // collector — cannot see the segment it exists to watch.
             var cams = (d.uptime || []).concat(d.remote_uptime || []);
+
+            /* An address reported by BOTH this box and a relay sensor is
+               listed twice, and the two rows disagree: the sensor can see
+               the device, this box demonstrably cannot, so the local row
+               is a claim about something out of its reach. That is not a
+               rendering quirk — it is the collector asserting a camera is
+               "never seen" while the agent watching it reports it up.
+               Mark the local one rather than hide it: silently dropping a
+               row is how a dashboard starts lying in the other direction,
+               and the fix is to remove the stale row (the button above),
+               not to paper over it. */
+            var bySensor = {};
+            $.each(cams, function (i, c) {
+                if (c.sensor && c.sensor !== 'local') bySensor[c.ip] = c.sensor;
+            });
+
             var rows = '';
             $.each(cams, function (i, c) {
+                var superseded = (!c.sensor || c.sensor === 'local') &&
+                                 bySensor[c.ip];
                 // A sensor that has stopped reporting tells us nothing
                 // current, so its cameras read unknown and its
                 // availability reads n/a rather than the figure it last
                 // claimed — that number is as stale as the contact.
                 var stale = (c.stale === true);
-                rows += '<tr>' +
+                rows += '<tr' + (superseded ? ' class="text-muted"' : '') + '>' +
                     '<td>' + stateLabel(c.state) + '</td>' +
-                    '<td>' + esc(c.ip) + '</td>' +
+                    '<td>' + esc(c.ip) +
+                        (superseded
+                            ? ' <span class="label label-warning" title="'
+                              + "{{ lang._('Sensor ') }}" + esc(bySensor[c.ip])
+                              + "{{ lang._(' also reports this address and can actually see it. This local row is left over from a configuration this box no longer has; use Remove unclaimed rows.') }}"
+                              + '">{{ lang._('superseded') }}</span>'
+                            : '') +
+                        '</td>' +
                     '<td>' + esc(c.sensor || 'local') + '</td>' +
                     '<td>' + esc(c.role) + '</td>' +
                     '<td>' + (c.last_seen ? fmtAgo(c.last_seen) : "{{ lang._('never') }}") + '</td>' +
@@ -343,6 +368,33 @@ $(document).ready(function() {
         });
     }
 
+    /* Remove local rows the config no longer claims.
+     *
+     * Confirm first: it deletes outage history, which is the only record
+     * that a camera was ever down. Harmless for rows this box cannot
+     * observe — which is the case it exists for — but not reversible. */
+    $("#hound-forget-unclaimed").click(function () {
+        if (!confirm("{{ lang._('Remove every camera/NVR row this box no longer has in its configuration, along with its outage history? Rows for devices still on the wire come back on the next packet.') }}")) {
+            return;
+        }
+        var $b = $(this).prop("disabled", true);
+        ajaxCall("/api/hound/dashboard/forgetUnclaimed", {}, function (d) {
+            $b.prop("disabled", false);
+            if (d && d.status === 'ok') {
+                $("#hound-dash-error")
+                    .attr('class', 'alert alert-success')
+                    .text(d.response || "{{ lang._('Done.') }}").show();
+                loadDashboard();
+            } else {
+                $("#hound-dash-error")
+                    .attr('class', 'alert alert-danger')
+                    .text((d && d.message) ||
+                          "{{ lang._('Could not reach the hound backend.') }}")
+                    .show();
+            }
+        });
+    });
+
     /* Only poll while the dashboard tab is visible — each refresh spawns a
        configd process, so polling a hidden tab is pure waste. */
     function startPolling() {
@@ -424,7 +476,15 @@ $(document).ready(function() {
                 <i class="fa fa-refresh"></i> {{ lang._('Refresh') }}
             </button>
 
-            <h4>{{ lang._('Camera uptime') }}</h4>
+            <h4>
+                {{ lang._('Camera uptime') }}
+                <button id="hound-forget-unclaimed" type="button"
+                        class="btn btn-default btn-xs pull-right"
+                        title="{{ lang._('Delete rows for devices this box no longer has in its config — for example cameras that moved behind a relay agent. They cannot be cleared any other way: roles never downgrade and pruning keeps open outages.') }}">
+                    <i class="fa fa-eraser"></i>
+                    {{ lang._('Remove unclaimed rows') }}
+                </button>
+            </h4>
             <div class="table-responsive">
                 <table class="table table-striped table-condensed" id="tbl-uptime">
                     <thead>
