@@ -441,7 +441,7 @@ def chrony_window(samples: list[dict], cam: str | None) -> dict | None:
             if isinstance(r.get("chrony"), dict) and cam in r["chrony"]]
     if not rows:
         return None
-    (_, first), (_, last) = rows[0], rows[-1]
+    (t_first, first), (t_last, last) = rows[0], rows[-1]
     req = last["ntp"] - first["ntp"]
     drop = last["drop"] - first["drop"]
     # One reading is not a delta. Reporting it as "0 requests" would
@@ -453,6 +453,11 @@ def chrony_window(samples: list[dict], cam: str | None) -> dict | None:
         "drops": None if unknown or drop < 0 else drop,
         "restarted": not unknown and (req < 0 or drop < 0),
         "single_reading": unknown,
+        # chrony readings started when the cross-check was installed,
+        # which is not when the counters started. A delta covering one
+        # minute cannot speak for an hour of silence, and saying so is
+        # the difference between a second witness and a rubber stamp.
+        "span_s": t_last - t_first,
         "last_s": last.get("last_s"),
         "interval": last.get("interval"),
         "samples": len(rows),
@@ -484,7 +489,8 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
     if ch:
         bits = []
         if ch["requests"] is not None:
-            bits.append(f"{ch['requests']} requests")
+            bits.append(f"{ch['requests']} requests in "
+                        f"{ch['span_s'] / 60:.0f} min watched")
         if ch["drops"]:
             bits.append(f"**{ch['drops']} DROPPED**")
         if ch["last_s"] is not None:
@@ -550,11 +556,16 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
                 + "; ".join(f'"{e["text"]}"' for e in rel[:2])
                 + f". Confirm it is back and syncing before P2/P3.{why_else}")
             return "**silent — maintenance?**", detail
-        if ch and ch["requests"] == 0 and not ch["restarted"]:
+        if (ch and ch["requests"] == 0 and not ch["restarted"]
+                and ch["span_s"] >= gap):
             corroborated = (" chrony independently served it nothing in the "
                             "same period, so this is the camera, not the "
                             "counter: it is not asking the NVR for time at "
                             "all, and something else is setting its clock.")
+        elif ch and ch["span_s"] < gap:
+            corroborated = (f" chrony has only been read for "
+                            f"{ch['span_s'] / 60:.0f} min of that span, so "
+                            f"it cannot corroborate this yet.")
         elif ch:
             corroborated = ""
         else:

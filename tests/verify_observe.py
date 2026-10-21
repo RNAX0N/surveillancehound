@@ -373,6 +373,20 @@ check("...and the age is converted", parsed["106"]["last_s"] == 3900)
 check("non-camera clients are ignored", "19" not in parsed)
 check("chrony being unavailable is empty, not an error", absent == {})
 
+# A chrony delta covering one minute cannot speak for a day of silence.
+# The cross-check was installed mid-window, so this is the live case,
+# not a hypothetical.
+short = [None] * (DAY - 3) + [{"ntp": 500, "drop": 0, "interval": "12",
+                               "last_s": 60.0}] * 3
+cell, blockers, _, detail = judge([0] * DAY, chrony=short)
+check("a chrony delta shorter than the silence does not corroborate",
+      not any("independently served it nothing" in b for b in blockers),
+      str(blockers))
+check("...and says how little it watched",
+      any("cannot corroborate this yet" in b for b in blockers), str(blockers))
+check("...and shows the span beside the count",
+      "in 30 min watched" in detail, detail)
+
 # One chrony reading is not a delta. Reading it as "0 requests" would
 # have chrony corroborate a silent counter on no evidence at all.
 one = [None] * (DAY - 1) + [{"ntp": 500, "drop": 0,
