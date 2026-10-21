@@ -1,0 +1,227 @@
+#!/usr/bin/python3
+"""gsfw-observe — record and summarise the P1 observation window.
+
+P1 loads an nftables table that cannot drop anything. Every named
+counter in it corresponds to exactly one DROP that the P2/P3 lockdown
+will introduce. This tool turns 24 hours of those counters into a
+decision.
+
+    gsfw-observe snapshot     # hourly, from a timer: append one sample
+    gsfw-observe summary      # at T+24h: the review, as markdown
+
+`snapshot` is append-only and never interprets. `summary` interprets and
+never writes to the samples. Keeping them apart matters: a summary that
+could rewrite its own inputs cannot be audited.
+
+Verdicts are deliberately conservative. A counter the lockdown is MEANT
+to stop reads "expected"; anything else reads "UNEXPECTED" and forces a
+NO-GO, because the entire point of the window is to find the flows
+nobody predicted. The tool will not return GO while any unexpected
+class is non-zero, and it will not return GO on an empty sample set
+either — no observation is not the same as nothing happening, which is
+the mistake this project has made more than once.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+SAMPLES = "/var/log/gsfw-observe/samples.jsonl"
+TABLE = ("inet", "gsfw")
+
+# Counters the lockdown is SUPPOSED to stop. Non-zero here is the finding,
+# not a problem. Everything else non-zero blocks GO.
+EXPECTED_BLOCK = {
+    "fwd_cam_egress":
+        "a camera VLAN reaching off-segment. This is the laptop-on-a-"
+        "camera-cable exposure P2 exists to close.",
+    "fwd_wg_to_wg":
+        "peer-to-peer across the tunnel; nothing should ever do this.",
+    "fwd_wg_initiated":
+        "a tunnel peer initiating a flow; cameras pull nothing.",
+}
+# Counters that MUST be non-zero, or the lockdown would break something
+# that is working today and we would not know until we enforced it.
+MUST_BE_USED = {
+    "in_cam_ntp": "cameras getting time from the NVR (chrony)",
+}
+
+
+def nft(*args: str) -> str:
+    p = subprocess.run(("nft", *args), capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"gsfw-observe: nft failed: {p.stderr.strip()}", file=sys.stderr)
+        sys.exit(2)
+    return p.stdout
+
+
+def read_counters() -> dict[str, dict]:
+    """Named counters, by name. Parsed from `nft -j` so a format change
+    breaks loudly rather than being silently mis-scraped."""
+    doc = json.loads(nft("-j", "list", "table", *TABLE))
+    out = {}
+    for item in doc.get("nftables", []):
+        c = item.get("counter")
+        if c and c.get("family") == TABLE[0] and c.get("table") == TABLE[1]:
+            out[c["name"]] = {"packets": c.get("packets", 0),
+                              "bytes": c.get("bytes", 0),
+                              "comment": c.get("comment", "")}
+    return out
+
+
+def cmd_snapshot() -> int:
+    os.makedirs(os.path.dirname(SAMPLES), exist_ok=True)
+    row = {"ts": time.time(), "counters": read_counters()}
+    with open(SAMPLES, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, sort_keys=True) + "\n")
+    print(f"gsfw-observe: sampled {len(row['counters'])} counters")
+    return 0
+
+
+def load_samples() -> list[dict]:
+    if not os.path.exists(SAMPLES):
+        return []
+    out = []
+    for line in open(SAMPLES, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue          # a torn tail line; do not die on the report
+    return sorted(out, key=lambda r: r["ts"])
+
+
+def journal_examples(prefix_tag: str, limit: int = 4) -> list[str]:
+    """A few real log lines per class, so the summary names actual hosts
+    rather than only counts."""
+    p = subprocess.run(
+        ("journalctl", "-k", "--no-pager", "-o", "cat", "--since", "-25h"),
+        capture_output=True, text=True)
+    hits, seen = [], set()
+    for ln in (p.stdout or "").splitlines():
+        if f"gsfw-wouldblock {prefix_tag}" not in ln:
+            continue
+        m = re.search(r"SRC=(\S+).*?DST=(\S+)(?:.*?DPT=(\d+))?", ln)
+        key = m.groups() if m else (ln[:60],)
+        if key in seen:
+            continue
+        seen.add(key)
+        if m:
+            src, dst, dpt = m.group(1), m.group(2), m.group(3) or "-"
+            hits.append(f"{src} -> {dst}:{dpt}")
+        else:
+            hits.append(ln.strip()[:70])
+        if len(hits) >= limit:
+            break
+    return hits
+
+
+LOG_TAG = {
+    "fwd_cam_egress": "cam-egress", "fwd_rtsp_nonfrigate": "rtsp-not-frigate",
+    "fwd_into_cam_other": "into-cam", "fwd_wg_to_wg": "wg-to-wg",
+    "fwd_wg_initiated": "wg-initiated", "fwd_other": "other-forward",
+    "in_cam_other": "cam-to-nvr", "in_mgmt_offlan": "mgmt-not-lan",
+}
+
+
+def cmd_summary() -> int:
+    s = load_samples()
+    if not s:
+        print("## P1 observation — NO DATA\n")
+        print("No samples were recorded, so this window observed nothing.")
+        print("**NO-GO.** An empty sample set is not evidence that nothing")
+        print("happened; it is evidence that nothing was watched. Check the")
+        print("timer (`systemctl status gsfw-observe.timer`) and restart the")
+        print("window — do not read silence as a pass.")
+        return 1
+
+    first, last = s[0], s[-1]
+    hours = (last["ts"] - first["ts"]) / 3600.0
+    names = sorted(set().union(*(set(r["counters"]) for r in s)))
+
+    print("## P1 observation window — review\n")
+    print(f"- samples: **{len(s)}** over **{hours:.1f}h** "
+          f"({time.strftime('%Y-%m-%d %H:%M', time.localtime(first['ts']))} "
+          f"to {time.strftime('%Y-%m-%d %H:%M', time.localtime(last['ts']))})")
+    print("- every counter below is a flow the lockdown WOULD HAVE DROPPED.")
+    print("  Nothing was dropped during this window.\n")
+
+    print("| class | packets | first seen | last seen | verdict |")
+    print("|---|---:|---|---|---|")
+    blockers, findings = [], []
+    for n in names:
+        tot = last["counters"].get(n, {}).get("packets", 0)
+        firsts = next((r for r in s if r["counters"].get(n, {}).get("packets", 0)), None)
+        lasts = next((r for r in reversed(s)
+                      if r["counters"].get(n, {}).get("packets", 0)), None)
+        fs = time.strftime("%m-%d %H:%M", time.localtime(firsts["ts"])) if firsts else "—"
+        ls = time.strftime("%m-%d %H:%M", time.localtime(lasts["ts"])) if lasts else "—"
+        if n in MUST_BE_USED:
+            if tot == 0:
+                verdict = "**UNEXPECTED — silent**"
+                blockers.append(
+                    f"`{n}` is zero. {MUST_BE_USED[n]} appears unused, which "
+                    f"is more likely to mean this window did not see it than "
+                    f"that nothing needs it. Enforcing could cut a working "
+                    f"service.")
+            else:
+                verdict = "expected (in use)"
+        elif tot == 0:
+            verdict = "clear"
+        elif n in EXPECTED_BLOCK:
+            verdict = "expected"
+            findings.append(f"`{n}` ({tot} pkts): {EXPECTED_BLOCK[n]}")
+        else:
+            verdict = "**UNEXPECTED**"
+            blockers.append(
+                f"`{n}` saw {tot} packets. The lockdown would have dropped "
+                f"these and nobody predicted them. Resolve before P2.")
+        print(f"| `{n}` | {tot} | {fs} | {ls} | {verdict} |")
+
+    for n in names:
+        tag = LOG_TAG.get(n)
+        tot = last["counters"].get(n, {}).get("packets", 0)
+        if not tag or not tot:
+            continue
+        ex = journal_examples(tag)
+        if ex:
+            print(f"\n**`{n}` — who:**")
+            for e in ex:
+                print(f"  - `{e}`")
+
+    print("\n### Findings the lockdown is meant to stop\n")
+    print("\n".join(f"- {f}" for f in findings) or "- none")
+
+    if blockers:
+        print("\n### Blockers\n")
+        print("\n".join(f"- {b}" for b in blockers))
+        print("\n## NO-GO for P2")
+        print("Resolve the blockers above, then re-run the window.")
+        return 1
+
+    if hours < 23.0:
+        print(f"\n## NO-GO for P2 — window too short ({hours:.1f}h of 24h)")
+        print("Partial observation reads as 'nothing unexpected' for the")
+        print("hours it did not watch. Let it finish.")
+        return 1
+
+    print("\n## GO for P2")
+    print("Every non-zero counter is a class the lockdown is meant to stop,")
+    print("and everything that must stay permitted was seen in use.")
+    return 0
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "snapshot":
+        sys.exit(cmd_snapshot())
+    if mode == "summary":
+        sys.exit(cmd_summary())
+    print(__doc__)
+    sys.exit(2)

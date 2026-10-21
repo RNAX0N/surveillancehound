@@ -1,0 +1,101 @@
+#!/usr/sbin/nft -f
+#
+# P1 — OBSERVE ONLY. This ruleset cannot drop, reject or alter a single
+# packet. Every chain is `policy accept` and every rule ends in `return`
+# or does nothing but count.
+#
+# Its only job is to answer one question for 24 hours: if P2's forward
+# lockdown and P3's input lockdown were enforced RIGHT NOW, what would
+# they have broken? Each named counter below corresponds to exactly one
+# DROP that P2/P3 will introduce. A counter that is non-zero at T+24h is
+# a flow the lockdown would have killed — either expected (the laptop-on-
+# a-camera-cable case, which is the point) or unexpected, in which case
+# enforcing without this window would have caused an outage.
+#
+# Own table, replaced atomically by name. Nothing Docker owns is named.
+# See mailbox-agents/surveillancehound-nvr-hardening-PLAN_2026-10-20.md
+
+table inet gsfw
+delete table inet gsfw
+
+table inet gsfw {
+    # ---- what P2 would DROP in the forward chain -----------------------
+    counter fwd_cam_egress        { comment "camera VLAN -> anywhere: the laptop-on-a-camera-cable case" }
+    counter fwd_rtsp_nonfrigate   { comment "something other than Frigate pulling :554 from a camera" }
+    counter fwd_into_cam_other    { comment "into a camera VLAN, not Frigate RTSP and not admin" }
+    counter fwd_wg_to_wg          { comment "peer-to-peer across the tunnel" }
+    counter fwd_wg_initiated      { comment "a tunnel peer initiating anything" }
+    counter fwd_other             { comment "forwarded, matched no allow class: P2 default-drop" }
+
+    # ---- what P3 would DROP in the input chain -------------------------
+    counter in_cam_ntp            { comment "camera -> NVR udp/123: MUST stay allowed" }
+    counter in_cam_wg             { comment "camera -> NVR udp/51820: the WG underlay" }
+    counter in_cam_other          { comment "camera -> NVR, anything else: P3 would drop" }
+    counter in_admin_mgmt         { comment "admin host -> 22/8971 on the LAN side" }
+    counter in_mgmt_offlan        { comment "22/8971 from somewhere that is NOT the LAN side" }
+
+    chain observe_forward {
+        # priority filter + 10: after the existing filter hooks, so this
+        # observes what survives them rather than what was offered.
+        type filter hook forward priority filter + 10; policy accept;
+
+        # Already-established flows are not candidates for a NEW-state
+        # drop, so they must not be counted as casualties.
+        ct state established,related return
+
+        # ---- classes P2 will ALLOW. Counted nowhere; returned early so
+        #      they cannot fall through into fwd_other and inflate it.
+        ct status dnat return
+        ip saddr 172.19.0.2 ip daddr 117.111.0.0/16 tcp dport 554 return
+        oifname "wg0" ip daddr 10.77.0.0/24 tcp dport 554 return
+        ip saddr 88.255.1.221 oifname "enp6s0.*" tcp dport { 22, 443 } return
+
+        # ---- classes P2 will DROP. Count, log sparsely, then RETURN.
+        iifname "wg0" oifname "wg0" counter name fwd_wg_to_wg \
+            log prefix "gsfw-wouldblock wg-to-wg: " level info limit rate 6/minute return
+        iifname "wg0" counter name fwd_wg_initiated \
+            log prefix "gsfw-wouldblock wg-initiated: " level info limit rate 6/minute return
+
+        # Anything pulling RTSP from a camera that is not Frigate. The
+        # operator asked for this one specifically, by pre-NAT source.
+        ip daddr 117.111.0.0/16 tcp dport 554 counter name fwd_rtsp_nonfrigate \
+            log prefix "gsfw-wouldblock rtsp-not-frigate: " level warn limit rate 12/minute return
+
+        # A camera VLAN talking out to anything. With forward policy
+        # ACCEPT today, this reaches every camera, the LAN, and the
+        # internet. This counter being non-zero is the finding.
+        iifname "enp6s0.*" counter name fwd_cam_egress \
+            log prefix "gsfw-wouldblock cam-egress: " level warn limit rate 12/minute return
+
+        oifname "enp6s0.*" counter name fwd_into_cam_other \
+            log prefix "gsfw-wouldblock into-cam: " level info limit rate 12/minute return
+
+        counter name fwd_other \
+            log prefix "gsfw-wouldblock other-forward: " level info limit rate 6/minute return
+    }
+
+    chain observe_input {
+        type filter hook input priority filter + 10; policy accept;
+        ct state established,related return
+        iif "lo" return
+
+        # NTP from a camera: P3 KEEPS this. Counted to prove it is in use
+        # before P3 narrows the input chain, and to catch camera 12 if it
+        # starts asking while chrony still refuses it.
+        iifname "enp6s0.*" udp dport 123 counter name in_cam_ntp return
+        iifname "enp6s0.*" udp dport 51820 counter name in_cam_wg return
+        iifname "enp6s0.*" ip protocol icmp return
+
+        # Anything else a camera sends AT the NVR. P3 drops this, so a
+        # non-zero counter here is a service something depends on that
+        # nobody mentioned.
+        iifname "enp6s0.*" counter name in_cam_other \
+            log prefix "gsfw-wouldblock cam-to-nvr: " level warn limit rate 12/minute return
+
+        # Management, and management from the wrong side of the house.
+        iifname "enp4s0" ip saddr 88.255.1.221 tcp dport { 22, 8971 } \
+            counter name in_admin_mgmt return
+        tcp dport { 22, 8971 } counter name in_mgmt_offlan \
+            log prefix "gsfw-wouldblock mgmt-not-lan: " level warn limit rate 12/minute return
+    }
+}

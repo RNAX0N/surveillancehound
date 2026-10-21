@@ -57,3 +57,40 @@ counts. Restarting Docker is disruptive — on this host it restarted
 Frigate and cost ~5 minutes of recording — and it only restores *Docker's*
 tables. Any rule hand-added to another table is still gone, silently,
 which is the failure this tool reports.
+
+## `gsfw-observe` + `gsfw-observe.nft` — the P1 observation window
+
+Before enforcing a firewall lockdown on a host that records twelve
+cameras, measure what the lockdown would have broken.
+
+`gsfw-observe.nft` loads a table that **cannot drop a packet**: both
+chains are `policy accept` and no rule contains a `drop` or `reject`
+verb (the only matches are the words inside counter comments — checked).
+Every named counter in it corresponds to exactly one DROP that the P2
+forward lockdown or P3 input lockdown will introduce.
+
+```
+nft -f gsfw-observe.nft                     # observe only, cannot drop
+install -m 0755 gsfw-observe /usr/local/sbin/
+systemctl enable --now gsfw-observe.timer   # hourly samples
+# ... 24 hours later ...
+gsfw-observe summary                        # markdown review + GO/NO-GO
+```
+
+The summary is deliberately hard to pass:
+
+- a counter the lockdown is **meant** to stop reads `expected`
+- any **other** non-zero counter reads `UNEXPECTED` and forces NO-GO —
+  finding the unpredicted flows is the whole point of the window
+- a counter that **must** be in use (cameras' NTP) reading zero also
+  forces NO-GO: more likely the window did not see it than that nothing
+  needs it
+- **no samples at all is NO-GO**, not a pass. An empty set is evidence
+  nothing was *watched*, not that nothing *happened* — a distinction
+  this project has got wrong before
+- a window shorter than 23h is NO-GO, because partial observation reads
+  as "nothing unexpected" for the hours it did not watch
+
+`snapshot` is append-only and never interprets; `summary` interprets and
+never writes to the samples. A summary that could rewrite its own inputs
+cannot be audited.

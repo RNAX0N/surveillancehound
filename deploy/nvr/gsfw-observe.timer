@@ -1,0 +1,13 @@
+[Unit]
+Description=Hourly sampling of the P1 observation counters
+
+[Timer]
+OnActiveSec=1min
+OnUnitActiveSec=1h
+# Persistent so a reboot mid-window does not silently lose hours. The
+# summary refuses GO on a short window, so a gap is reported rather than
+# averaged away.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

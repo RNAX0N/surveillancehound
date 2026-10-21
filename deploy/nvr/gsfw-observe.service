@@ -1,0 +1,7 @@
+[Unit]
+Description=Sample the P1 observation counters
+Documentation=file:///usr/local/share/gsfw/README
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gsfw-observe snapshot
