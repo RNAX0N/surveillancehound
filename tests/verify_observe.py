@@ -146,8 +146,13 @@ check("resolution is the widest sample gap",
 print("\nBusyBox backoff vs. a dead camera")
 
 
-def judge(vals: list[int], events=None, egress=None, name="in_ntp_106"):
+def judge(vals: list[int], events=None, egress=None, name="in_ntp_106",
+          chrony: list[dict] | None = None):
     s = build(len(vals), {name: vals})
+    if chrony is not None:
+        cam = G.camera_of(name)
+        for row, c in zip(s, chrony):
+            row["chrony"] = {cam: c} if c else {}
     blockers: list[str] = []
     confirm: list[str] = []
     tot = next((v for v in reversed(vals) if v is not None), 0)
@@ -155,6 +160,18 @@ def judge(vals: list[int], events=None, egress=None, name="in_ntp_106"):
                                events or [], egress or {},
                                blockers, confirm)
     return cell, blockers, confirm, detail
+
+
+def chrony_series(n: int, ntp_start: int, ntp_end: int,
+                  drop: int = 0, last_s: float = 120.0) -> list[dict]:
+    """A chrony reading per sample, counts rising linearly."""
+    out = []
+    for i in range(n):
+        frac = i / max(1, n - 1)
+        out.append({"ntp": int(ntp_start + (ntp_end - ntp_start) * frac),
+                    "drop": drop if i else 0,
+                    "interval": "12", "last_s": last_s})
+    return out
 
 
 # One poll per ~64 min: 4 samples + a bit. Healthy on our firmware.
@@ -275,6 +292,91 @@ check("a silent camera that IS leaving the segment still blocks",
       bool(blockers))
 check("...and names P2 as what would cut it",
       any("off-segment" in b and "P2" in b for b in blockers), str(blockers))
+
+
+# --------------------------------------------------------------------
+# 4b. chrony as the independent witness
+# --------------------------------------------------------------------
+print("\nchrony cross-check")
+
+# The counter says nothing; chrony says it served 21 requests. The
+# camera is fine and the COUNTER RULE is wrong — a tool reading only
+# its own counters cannot reach that conclusion about itself.
+cell, blockers, _, _ = judge([0] * DAY, chrony=chrony_series(DAY, 100, 121))
+check("counter silent but chrony served it blocks on the RULE",
+      "RULE WRONG" in cell, cell)
+check("...and says the window's other readings are suspect too",
+      any("every other silent reading" in b for b in blockers), str(blockers))
+
+# chrony refusing is the opposite fault with the opposite fix.
+cell, blockers, _, _ = judge(backed_off(DAY, 4),
+                             chrony=chrony_series(DAY, 100, 121, drop=9))
+check("chrony dropping requests blocks, even with the counter healthy",
+      "refusing" in cell, cell)
+check("...and says it is not a firewall problem",
+      any("not a firewall problem" in b for b in blockers), str(blockers))
+
+# Both agree the camera is silent: a stronger statement than either.
+cell, blockers, _, _ = judge([0] * DAY, chrony=chrony_series(DAY, 100, 100))
+check("both silent blocks on the camera", "UNEXPECTED — silent" in cell, cell)
+check("...and says so is corroborated",
+      any("chrony independently served it nothing" in b for b in blockers),
+      str(blockers))
+
+# No chrony data at all: the verdict must say what it is resting on.
+cell, blockers, _, _ = judge([0] * DAY)
+check("with no chrony data the blocker admits it stands alone",
+      any("rests on the counter alone" in b for b in blockers), str(blockers))
+
+# chronyd restarting resets its tallies; a negative delta must not be
+# read as a count, in either direction.
+restart = chrony_series(DAY, 500, 520)
+for i in range(DAY // 2, DAY):
+    restart[i] = dict(restart[i], ntp=restart[i]["ntp"] - 500)
+cell, blockers, _, detail = judge([0] * DAY, chrony=restart)
+check("a chronyd restart is not read as a request count",
+      "RULE WRONG" not in cell, cell)
+check("...and is called out in the detail",
+      "restarted" in detail, detail)
+check("...leaving the corroboration unclaimed",
+      not any("independently served it nothing" in b for b in blockers))
+
+# Parsed against REAL `chronyc -n clients` output from the NVR, because
+# a column index guessed from the man page is the kind of thing that
+# reads plausibly and is silently off by one.
+REAL_CHRONYC = """Hostname                      NTP   Drop Int IntL Last     Cmd   Drop Int  Last
+===============================================================================
+117.111.108.2                 753      0   6   -    57       0      0   -     -
+117.111.106.2                  23      0  12   -   65m       0      0   -     -
+172.19.0.2                      4      0   6   -    12       0      0   -     -
+"""
+
+
+class _FakeRun:
+    def __init__(self, text, rc=0):
+        self.stdout, self.returncode, self.stderr = text, rc, ""
+
+
+_real_run = G.subprocess.run
+G.subprocess.run = lambda *a, **k: _FakeRun(REAL_CHRONYC)
+parsed = G.read_chrony()
+G.subprocess.run = lambda *a, **k: _FakeRun("", rc=1)
+absent = G.read_chrony()
+G.subprocess.run = _real_run
+
+check("real chronyc output parses", set(parsed) == {"108", "106"}, str(parsed))
+check("...request counts land in the right column",
+      parsed["108"]["ntp"] == 753 and parsed["106"]["ntp"] == 23, str(parsed))
+check("...drops land in the right column",
+      parsed["106"]["drop"] == 0 and parsed["106"]["interval"] == "12")
+check("...and the age is converted", parsed["106"]["last_s"] == 3900)
+check("non-camera clients are ignored", "19" not in parsed)
+check("chrony being unavailable is empty, not an error", absent == {})
+
+check("chrony ages parse bare seconds", G._chrony_age("57") == 57)
+check("chrony ages parse minutes", G._chrony_age("65m") == 3900)
+check("chrony ages parse hours", G._chrony_age("3h") == 10800)
+check("chrony ages tolerate '-'", G._chrony_age("-") is None)
 
 
 # --------------------------------------------------------------------

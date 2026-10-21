@@ -135,6 +135,53 @@ def read_counters() -> dict[str, dict]:
     return out
 
 
+def read_chrony() -> dict[str, dict]:
+    """What chrony itself says about each camera, keyed by VLAN.
+
+    A firewall counter answers "did a packet arrive". It cannot say
+    whether the SERVER answered, and the two blockers this tool can
+    raise on a silent camera — "it is not asking" and "chrony is
+    refusing it" — have opposite fixes. chrony has both facts already:
+    a request count, and a Drop count.
+
+    It also guards the tool against itself. If the counter is zero and
+    chrony recorded requests in the same period, the camera is fine and
+    the COUNTER RULE is wrong — a possibility a tool that only reads its
+    own counters cannot entertain about itself.
+
+    Absent or unparseable chrony is not an error. It downgrades the
+    verdict to what the counters alone can support, which is where this
+    tool started.
+    """
+    p = subprocess.run(("chronyc", "-n", "clients"),
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return {}
+    out: dict[str, dict] = {}
+    for ln in (p.stdout or "").splitlines():
+        f = ln.split()
+        if len(f) < 6 or not re.fullmatch(r"117\.111\.(1\d\d)\.\d+", f[0]):
+            continue
+        cam = f[0].split(".")[2]
+        try:
+            out[cam] = {"ntp": int(f[1]), "drop": int(f[2]),
+                        "interval": f[3], "last_s": _chrony_age(f[5])}
+        except ValueError:
+            continue
+    return out
+
+
+def _chrony_age(tok: str) -> float | None:
+    """chronyc prints an age as bare seconds, or with m/h/d."""
+    if tok in ("-", ""):
+        return None
+    mult = {"m": 60, "h": 3600, "d": 86400}.get(tok[-1])
+    try:
+        return float(tok[:-1]) * mult if mult else float(tok)
+    except ValueError:
+        return None
+
+
 def cmd_event(text: str) -> int:
     """Record a maintenance event, so a counter anomaly can be attributed.
 
@@ -289,7 +336,8 @@ def span_str(span: tuple[float, float] | None) -> str:
 
 def cmd_snapshot() -> int:
     os.makedirs(os.path.dirname(SAMPLES), exist_ok=True)
-    row = {"ts": time.time(), "counters": read_counters()}
+    row = {"ts": time.time(), "counters": read_counters(),
+           "chrony": read_chrony()}
     with open(SAMPLES, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, sort_keys=True) + "\n")
     print(f"gsfw-observe: sampled {len(row['counters'])} counters")
@@ -377,6 +425,35 @@ LOG_TAG = {
 }
 
 
+def chrony_window(samples: list[dict], cam: str | None) -> dict | None:
+    """chrony's own view of this camera across the window.
+
+    `requests` is a delta between the first and last samples that carry
+    chrony data, not a total, so it covers the same period the counter
+    does. A negative delta means chronyd restarted and its tallies went
+    back to zero; that is reported as unknown rather than as a negative
+    count, because a restart is exactly when a wrong number would be
+    most convincing.
+    """
+    if not cam:
+        return None
+    rows = [(r["ts"], r["chrony"][cam]) for r in samples
+            if isinstance(r.get("chrony"), dict) and cam in r["chrony"]]
+    if not rows:
+        return None
+    (_, first), (_, last) = rows[0], rows[-1]
+    req = last["ntp"] - first["ntp"]
+    drop = last["drop"] - first["drop"]
+    return {
+        "requests": None if req < 0 else req,
+        "drops": None if drop < 0 else drop,
+        "restarted": req < 0 or drop < 0,
+        "last_s": last.get("last_s"),
+        "interval": last.get("interval"),
+        "samples": len(rows),
+    }
+
+
 def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
               events: list[dict], egress: dict[str, int],
               blockers: list[str], confirm: list[str]) -> tuple[str, str]:
@@ -398,11 +475,47 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
     if unknown:
         detail += f", {unknown} interval(s) before this counter existed"
 
+    ch = chrony_window(samples, cam)
+    if ch:
+        bits = []
+        if ch["requests"] is not None:
+            bits.append(f"{ch['requests']} requests")
+        if ch["drops"]:
+            bits.append(f"**{ch['drops']} DROPPED**")
+        if ch["last_s"] is not None:
+            bits.append(f"last {ch['last_s'] / 60:.0f} min ago")
+        if ch["interval"] and ch["interval"] != "-":
+            bits.append(f"poll 2^{ch['interval']}s")
+        if ch["restarted"]:
+            bits.append("chronyd restarted, deltas unusable")
+        if bits:
+            detail += " — chrony: " + ", ".join(bits)
+
     why_else = ""
     if cam and egress.get(cam):
         why_else = (f" It was also logged leaving its segment "
                     f"{egress[cam]}x, so it may be getting the time "
                     f"off-segment — which is the traffic P2 cuts.")
+
+    # chrony is the independent witness. Where it contradicts the
+    # counter, the counter is the thing in doubt: chrony is the service
+    # we are trying to protect, and this tool is the new code.
+    if ch and ch["requests"] and tot == 0:
+        blockers.append(
+            f"`{name}` counted nothing, but chrony served {ch['requests']} "
+            f"requests from this camera over the same period. The camera is "
+            f"fine; the COUNTER is not seeing its traffic. Fix the rule "
+            f"before reading any verdict out of this window — every other "
+            f"silent reading here is suspect for the same reason.")
+        return "**RULE WRONG — chrony saw it**", detail
+    if ch and ch["drops"]:
+        blockers.append(
+            f"`{name}`: chrony REFUSED {ch['drops']} requests from this "
+            f"camera. This is the camera-12 failure, and it is a live one: "
+            f"the camera is asking and not being served. Fix the chrony "
+            f"allow list; it is not a firewall problem and P2/P3 will not "
+            f"change it either way.")
+        return "**chrony refusing**", detail
 
     if tot == 0:
         # Zero is judged on the SAME clock as a gap, not on its own. A
@@ -430,11 +543,21 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
                 + "; ".join(f'"{e["text"]}"' for e in rel[:2])
                 + f". Confirm it is back and syncing before P2/P3.{why_else}")
             return "**silent — maintenance?**", detail
+        if ch and ch["requests"] == 0 and not ch["restarted"]:
+            corroborated = (" chrony independently served it nothing in the "
+                            "same period, so this is the camera, not the "
+                            "counter: it is not asking the NVR for time at "
+                            "all, and something else is setting its clock.")
+        elif ch:
+            corroborated = ""
+        else:
+            corroborated = (" chrony was not readable, so this rests on the "
+                            "counter alone — check `chronyc -n clients` "
+                            "before acting on it.")
         blockers.append(
             f"`{name}` saw no NTP in {mins:.0f} min of proven silence. That "
-            f"is past backoff — BusyBox ntpd still asks once per ~68 min. "
-            f"Either this camera is not using the NVR for time, or chrony "
-            f"is refusing it.{why_else}")
+            f"is past backoff — BusyBox ntpd still asks once per ~68 min."
+            f"{corroborated}{why_else}")
         return "**UNEXPECTED — silent**", detail
 
     if gap >= NTP_GAP_FAIL_S:

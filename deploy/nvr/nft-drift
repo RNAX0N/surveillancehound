@@ -25,6 +25,7 @@ Stdlib only, no daemon, safe to run from cron or a systemd timer.
 """
 from __future__ import annotations
 
+import collections
 import os
 import re
 import subprocess
@@ -35,8 +36,16 @@ NS = f"nftdrift{os.getpid()}"
 
 # Counters differ by construction (the namespace render has never seen a
 # packet) and handles are allocation order. Neither is drift.
+#
+# Two shapes, and missing the second one made this tool useless: an
+# inline rule counter reads `counter packets N bytes M`, but a NAMED
+# counter object puts its totals on their own line inside the braces.
+# The observe table is 44 named counters, so every drift report was a
+# wall of packet totals and a real change would have been lost in it. A
+# check that cries wolf on every incremented counter does not get read.
 _NOISE = (
     (re.compile(r"counter packets \d+ bytes \d+"), "counter"),
+    (re.compile(r"^(\s*)packets \d+ bytes \d+\s*$"), r"\1packets N bytes N"),
     (re.compile(r" # handle \d+"), ""),
     (re.compile(r"[ \t]+$"), ""),
 )
@@ -94,8 +103,13 @@ def main() -> int:
             a, b = normalise(want), normalise(live)
             if a == b:
                 continue
-            only_cfg = [x for x in a if x not in b]
-            only_live = [x for x in b if x not in a]
+            # Multiset, not membership: `x not in b` hides a line that
+            # exists once in the config and three times live, which is
+            # precisely what a duplicated rule looks like.
+            only_cfg = list((collections.Counter(a)
+                             - collections.Counter(b)).elements())
+            only_live = list((collections.Counter(b)
+                              - collections.Counter(a)).elements())
             problems.append(f"  table {family} {name}:")
             for x in only_cfg:
                 problems.append(f"    in config, not live : {x.strip()}")
