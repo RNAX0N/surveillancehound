@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+"""nft-drift — does the LIVE ruleset match what the config file says?
+
+The problem this exists for: a firewall has two states that can silently
+disagree. A rule added live and never written to the config is lost at
+the next reload, reboot or `docker restart`. A rule written to the config
+but never applied means you believe you are protected and are not. Both
+are silent, and the second one is already true on this host — the
+hardening keys in /etc/sysctl.conf were never applied, which is why
+rp_filter reads 0.
+
+Neither `nft -c -f` nor `nft list ruleset` can tell you about either:
+the first says the file parses, the second says what is loaded. Nobody
+compares them.
+
+So: render the config in a THROWAWAY NETWORK NAMESPACE, which has its
+own empty nftables, and diff it against live. The namespace means the
+render is free of consequences — no flush, no reload, nothing touched.
+Only tables the config itself defines are compared, so Docker's
+iptables-nft tables are ignored rather than reported as drift forever.
+
+    nft-drift [config]        exit 0 = in sync, 1 = drift, 2 = error
+
+Stdlib only, no daemon, safe to run from cron or a systemd timer.
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+
+CONF = sys.argv[1] if len(sys.argv) > 1 else "/etc/nftables.conf"
+NS = f"nftdrift{os.getpid()}"
+
+# Counters differ by construction (the namespace render has never seen a
+# packet) and handles are allocation order. Neither is drift.
+_NOISE = (
+    (re.compile(r"counter packets \d+ bytes \d+"), "counter"),
+    (re.compile(r" # handle \d+"), ""),
+    (re.compile(r"[ \t]+$"), ""),
+)
+
+
+def sh(*argv: str) -> tuple[int, str]:
+    p = subprocess.run(argv, capture_output=True, text=True)
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def normalise(text: str) -> list[str]:
+    out = []
+    for line in text.splitlines():
+        for rx, repl in _NOISE:
+            line = rx.sub(repl, line)
+        if line.strip():
+            out.append(line.rstrip())
+    return out
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        print("nft-drift: must run as root", file=sys.stderr)
+        return 2
+    if not os.path.isfile(CONF):
+        print(f"nft-drift: no such config: {CONF}", file=sys.stderr)
+        return 2
+
+    rc, _ = sh("ip", "netns", "add", NS)
+    if rc != 0:
+        print(f"nft-drift: could not create namespace {NS}", file=sys.stderr)
+        return 2
+    try:
+        rc, err = sh("ip", "netns", "exec", NS, "nft", "-f", CONF)
+        if rc != 0:
+            # The config does not even load cleanly into an empty ruleset.
+            # That is worse than drift and must not be reported as "in sync".
+            print("DRIFT: the config does not apply to an empty ruleset:")
+            print("  " + err.strip().replace("\n", "\n  "))
+            return 1
+
+        rc, tables = sh("ip", "netns", "exec", NS, "nft", "list", "tables")
+        wanted = [ln.split() for ln in tables.splitlines() if ln.startswith("table ")]
+
+        problems = []
+        for _, family, name in wanted:
+            rc_ns, want = sh("ip", "netns", "exec", NS,
+                             "nft", "list", "table", family, name)
+            rc_live, live = sh("nft", "list", "table", family, name)
+            if rc_live != 0:
+                problems.append(
+                    f"  table {family} {name}: in the config, NOT LOADED. "
+                    f"Anything it protects is unprotected right now.")
+                continue
+            a, b = normalise(want), normalise(live)
+            if a == b:
+                continue
+            only_cfg = [x for x in a if x not in b]
+            only_live = [x for x in b if x not in a]
+            problems.append(f"  table {family} {name}:")
+            for x in only_cfg:
+                problems.append(f"    in config, not live : {x.strip()}")
+            for x in only_live:
+                problems.append(
+                    f"    LIVE ONLY, will be LOST on reload/reboot: {x.strip()}")
+
+        if problems:
+            print("DRIFT between /etc/nftables.conf and the live ruleset:")
+            print("\n".join(problems))
+            print("\nA live-only rule disappears at the next reload, reboot or")
+            print("`docker restart`. A config-only rule is not protecting you.")
+            return 1
+
+        names = ", ".join(f"{f} {n}" for _, f, n in wanted) or "(none)"
+        print(f"in sync: {len(wanted)} table(s) match the config [{names}]")
+        return 0
+    finally:
+        sh("ip", "netns", "del", NS)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
