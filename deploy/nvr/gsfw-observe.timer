@@ -1,9 +1,15 @@
 [Unit]
-Description=Hourly sampling of the P1 observation counters
+Description=Periodic sampling of the P1 observation counters
 
 [Timer]
 OnActiveSec=1min
-OnUnitActiveSec=1h
+# 15 minutes, not hourly. The summary judges a camera's time sync by the
+# longest span its counter PROVABLY did not move, and it cannot resolve a
+# silence shorter than the sampling interval. Hourly sampling could not
+# tell a 70-minute gap (past BusyBox ntpd's MAXPOLL, suspicious) from a
+# two-hour one (a camera that stopped asking) — the exact distinction the
+# window exists to make. One `nft -j list` every 15 min is free.
+OnUnitActiveSec=15min
 # Persistent so a reboot mid-window does not silently lose hours. The
 # summary refuses GO on a short window, so a gap is reported rather than
 # averaged away.

@@ -6,8 +6,9 @@ counter in it corresponds to exactly one DROP that the P2/P3 lockdown
 will introduce. This tool turns 24 hours of those counters into a
 decision.
 
-    gsfw-observe snapshot     # hourly, from a timer: append one sample
+    gsfw-observe snapshot     # every 15 min, from a timer: one sample
     gsfw-observe summary      # at T+24h: the review, as markdown
+    gsfw-observe event "..."  # note maintenance, so a flatline is read right
 
 `snapshot` is append-only and never interprets. `summary` interprets and
 never writes to the samples. Keeping them apart matters: a summary that
@@ -20,6 +21,14 @@ nobody predicted. The tool will not return GO while any unexpected
 class is non-zero, and it will not return GO on an empty sample set
 either — no observation is not the same as nothing happening, which is
 the mistake this project has made more than once.
+
+Counters that must STAY permitted (per-camera NTP) are judged on
+continuity rather than total, because the cameras run two different NTP
+clients whose healthy packet counts differ by two orders of magnitude.
+See the threshold block below.
+
+Exit status: 0 GO, 1 NO-GO, 2 HOLD (needs the operator to confirm
+something observation cannot settle on its own).
 """
 from __future__ import annotations
 
@@ -34,6 +43,36 @@ SAMPLES = "/var/log/gsfw-observe/samples.jsonl"
 EVENTS = "/var/log/gsfw-observe/events.jsonl"
 TABLE = ("inet", "gsfw")
 CAMERAS = range(101, 113)
+
+# --- how NTP liveness is judged, and why not by packet count ----------
+#
+# BusyBox 1.36.1 ntpd — what our own firmware runs — backs OFF once it is
+# stably synced: MINPOLL 32s, BIGPOLL ~8.5min, MAXPOLL ~68min (ntpd.c).
+# Vendor-firmware cameras poll every ~23s. So the same TOTAL is healthy
+# for one and alarming for the other, and over a short window a perfectly
+# healthy backed-off camera reads as zero.
+#
+# A total therefore cannot answer the question. CONTINUITY can, and it
+# answers it the same way for both firmwares: a camera that is keeping
+# time asks again before MAXPOLL elapses, whatever its poll floor. So we
+# measure the longest span in which a counter PROVABLY did not move.
+#
+# Thresholds from the camera-firmware session, 2026-10-21. Their stated
+# pass bar — "at least ~20 polls/24h, no gap longer than ~70min" — is the
+# same test: 20 polls across 24h is unreachable without a gap over 70min,
+# so the gap check subsumes the count check and we do not run both (two
+# tests for one property double-report a single fault).
+NTP_GAP_WARN_S = 70 * 60      # past MAXPOLL: ask, do not assume
+NTP_GAP_FAIL_S = 2 * 3600     # their "0 packets across 2h is a real problem"
+
+# Counters whose silence is already explained. Listed so the window does
+# not stall on a known-absent camera — but these still print and still
+# ask for confirmation, because "we knew about that one" is exactly how a
+# real regression gets waved through.
+EXPECTED_SILENT = {
+    "in_ntp_112": "camera 12 is not deployed yet; chrony was opened for "
+                  "it in P0 so that it works when it arrives.",
+}
 
 # How each counter is judged. Per-camera counters are matched by shape,
 # so adding camera 13 needs no change here.
@@ -131,12 +170,20 @@ def load_events() -> list[dict]:
     return sorted(out, key=lambda r: r["ts"])
 
 
-def events_mentioning(events: list[dict], cam: str | None) -> list[dict]:
+def events_mentioning(events: list[dict], cam: str | None,
+                      span: tuple[float, float] | None = None) -> list[dict]:
     """Events that plausibly explain an anomaly on this camera.
 
     Matched loosely on purpose — "C6", "camera 6", "117.111.106.2" and
     "106" should all hit. A missed match costs a false blocker, which is
     the safe direction: it asks a human instead of excusing itself.
+
+    With `span`, also require the event to be near the anomaly in TIME.
+    Without that, one "C6 down for reflash" at hour 2 would excuse a C6
+    outage at hour 20 — the window runs alongside a firmware campaign, so
+    every camera will eventually have an event with its name on it, and a
+    name-only match would end up excusing everything exactly once the log
+    is full enough to be useless.
     """
     if not cam:
         return []
@@ -145,9 +192,87 @@ def events_mentioning(events: list[dict], cam: str | None) -> list[dict]:
     hits = []
     for e in events:
         low = e["text"].lower()
-        if any(pt in low for pt in pats):
-            hits.append(e)
+        if not any(pt in low for pt in pats):
+            continue
+        if span is not None:
+            # An event explains a silence if it lands inside it, or in the
+            # half hour before it — "taking C6 down now" is written just
+            # before the counter flatlines, not during.
+            start, end = span
+            if not (start - 1800 <= e["ts"] <= end):
+                continue
+        hits.append(e)
     return hits
+
+
+def silence_spans(samples: list[dict], name: str
+                  ) -> tuple[list[tuple[float, float]], int, int]:
+    """Spans in which `name` PROVABLY did not move, plus counts of the
+    intervals we cannot speak for.
+
+    Only intervals bounded by two readings count. If the counter rose
+    between two samples, at least one packet arrived in between; if it
+    held, nothing arrived for that whole interval. Consecutive held
+    intervals merge, so the span returned is a LOWER bound on the real
+    silence — never an inflated one.
+
+    A DECREASE means the table was replaced and the counters restarted.
+    That interval is unknowable, so it ends the run rather than extending
+    it, and is counted and reported: a reload that quietly shortened
+    every gap would otherwise turn a NO-GO into a GO.
+    """
+    spans: list[tuple[float, float]] = []
+    resets = unknown = 0
+    run_start: float | None = None
+    prev = None
+    for cur in samples:
+        if prev is not None:
+            a = prev["counters"].get(name)
+            b = cur["counters"].get(name)
+            if a is None or b is None:
+                unknown += 1
+                stop = True
+            elif b["packets"] < a["packets"]:
+                resets += 1
+                stop = True
+            elif b["packets"] > a["packets"]:
+                stop = True
+            else:
+                stop = False
+                if run_start is None:
+                    run_start = prev["ts"]
+            if stop and run_start is not None:
+                spans.append((run_start, prev["ts"]))
+                run_start = None
+        prev = cur
+    if run_start is not None and prev is not None:
+        spans.append((run_start, prev["ts"]))
+    return spans, resets, unknown
+
+
+def longest_span(spans: list[tuple[float, float]]
+                 ) -> tuple[float, tuple[float, float] | None]:
+    if not spans:
+        return 0.0, None
+    best = max(spans, key=lambda s: s[1] - s[0])
+    return best[1] - best[0], best
+
+
+def sample_resolution(samples: list[dict]) -> float:
+    """The widest gap between consecutive samples. A silence shorter than
+    this cannot be seen at all, so the summary states it rather than
+    implying a precision the sampling does not have."""
+    if len(samples) < 2:
+        return 0.0
+    return max(b["ts"] - a["ts"] for a, b in zip(samples, samples[1:]))
+
+
+def span_str(span: tuple[float, float] | None) -> str:
+    if not span:
+        return ""
+    f = time.strftime("%m-%d %H:%M", time.localtime(span[0]))
+    t = time.strftime("%H:%M", time.localtime(span[1]))
+    return f"{f}–{t}"
 
 
 def cmd_snapshot() -> int:
@@ -174,14 +299,47 @@ def load_samples() -> list[dict]:
     return sorted(out, key=lambda r: r["ts"])
 
 
+_JOURNAL: list[str] | None = None
+
+
+def journal_lines() -> list[str]:
+    """The kernel log for the window, read ONCE. Every would-block class
+    scans it, and re-running journalctl per class made the summary slower
+    than the thing it was reporting on."""
+    global _JOURNAL
+    if _JOURNAL is None:
+        p = subprocess.run(
+            ("journalctl", "-k", "--no-pager", "-o", "cat", "--since", "-25h"),
+            capture_output=True, text=True)
+        _JOURNAL = (p.stdout or "").splitlines()
+    return _JOURNAL
+
+
+def egress_by_camera() -> dict[str, int]:
+    """Cameras seen trying to leave their segment, by VLAN, from the
+    cam-egress log lines.
+
+    This is the correlation that makes a silent NTP counter actionable.
+    A camera with no NTP to the NVR but plenty of egress is not idle — it
+    is getting the time from somewhere else, and P2 is the change that
+    would cut it off. Aggregate counters cannot pair those two facts; the
+    log lines carry the source address, so they can.
+    """
+    out: dict[str, int] = {}
+    for ln in journal_lines():
+        if "gsfw-wouldblock cam-egress" not in ln:
+            continue
+        m = re.search(r"SRC=117\.111\.(1\d\d)\.", ln)
+        if m:
+            out[m.group(1)] = out.get(m.group(1), 0) + 1
+    return out
+
+
 def journal_examples(prefix_tag: str, limit: int = 4) -> list[str]:
     """A few real log lines per class, so the summary names actual hosts
     rather than only counts."""
-    p = subprocess.run(
-        ("journalctl", "-k", "--no-pager", "-o", "cat", "--since", "-25h"),
-        capture_output=True, text=True)
     hits, seen = [], set()
-    for ln in (p.stdout or "").splitlines():
+    for ln in journal_lines():
         if f"gsfw-wouldblock {prefix_tag}" not in ln:
             continue
         m = re.search(r"SRC=(\S+).*?DST=(\S+)(?:.*?DPT=(\d+))?", ln)
@@ -205,6 +363,78 @@ LOG_TAG = {
     "fwd_wg_initiated": "wg-initiated", "fwd_other": "other-forward",
     "in_cam_other": "cam-to-nvr", "in_mgmt_offlan": "mgmt-not-lan",
 }
+
+
+def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
+              events: list[dict], egress: dict[str, int],
+              blockers: list[str], confirm: list[str]) -> tuple[str, str]:
+    """Verdict for one camera's NTP counter, judged on continuity.
+
+    Returns (table cell, detail line). Appends to `blockers`/`confirm`
+    in place — the caller owns the overall GO/HOLD/NO-GO decision and
+    this function must not be able to reach past its own camera.
+    """
+    spans, resets, unknown = silence_spans(samples, name)
+    gap, worst = longest_span(spans)
+    mins = gap / 60.0
+    detail = (f"`{name}`: {tot} polls, longest proven silence "
+              f"**{mins:.0f} min**" + (f" ({span_str(worst)})" if worst else ""))
+    if resets:
+        detail += f", {resets} counter reset(s) not judged"
+    if unknown:
+        detail += f", {unknown} interval(s) with no reading"
+
+    why_else = ""
+    if cam and egress.get(cam):
+        why_else = (f" It was also logged leaving its segment "
+                    f"{egress[cam]}x, so it may be getting the time "
+                    f"off-segment — which is the traffic P2 cuts.")
+
+    if tot == 0:
+        if name in EXPECTED_SILENT:
+            confirm.append(f"`{name}` saw no NTP at all. Known: "
+                           f"{EXPECTED_SILENT[name]} Confirm this is still "
+                           f"true before P2/P3.{why_else}")
+            return "**silent — known**", detail
+        rel = events_mentioning(events, cam)
+        if rel:
+            confirm.append(
+                f"`{name}` saw no NTP at all, and an event mentions this "
+                "camera: " + "; ".join(f'"{e["text"]}"' for e in rel[:2])
+                + f". Confirm it is back and syncing before P2/P3.{why_else}")
+            return "**silent — maintenance?**", detail
+        blockers.append(
+            f"`{name}` saw no NTP for the whole window. That is not poll "
+            f"backoff — BusyBox ntpd still asks once per ~68 min. Either "
+            f"this camera is not using the NVR for time, or chrony is "
+            f"refusing it.{why_else}")
+        return "**UNEXPECTED — silent**", detail
+
+    if gap >= NTP_GAP_FAIL_S:
+        rel = events_mentioning(events, cam, worst)
+        if rel:
+            confirm.append(
+                f"`{name}` went {mins:.0f} min without a poll "
+                f"({span_str(worst)}), and an event covers that span: "
+                + "; ".join(f'"{e["text"]}"' for e in rel[:2])
+                + ". Confirm the camera came back and resumed syncing.")
+            return f"**{mins:.0f}min gap — maintenance?**", detail
+        blockers.append(
+            f"`{name}` went {mins:.0f} min without a single poll "
+            f"({span_str(worst)}) and no maintenance event covers it. "
+            f"Past 2h this is not backoff; the camera stopped asking."
+            f"{why_else}")
+        return f"**UNEXPECTED — {mins:.0f}min gap**", detail
+
+    if gap >= NTP_GAP_WARN_S:
+        confirm.append(
+            f"`{name}` went {mins:.0f} min without a poll "
+            f"({span_str(worst)}), past BusyBox ntpd's ~68 min MAXPOLL but "
+            f"under the 2h failure bar. Likely a slow sample landing either "
+            f"side of one poll; worth a glance, not a blocker.")
+        return f"{mins:.0f}min gap", detail
+
+    return "in use", detail
 
 
 def cmd_summary() -> int:
@@ -232,7 +462,9 @@ def cmd_summary() -> int:
     print("| class | packets | first seen | last seen | verdict |")
     print("|---|---:|---|---|---|")
     blockers, findings, confirm = [], [], []
+    ntp_detail: list[str] = []
     events = load_events()
+    egress = egress_by_camera()
     for n in names:
         tot = last["counters"].get(n, {}).get("packets", 0)
         firsts = next((r for r in s if r["counters"].get(n, {}).get("packets", 0)), None)
@@ -243,23 +475,11 @@ def cmd_summary() -> int:
         kind = classify(n)
         cam = camera_of(n)
 
-        if kind == "must_be_used" and tot == 0:
-            rel = events_mentioning(events, cam)
-            if rel:
-                verdict = "**zero — maintenance?**"
-                confirm.append(
-                    f"`{n}` is zero. A recorded event may explain it: "
-                    + "; ".join(f'"{e["text"]}"' for e in rel[:2])
-                    + ". Confirm the camera is back and serving before P3.")
-            else:
-                verdict = "**UNEXPECTED — silent**"
-                blockers.append(
-                    f"`{n}` is zero and no maintenance event mentions this "
-                    f"camera. Either it is not asking the NVR for time, or "
-                    f"chrony is refusing it — the camera-12 case. Enforcing "
-                    f"P3 could cut a working service.")
-        elif kind == "must_be_used":
-            verdict = "expected (in use)"
+        if kind == "must_be_used":
+            verdict, note = judge_ntp(n, cam, tot, s, events, egress,
+                                      blockers, confirm)
+            if note:
+                ntp_detail.append(note)
         elif tot == 0:
             verdict = "clear"
         elif kind == "expected_block":
@@ -282,6 +502,19 @@ def cmd_summary() -> int:
                     f"dropped these and nobody predicted them. Resolve "
                     f"before P2.")
         print(f"| `{n}` | {tot} | {fs} | {ls} | {verdict} |")
+
+    if ntp_detail:
+        res = sample_resolution(s) / 60.0
+        print("\n### Per-camera time sync (judged on continuity, not count)\n")
+        print(f"Sampling resolves silences no finer than **{res:.0f} min**; "
+              f"every figure below is a proven lower bound.")
+        if res * 60 >= NTP_GAP_FAIL_S:
+            print("\n> **Sampling is coarser than the 2h failure bar**, so a "
+                  "gap at that bar cannot be told from one twice its size. "
+                  "Tighten the timer before trusting a GO here.")
+        print()
+        for d in ntp_detail:
+            print(f"- {d}")
 
     if events:
         print("\n### Maintenance events recorded during the window\n")
