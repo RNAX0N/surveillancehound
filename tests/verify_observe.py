@@ -183,6 +183,25 @@ check("a wholly silent camera is a blocker", "silent" in cell, cell)
 check("...and rules out backoff explicitly",
       any("backoff" in b for b in blockers), str(blockers))
 
+# Zero is judged on the same clock as a gap. Forty-six minutes of zero
+# is not evidence of anything — a backed-off camera would not have
+# spoken yet — and blocking on it is the easier mistake to make,
+# because zero looks damning.
+cell, blockers, confirm, _ = judge([0] * 4)       # 45 min of samples
+check("a short run of zeros is not a finding", not blockers, str(blockers))
+check("...and says so rather than passing it", cell == "no verdict yet", cell)
+check("...naming the backoff it cannot yet rule out",
+      any("backoff" in c for c in confirm), str(confirm))
+
+# A counter added partway through has been watched for less time than
+# the window has run, and must not borrow the window's evidence.
+late = [None] * (DAY - 3) + [0, 0, 0]
+cell, blockers, confirm, detail = judge(late)
+check("a counter added late does not block on the window's length",
+      not blockers, str(blockers))
+check("...and reports what it was actually watched for",
+      "**30 min** watched" in detail, detail)
+
 # Just past MAXPOLL but under 2h: ask, do not block.
 vals = backed_off(DAY, 4)
 for i in range(20, 25):            # freeze 5 samples = 75 min

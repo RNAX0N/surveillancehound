@@ -250,6 +250,18 @@ def silence_spans(samples: list[dict], name: str
     return spans, resets, unknown
 
 
+def observed_span(samples: list[dict], name: str) -> float:
+    """How long this counter has existed in the samples at all.
+
+    Not the same as the window. Counters added mid-window — the table was
+    replaced to split NTP per camera — have been watched for far less
+    time than the window has run, and a verdict that does not say so
+    claims 24 hours of evidence it does not have.
+    """
+    present = [r["ts"] for r in samples if name in r["counters"]]
+    return (present[-1] - present[0]) if len(present) > 1 else 0.0
+
+
 def longest_span(spans: list[tuple[float, float]]
                  ) -> tuple[float, tuple[float, float] | None]:
     if not spans:
@@ -377,12 +389,14 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
     spans, resets, unknown = silence_spans(samples, name)
     gap, worst = longest_span(spans)
     mins = gap / 60.0
-    detail = (f"`{name}`: {tot} polls, longest proven silence "
-              f"**{mins:.0f} min**" + (f" ({span_str(worst)})" if worst else ""))
+    obs = observed_span(samples, name) / 60.0
+    detail = (f"`{name}`: {tot} polls over **{obs:.0f} min** watched, "
+              f"longest proven silence **{mins:.0f} min**"
+              + (f" ({span_str(worst)})" if worst else ""))
     if resets:
         detail += f", {resets} counter reset(s) not judged"
     if unknown:
-        detail += f", {unknown} interval(s) with no reading"
+        detail += f", {unknown} interval(s) before this counter existed"
 
     why_else = ""
     if cam and egress.get(cam):
@@ -391,23 +405,36 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
                     f"off-segment — which is the traffic P2 cuts.")
 
     if tot == 0:
+        # Zero is judged on the SAME clock as a gap, not on its own. A
+        # counter that has existed for 46 minutes and read zero proves
+        # nothing: BusyBox ntpd at MAXPOLL would not have spoken yet.
+        # Blocking on that is as wrong as passing a dead camera, and it
+        # is the easier mistake to make because zero looks damning.
+        if gap < NTP_GAP_FAIL_S:
+            confirm.append(
+                f"`{name}` has read zero, but only {obs:.0f} min of it is "
+                f"proven silence — short of the {NTP_GAP_FAIL_S // 60} min "
+                f"needed to rule out BusyBox ntpd's ~68 min backoff. Not a "
+                f"finding either way yet; let the counter run.{why_else}")
+            return "no verdict yet", detail
         if name in EXPECTED_SILENT:
-            confirm.append(f"`{name}` saw no NTP at all. Known: "
+            confirm.append(f"`{name}` saw no NTP in {mins:.0f} min. Known: "
                            f"{EXPECTED_SILENT[name]} Confirm this is still "
                            f"true before P2/P3.{why_else}")
             return "**silent — known**", detail
         rel = events_mentioning(events, cam)
         if rel:
             confirm.append(
-                f"`{name}` saw no NTP at all, and an event mentions this "
-                "camera: " + "; ".join(f'"{e["text"]}"' for e in rel[:2])
+                f"`{name}` saw no NTP in {mins:.0f} min, and an event "
+                "mentions this camera: "
+                + "; ".join(f'"{e["text"]}"' for e in rel[:2])
                 + f". Confirm it is back and syncing before P2/P3.{why_else}")
             return "**silent — maintenance?**", detail
         blockers.append(
-            f"`{name}` saw no NTP for the whole window. That is not poll "
-            f"backoff — BusyBox ntpd still asks once per ~68 min. Either "
-            f"this camera is not using the NVR for time, or chrony is "
-            f"refusing it.{why_else}")
+            f"`{name}` saw no NTP in {mins:.0f} min of proven silence. That "
+            f"is past backoff — BusyBox ntpd still asks once per ~68 min. "
+            f"Either this camera is not using the NVR for time, or chrony "
+            f"is refusing it.{why_else}")
         return "**UNEXPECTED — silent**", detail
 
     if gap >= NTP_GAP_FAIL_S:
