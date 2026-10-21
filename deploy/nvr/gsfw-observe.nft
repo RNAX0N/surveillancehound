@@ -28,9 +28,46 @@ table inet gsfw {
     counter fwd_other             { comment "forwarded, matched no allow class: P2 default-drop" }
 
     # ---- what P3 would DROP in the input chain -------------------------
-    counter in_cam_ntp            { comment "camera -> NVR udp/123: MUST stay allowed" }
-    counter in_cam_wg             { comment "camera -> NVR udp/51820: the WG underlay" }
-    counter in_cam_other          { comment "camera -> NVR, anything else: P3 would drop" }
+    # PER CAMERA, not aggregate. An aggregate NTP counter reads
+    # healthy while one camera is silently denied — which is the
+    # exact question asked about camera 12 and chrony. It also
+    # makes a maintenance flatline attributable to one unit.
+    counter in_ntp_101  { comment "camera 101: NTP from 117.111.101.2" }
+    counter in_wg_101   { comment "camera 101: WireGuard underlay" }
+    counter in_oth_101  { comment "camera 101: anything else at the NVR" }
+    counter in_ntp_102  { comment "camera 102: NTP from 117.111.102.2" }
+    counter in_wg_102   { comment "camera 102: WireGuard underlay" }
+    counter in_oth_102  { comment "camera 102: anything else at the NVR" }
+    counter in_ntp_103  { comment "camera 103: NTP from 117.111.103.2" }
+    counter in_wg_103   { comment "camera 103: WireGuard underlay" }
+    counter in_oth_103  { comment "camera 103: anything else at the NVR" }
+    counter in_ntp_104  { comment "camera 104: NTP from 117.111.104.2" }
+    counter in_wg_104   { comment "camera 104: WireGuard underlay" }
+    counter in_oth_104  { comment "camera 104: anything else at the NVR" }
+    counter in_ntp_105  { comment "camera 105: NTP from 117.111.105.2" }
+    counter in_wg_105   { comment "camera 105: WireGuard underlay" }
+    counter in_oth_105  { comment "camera 105: anything else at the NVR" }
+    counter in_ntp_106  { comment "camera 106: NTP from 117.111.106.2" }
+    counter in_wg_106   { comment "camera 106: WireGuard underlay" }
+    counter in_oth_106  { comment "camera 106: anything else at the NVR" }
+    counter in_ntp_107  { comment "camera 107: NTP from 117.111.107.2" }
+    counter in_wg_107   { comment "camera 107: WireGuard underlay" }
+    counter in_oth_107  { comment "camera 107: anything else at the NVR" }
+    counter in_ntp_108  { comment "camera 108: NTP from 117.111.108.2" }
+    counter in_wg_108   { comment "camera 108: WireGuard underlay" }
+    counter in_oth_108  { comment "camera 108: anything else at the NVR" }
+    counter in_ntp_109  { comment "camera 109: NTP from 117.111.109.2" }
+    counter in_wg_109   { comment "camera 109: WireGuard underlay" }
+    counter in_oth_109  { comment "camera 109: anything else at the NVR" }
+    counter in_ntp_110  { comment "camera 110: NTP from 117.111.110.2" }
+    counter in_wg_110   { comment "camera 110: WireGuard underlay" }
+    counter in_oth_110  { comment "camera 110: anything else at the NVR" }
+    counter in_ntp_111  { comment "camera 111: NTP from 117.111.111.2" }
+    counter in_wg_111   { comment "camera 111: WireGuard underlay" }
+    counter in_oth_111  { comment "camera 111: anything else at the NVR" }
+    counter in_ntp_112  { comment "camera 112: NTP from 117.111.112.2" }
+    counter in_wg_112   { comment "camera 112: WireGuard underlay" }
+    counter in_oth_112  { comment "camera 112: anything else at the NVR" }
     counter in_admin_mgmt         { comment "admin host -> 22/8971 on the LAN side" }
     counter in_mgmt_offlan        { comment "22/8971 from somewhere that is NOT the LAN side" }
 
@@ -82,15 +119,47 @@ table inet gsfw {
         # NTP from a camera: P3 KEEPS this. Counted to prove it is in use
         # before P3 narrows the input chain, and to catch camera 12 if it
         # starts asking while chrony still refuses it.
-        iifname "enp6s0.*" udp dport 123 counter name in_cam_ntp return
-        iifname "enp6s0.*" udp dport 51820 counter name in_cam_wg return
+        iifname "enp6s0.101" ip saddr 117.111.101.2 udp dport 123 counter name in_ntp_101 return
+        iifname "enp6s0.101" ip saddr 117.111.101.2 udp dport 51820 counter name in_wg_101 return
+        iifname "enp6s0.102" ip saddr 117.111.102.2 udp dport 123 counter name in_ntp_102 return
+        iifname "enp6s0.102" ip saddr 117.111.102.2 udp dport 51820 counter name in_wg_102 return
+        iifname "enp6s0.103" ip saddr 117.111.103.2 udp dport 123 counter name in_ntp_103 return
+        iifname "enp6s0.103" ip saddr 117.111.103.2 udp dport 51820 counter name in_wg_103 return
+        iifname "enp6s0.104" ip saddr 117.111.104.2 udp dport 123 counter name in_ntp_104 return
+        iifname "enp6s0.104" ip saddr 117.111.104.2 udp dport 51820 counter name in_wg_104 return
+        iifname "enp6s0.105" ip saddr 117.111.105.2 udp dport 123 counter name in_ntp_105 return
+        iifname "enp6s0.105" ip saddr 117.111.105.2 udp dport 51820 counter name in_wg_105 return
+        iifname "enp6s0.106" ip saddr 117.111.106.2 udp dport 123 counter name in_ntp_106 return
+        iifname "enp6s0.106" ip saddr 117.111.106.2 udp dport 51820 counter name in_wg_106 return
+        iifname "enp6s0.107" ip saddr 117.111.107.2 udp dport 123 counter name in_ntp_107 return
+        iifname "enp6s0.107" ip saddr 117.111.107.2 udp dport 51820 counter name in_wg_107 return
+        iifname "enp6s0.108" ip saddr 117.111.108.2 udp dport 123 counter name in_ntp_108 return
+        iifname "enp6s0.108" ip saddr 117.111.108.2 udp dport 51820 counter name in_wg_108 return
+        iifname "enp6s0.109" ip saddr 117.111.109.2 udp dport 123 counter name in_ntp_109 return
+        iifname "enp6s0.109" ip saddr 117.111.109.2 udp dport 51820 counter name in_wg_109 return
+        iifname "enp6s0.110" ip saddr 117.111.110.2 udp dport 123 counter name in_ntp_110 return
+        iifname "enp6s0.110" ip saddr 117.111.110.2 udp dport 51820 counter name in_wg_110 return
+        iifname "enp6s0.111" ip saddr 117.111.111.2 udp dport 123 counter name in_ntp_111 return
+        iifname "enp6s0.111" ip saddr 117.111.111.2 udp dport 51820 counter name in_wg_111 return
+        iifname "enp6s0.112" ip saddr 117.111.112.2 udp dport 123 counter name in_ntp_112 return
+        iifname "enp6s0.112" ip saddr 117.111.112.2 udp dport 51820 counter name in_wg_112 return
         iifname "enp6s0.*" ip protocol icmp return
 
         # Anything else a camera sends AT the NVR. P3 drops this, so a
         # non-zero counter here is a service something depends on that
         # nobody mentioned.
-        iifname "enp6s0.*" counter name in_cam_other \
-            log prefix "gsfw-wouldblock cam-to-nvr: " level warn limit rate 12/minute return
+        iifname "enp6s0.101" counter name in_oth_101 log prefix "gsfw-wouldblock cam-to-nvr c101: " level warn limit rate 6/minute return
+        iifname "enp6s0.102" counter name in_oth_102 log prefix "gsfw-wouldblock cam-to-nvr c102: " level warn limit rate 6/minute return
+        iifname "enp6s0.103" counter name in_oth_103 log prefix "gsfw-wouldblock cam-to-nvr c103: " level warn limit rate 6/minute return
+        iifname "enp6s0.104" counter name in_oth_104 log prefix "gsfw-wouldblock cam-to-nvr c104: " level warn limit rate 6/minute return
+        iifname "enp6s0.105" counter name in_oth_105 log prefix "gsfw-wouldblock cam-to-nvr c105: " level warn limit rate 6/minute return
+        iifname "enp6s0.106" counter name in_oth_106 log prefix "gsfw-wouldblock cam-to-nvr c106: " level warn limit rate 6/minute return
+        iifname "enp6s0.107" counter name in_oth_107 log prefix "gsfw-wouldblock cam-to-nvr c107: " level warn limit rate 6/minute return
+        iifname "enp6s0.108" counter name in_oth_108 log prefix "gsfw-wouldblock cam-to-nvr c108: " level warn limit rate 6/minute return
+        iifname "enp6s0.109" counter name in_oth_109 log prefix "gsfw-wouldblock cam-to-nvr c109: " level warn limit rate 6/minute return
+        iifname "enp6s0.110" counter name in_oth_110 log prefix "gsfw-wouldblock cam-to-nvr c110: " level warn limit rate 6/minute return
+        iifname "enp6s0.111" counter name in_oth_111 log prefix "gsfw-wouldblock cam-to-nvr c111: " level warn limit rate 6/minute return
+        iifname "enp6s0.112" counter name in_oth_112 log prefix "gsfw-wouldblock cam-to-nvr c112: " level warn limit rate 6/minute return
 
         # Management, and management from the wrong side of the house.
         iifname "enp4s0" ip saddr 88.255.1.221 tcp dport { 22, 8971 } \

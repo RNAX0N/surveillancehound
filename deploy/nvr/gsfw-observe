@@ -31,10 +31,20 @@ import sys
 import time
 
 SAMPLES = "/var/log/gsfw-observe/samples.jsonl"
+EVENTS = "/var/log/gsfw-observe/events.jsonl"
 TABLE = ("inet", "gsfw")
+CAMERAS = range(101, 113)
 
-# Counters the lockdown is SUPPOSED to stop. Non-zero here is the finding,
-# not a problem. Everything else non-zero blocks GO.
+# How each counter is judged. Per-camera counters are matched by shape,
+# so adding camera 13 needs no change here.
+#
+#   expected_block : the lockdown is MEANT to stop this. Non-zero is the
+#                    finding, not a problem.
+#   must_be_used   : zero means the lockdown would cut something that
+#                    works today and we would not know until we enforced.
+#   unexpected     : anything else non-zero. Blocks GO — finding the
+#                    unpredicted flows is the whole point of the window.
+#   informational  : non-zero is fine and tells us nothing is broken.
 EXPECTED_BLOCK = {
     "fwd_cam_egress":
         "a camera VLAN reaching off-segment. This is the laptop-on-a-"
@@ -44,11 +54,24 @@ EXPECTED_BLOCK = {
     "fwd_wg_initiated":
         "a tunnel peer initiating a flow; cameras pull nothing.",
 }
-# Counters that MUST be non-zero, or the lockdown would break something
-# that is working today and we would not know until we enforced it.
-MUST_BE_USED = {
-    "in_cam_ntp": "cameras getting time from the NVR (chrony)",
-}
+
+
+def classify(name: str) -> str:
+    if name in EXPECTED_BLOCK:
+        return "expected_block"
+    if re.fullmatch(r"in_ntp_1\d\d", name):
+        return "must_be_used"
+    if re.fullmatch(r"in_wg_1\d\d", name):
+        # Only meaningful once the tunnel exists; silent is correct today.
+        return "informational"
+    if name in ("in_admin_mgmt",):
+        return "informational"
+    return "unexpected"
+
+
+def camera_of(name: str) -> str | None:
+    m = re.search(r"_(1\d\d)$", name)
+    return m.group(1) if m else None
 
 
 def nft(*args: str) -> str:
@@ -71,6 +94,60 @@ def read_counters() -> dict[str, dict]:
                               "bytes": c.get("bytes", 0),
                               "comment": c.get("comment", "")}
     return out
+
+
+def cmd_event(text: str) -> int:
+    """Record a maintenance event, so a counter anomaly can be attributed.
+
+    A camera taken down for reflashing flatlines its NTP counter. Without
+    a record of WHY, the summary cannot tell that from chrony silently
+    refusing it — and those have opposite responses. The window overlaps
+    a firmware campaign, so this is not optional bookkeeping.
+
+    Deliberately free text with a timestamp rather than a schema: the
+    point is that a human or the camera-firmware session can append
+    without agreeing a format first, and the summary quotes it verbatim
+    next to the anomaly rather than parsing it.
+    """
+    os.makedirs(os.path.dirname(EVENTS), exist_ok=True)
+    with open(EVENTS, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": time.time(), "text": text}) + "\n")
+    print(f"gsfw-observe: recorded event: {text}")
+    return 0
+
+
+def load_events() -> list[dict]:
+    if not os.path.exists(EVENTS):
+        return []
+    out = []
+    for line in open(EVENTS, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return sorted(out, key=lambda r: r["ts"])
+
+
+def events_mentioning(events: list[dict], cam: str | None) -> list[dict]:
+    """Events that plausibly explain an anomaly on this camera.
+
+    Matched loosely on purpose — "C6", "camera 6", "117.111.106.2" and
+    "106" should all hit. A missed match costs a false blocker, which is
+    the safe direction: it asks a human instead of excusing itself.
+    """
+    if not cam:
+        return []
+    short = str(int(cam) - 100)
+    pats = (cam, f"c{short}", f"camera {short}", f"cam {short}")
+    hits = []
+    for e in events:
+        low = e["text"].lower()
+        if any(pt in low for pt in pats):
+            hits.append(e)
+    return hits
 
 
 def cmd_snapshot() -> int:
@@ -154,7 +231,8 @@ def cmd_summary() -> int:
 
     print("| class | packets | first seen | last seen | verdict |")
     print("|---|---:|---|---|---|")
-    blockers, findings = [], []
+    blockers, findings, confirm = [], [], []
+    events = load_events()
     for n in names:
         tot = last["counters"].get(n, {}).get("packets", 0)
         firsts = next((r for r in s if r["counters"].get(n, {}).get("packets", 0)), None)
@@ -162,27 +240,54 @@ def cmd_summary() -> int:
                       if r["counters"].get(n, {}).get("packets", 0)), None)
         fs = time.strftime("%m-%d %H:%M", time.localtime(firsts["ts"])) if firsts else "—"
         ls = time.strftime("%m-%d %H:%M", time.localtime(lasts["ts"])) if lasts else "—"
-        if n in MUST_BE_USED:
-            if tot == 0:
+        kind = classify(n)
+        cam = camera_of(n)
+
+        if kind == "must_be_used" and tot == 0:
+            rel = events_mentioning(events, cam)
+            if rel:
+                verdict = "**zero — maintenance?**"
+                confirm.append(
+                    f"`{n}` is zero. A recorded event may explain it: "
+                    + "; ".join(f'"{e["text"]}"' for e in rel[:2])
+                    + ". Confirm the camera is back and serving before P3.")
+            else:
                 verdict = "**UNEXPECTED — silent**"
                 blockers.append(
-                    f"`{n}` is zero. {MUST_BE_USED[n]} appears unused, which "
-                    f"is more likely to mean this window did not see it than "
-                    f"that nothing needs it. Enforcing could cut a working "
-                    f"service.")
-            else:
-                verdict = "expected (in use)"
+                    f"`{n}` is zero and no maintenance event mentions this "
+                    f"camera. Either it is not asking the NVR for time, or "
+                    f"chrony is refusing it — the camera-12 case. Enforcing "
+                    f"P3 could cut a working service.")
+        elif kind == "must_be_used":
+            verdict = "expected (in use)"
         elif tot == 0:
             verdict = "clear"
-        elif n in EXPECTED_BLOCK:
+        elif kind == "expected_block":
             verdict = "expected"
             findings.append(f"`{n}` ({tot} pkts): {EXPECTED_BLOCK[n]}")
+        elif kind == "informational":
+            verdict = "informational"
         else:
-            verdict = "**UNEXPECTED**"
-            blockers.append(
-                f"`{n}` saw {tot} packets. The lockdown would have dropped "
-                f"these and nobody predicted them. Resolve before P2.")
+            rel = events_mentioning(events, cam)
+            if rel:
+                verdict = "**non-zero — maintenance?**"
+                confirm.append(
+                    f"`{n}` saw {tot} packets, and an event may explain it: "
+                    + "; ".join(f'"{e["text"]}"' for e in rel[:2])
+                    + ". Confirm this traffic is not needed before P2/P3.")
+            else:
+                verdict = "**UNEXPECTED**"
+                blockers.append(
+                    f"`{n}` saw {tot} packets. The lockdown would have "
+                    f"dropped these and nobody predicted them. Resolve "
+                    f"before P2.")
         print(f"| `{n}` | {tot} | {fs} | {ls} | {verdict} |")
+
+    if events:
+        print("\n### Maintenance events recorded during the window\n")
+        for e in events:
+            print(f"- `{time.strftime('%m-%d %H:%M', time.localtime(e['ts']))}` "
+                  f"{e['text']}")
 
     for n in names:
         tag = LOG_TAG.get(n)
@@ -211,6 +316,16 @@ def cmd_summary() -> int:
         print("hours it did not watch. Let it finish.")
         return 1
 
+    if confirm:
+        print("\n### Needs your confirmation\n")
+        print("\n".join(f"- {c}" for c in confirm))
+        print("\n## HOLD for P2 — maintenance overlapped the window")
+        print("Nothing here is necessarily wrong, but a firmware campaign")
+        print("ran during observation, so these readings have an innocent")
+        print("explanation AND a dangerous one and the counters cannot tell")
+        print("them apart. Confirm each, or re-run a clean window.")
+        return 2
+
     print("\n## GO for P2")
     print("Every non-zero counter is a class the lockdown is meant to stop,")
     print("and everything that must stay permitted was seen in use.")
@@ -223,5 +338,10 @@ if __name__ == "__main__":
         sys.exit(cmd_snapshot())
     if mode == "summary":
         sys.exit(cmd_summary())
+    if mode == "event":
+        if len(sys.argv) < 3:
+            print("usage: gsfw-observe event \"what happened\"", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(cmd_event(" ".join(sys.argv[2:])))
     print(__doc__)
     sys.exit(2)
