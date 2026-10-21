@@ -373,6 +373,16 @@ check("...and the age is converted", parsed["106"]["last_s"] == 3900)
 check("non-camera clients are ignored", "19" not in parsed)
 check("chrony being unavailable is empty, not an error", absent == {})
 
+# One chrony reading is not a delta. Reading it as "0 requests" would
+# have chrony corroborate a silent counter on no evidence at all.
+one = [None] * (DAY - 1) + [{"ntp": 500, "drop": 0,
+                             "interval": "12", "last_s": 60.0}]
+cell, blockers, _, detail = judge([0] * DAY, chrony=one)
+check("a single chrony reading does not corroborate anything",
+      not any("independently served it nothing" in b for b in blockers),
+      str(blockers))
+check("...and says why", "no delta yet" in detail, detail)
+
 check("chrony ages parse bare seconds", G._chrony_age("57") == 57)
 check("chrony ages parse minutes", G._chrony_age("65m") == 3900)
 check("chrony ages parse hours", G._chrony_age("3h") == 10800)

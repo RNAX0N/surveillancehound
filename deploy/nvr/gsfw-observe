@@ -444,10 +444,15 @@ def chrony_window(samples: list[dict], cam: str | None) -> dict | None:
     (_, first), (_, last) = rows[0], rows[-1]
     req = last["ntp"] - first["ntp"]
     drop = last["drop"] - first["drop"]
+    # One reading is not a delta. Reporting it as "0 requests" would
+    # have chrony corroborate a silent counter on no evidence at all,
+    # which is worse than having no witness.
+    unknown = len(rows) < 2
     return {
-        "requests": None if req < 0 else req,
-        "drops": None if drop < 0 else drop,
-        "restarted": req < 0 or drop < 0,
+        "requests": None if unknown or req < 0 else req,
+        "drops": None if unknown or drop < 0 else drop,
+        "restarted": not unknown and (req < 0 or drop < 0),
+        "single_reading": unknown,
         "last_s": last.get("last_s"),
         "interval": last.get("interval"),
         "samples": len(rows),
@@ -488,6 +493,8 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
             bits.append(f"poll 2^{ch['interval']}s")
         if ch["restarted"]:
             bits.append("chronyd restarted, deltas unusable")
+        if ch["single_reading"]:
+            bits.append("one reading only, no delta yet")
         if bits:
             detail += " — chrony: " + ", ".join(bits)
 
