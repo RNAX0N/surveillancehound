@@ -129,12 +129,23 @@ table inet gsfw_enforce {
         iifname "enp4s0" ip saddr 88.255.1.221 oifname "enp6s0.*" \
             tcp dport 22 counter name e_admin_mgmt accept
 
-        # Camera web UIs, for whoever is currently in the set. Ports
-        # discovered by probing every camera from this host on
-        # 2026-10-22: tcp/80 on the vendor units (101, 104, 105, 108,
-        # 109, 110, 111) and tcp/443 on ours (102, 103, 106, 107).
-        # Nothing else answered, so nothing else is allowed — the old
-        # rule opened every port on every camera VLAN.
+        # Camera web UIs, for whoever is currently in the set. Probing
+        # from this host on 2026-10-22 found tcp/80 on the vendor units
+        # (101, 104, 105, 108, 109, 110, 111) and tcp/443 on ours (102,
+        # 103, 106, 107). Those two results are sound: each probe either
+        # connected or was REFUSED, which proves the packet reached the
+        # camera and came back.
+        #
+        # What that survey does NOT establish is that nothing else
+        # listens. `inet myfw`'s output chain is `policy drop` and only
+        # permits tcp/{53,80,443,7844,8971} outbound, so a probe to any
+        # other port never left this host — every other "closed" was my
+        # own firewall, timing out against itself. Do not read the
+        # absence of 8000/8080/8443/34567 as evidence; an authoritative
+        # inventory has to come from inside each unit.
+        #
+        # Scoped to these two anyway, because they are what the web UI
+        # needs. The old rule opened every port on every camera VLAN.
         iifname "enp4s0" ip saddr @camweb_clients oifname "enp6s0.*" \
             tcp dport { 80, 443 } counter name e_camweb accept
 
