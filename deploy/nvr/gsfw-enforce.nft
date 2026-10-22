@@ -67,6 +67,14 @@ table inet gsfw_enforce {
     # On-demand camera web UI access, replacing the old cam-access
     # service's blanket `-i enp4s0 -o enp6s0.+ -j ACCEPT` in DOCKER-USER.
     #
+    # The set holds the CAMERAS, not the clients. There is only ever one
+    # client — the admin workstation, pinned in the rule below at the
+    # operator's instruction — and twelve cameras, of which you want
+    # one. So the set tracks the axis that actually varies, and opening
+    # camera 6 leaves the other eleven shut. Same convenience, a
+    # twelfth of the exposure. (It held clients until 2026-10-22, which
+    # meant every `startcamaccess` opened all twelve at once.)
+    #
     # EMPTY BY DEFAULT and every element carries a TIMEOUT, so access
     # closes itself. The old rule was called "temporary" and was simply
     # on — nothing expired it, and `stopcamaccess` had to be remembered.
@@ -81,11 +89,11 @@ table inet gsfw_enforce {
     # admit everything the router forwards — strictly LOOSER than an
     # address match. MAC binding for this client can only be enforced
     # on OPNsense, which shares its L2 segment.
-    set camweb_clients {
+    set camweb_targets {
         type ipv4_addr
         flags timeout
         timeout 30m
-        comment "on-demand camera web UI clients; empty = no access"
+        comment "cameras whose web UI is open on demand; empty = none"
     }
 
     chain enforce_forward {
@@ -170,7 +178,7 @@ table inet gsfw_enforce {
         #
         # Scoped to these two anyway, because they are what the web UI
         # needs. The old rule opened every port on every camera VLAN.
-        iifname "enp4s0" ip saddr @camweb_clients oifname "enp6s0.*" \
+        iifname "enp4s0" ip saddr 88.255.1.221 ip daddr @camweb_targets \
             tcp dport { 80, 443 } counter name e_camweb accept
 
         # Non-Frigate RTSP gets its OWN counter, mirroring the observer's

@@ -79,13 +79,35 @@ table inet gsfw {
     counter in_wg_112   { comment "camera 112: WireGuard underlay" }
     counter in_oth_112  { comment "camera 112: anything else at the NVR" }
     counter in_admin_mgmt         { comment "admin host -> 22/8971 on the LAN side" }
-    counter in_ntp_lan            { comment "a LAN host using this NVR as its time source" }
+    counter in_ntp_lan            { comment "a LAN host still trying to take time from us: now denied" }
     counter in_mgmt_offlan        { comment "22/8971 from somewhere that is NOT the LAN side" }
 
     chain observe_forward {
-        # priority filter + 10: after the existing filter hooks, so this
-        # observes what survives them rather than what was offered.
-        type filter hook forward priority filter + 10; policy accept;
+        # priority filter - 10: BEFORE every other filter hook, which is
+        # the opposite of what this said until 2026-10-22. It used to be
+        # `filter + 10`, "so this observes what survives them rather
+        # than what was offered" — and that was precisely wrong for an
+        # instrument whose whole job is to measure what the existing
+        # rules would deny.
+        #
+        # `inet myfw` runs at priority 0 with `policy drop` on input and
+        # output, so anything it dropped never reached these chains at
+        # all. Two consequences, both real:
+        #
+        #   - `out_wg_1NN` was built to reveal "the NVR is initiating a
+        #     WireGuard handshake and being stopped by its own egress
+        #     filter". At +10 it could never have shown that: the drop
+        #     happened first, so the counter would have read zero for
+        #     exactly the fault it existed to detect.
+        #   - `in_oth_1NN` reading zero across the 24h window meant only
+        #     "no camera used a port myfw already permitted". Anything
+        #     else was dropped at priority 0 and never counted, so the
+        #     finding was weaker than it was stated to be.
+        #
+        # At -10 these chains see every packet as offered, whatever any
+        # other table later does with it. Conntrack runs at -200, so
+        # `ct state` is still available here.
+        type filter hook forward priority filter - 10; policy accept;
 
         # Already-established flows are not candidates for a NEW-state
         # drop, so they must not be counted as casualties.
@@ -139,7 +161,7 @@ table inet gsfw {
     }
 
     chain observe_input {
-        type filter hook input priority filter + 10; policy accept;
+        type filter hook input priority filter - 10; policy accept;
         ct state established,related return
         iif "lo" return
 
@@ -200,14 +222,15 @@ table inet gsfw {
         iifname "enp6s0.112" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c112: " level warn
         iifname "enp6s0.112" counter name in_oth_112 return
 
-        # NTP from the LAN side. We have no evidence either way about
-        # whether a LAN host uses this NVR as its time source: chronyd
-        # listens on 0.0.0.0:123 and the old input rule allowed udp/123
-        # from anywhere, so one might have been relying on it for
-        # months. P3 keeps it permitted and this counter settles it —
-        # zero after a few days means it can be narrowed to the camera
-        # VLANs with evidence instead of with a guess. Breaking a time
-        # source silently is a bad way to find out.
+        # NTP from the LAN side, which P3 now DENIES: the operator
+        # confirmed that only devices behind this server take time from
+        # it and nothing on the LAN does.
+        #
+        # The counter stays, and it only became useful once these chains
+        # moved ahead of `inet myfw`. It now counts ATTEMPTS that myfw
+        # drops — so if some LAN host was quietly relying on this NVR
+        # for time, it shows up here as a number instead of as a clock
+        # drifting somewhere nobody is looking.
         iifname "enp4s0" udp dport 123 counter name in_ntp_lan return
 
         # Management, and management from the wrong side of the house.
@@ -248,7 +271,7 @@ table inet gsfw {
         # `in_wg_1NN` on the camera side stays flat, the NVR is trying
         # to initiate and being stopped locally. That turns a silent
         # loss into a reading.
-        type filter hook output priority filter + 10; policy accept;
+        type filter hook output priority filter - 10; policy accept;
         ct state established,related return
         oif "lo" return
 

@@ -1,0 +1,21 @@
+# On-demand camera web UI access — ONE camera.
+#
+#   systemctl start cam-access@6     # camera 6 only, 30 minutes
+#   systemctl stop  cam-access@6
+#
+# This is the one to prefer. The non-templated unit opens all twelve,
+# which is twelve times the exposure for the same browser tab.
+#
+# %i is the camera: 6, 106, c6 and 117.111.106.2 are all accepted.
+
+[Unit]
+Description=On-demand web UI access to camera %i (self-expiring)
+Documentation=file:///etc/nftables.d/gsfw-enforce.nft
+After=nftables.service
+Wants=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/camaccess open %i
+ExecStop=-/usr/local/sbin/camaccess close %i

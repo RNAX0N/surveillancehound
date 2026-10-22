@@ -1,0 +1,202 @@
+#!/usr/bin/python3
+"""camaccess — open one camera's web UI, briefly, and say so out loud.
+
+    camaccess open 6          # camera 6 only, 30 minutes
+    camaccess open 6 --minutes 5
+    camaccess open all        # what bare `startcamaccess` does
+    camaccess close [N]       # close one, or everything
+    camaccess status          # what is open, and for how much longer
+
+Driven by the operator's aliases, which are unchanged:
+    startcamaccess -> systemctl start cam-access.service   (-> open all)
+    stopcamaccess  -> systemctl stop  cam-access.service   (-> close)
+and `systemctl start cam-access@6` for one camera.
+
+WHY PER CAMERA. The previous version put the CLIENT in an nftables set
+and opened every camera to it. But there is only ever one client — the
+admin workstation, pinned in the rule — and twelve cameras, of which
+you want one. So the set now holds the TARGETS, which is the axis that
+actually varies, and opening camera 6 leaves the other eleven closed.
+Same convenience, a twelfth of the exposure.
+
+WHY IT DELETES BEFORE IT ADDS. `nft add element` on an element that is
+already present is accepted and silently does NOT refresh its timeout:
+measured 29m59s before a re-add and 29m56s after, i.e. nothing but
+decay. So running `startcamaccess` again would have looked like it
+granted another window while leaving the original expiry in place. Each
+open here removes the element first, so re-running genuinely extends.
+
+WHY IT WRITES AN EVENT. Opening a path into the camera segment is worth
+a line in the same audit log the firewall counters are read against,
+with who did it and for how long. Without it the only record is
+systemd's journal, which says a unit started and nothing about scope.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+TABLE = ("inet", "gsfw_enforce")
+SET = "camweb_targets"
+CAMERAS = range(101, 113)
+EVENTS = "/var/log/gsfw-observe/events.jsonl"
+DEFAULT_MINUTES = 30
+
+# Which port each camera actually serves, from probing every unit and
+# confirmed against the camera-firmware session's own firewall: vendor
+# units answer on 80, ours on 443 (majestic's 80 is dropped on every
+# interface). Recorded for the status output; the rule permits both,
+# because a port nothing listens on is not exposure and keeping one
+# rule is easier to read than twelve.
+WEB_PORT = {n: (443 if n in (102, 103, 106, 107) else 80) for n in CAMERAS}
+
+
+def nft(*args: str, check: bool = True) -> str:
+    p = subprocess.run(("nft", *args), capture_output=True, text=True)
+    if check and p.returncode != 0:
+        print(f"camaccess: nft failed: {p.stderr.strip()}", file=sys.stderr)
+        sys.exit(2)
+    return p.stdout
+
+
+def cam_ip(n: int) -> str:
+    return f"117.111.{n}.2"
+
+
+def parse_cam(tok: str) -> int:
+    """Accept 6, 106, c6, camera6 or the address. One camera, named any
+    of the ways a human would name it."""
+    t = tok.lower().lstrip("c").replace("camera", "").strip()
+    if t.startswith("117.111."):
+        t = t.split(".")[2]
+    try:
+        n = int(t)
+    except ValueError:
+        print(f"camaccess: not a camera: {tok}", file=sys.stderr)
+        sys.exit(2)
+    if n < 100:
+        n += 100
+    if n not in CAMERAS:
+        # Echo back what was TYPED, not the normalised number: "no
+        # camera 199" in answer to `open 99` reads like a bug in the
+        # tool rather than a typo in the argument.
+        print(f"camaccess: no camera {tok!r} — cameras are "
+              f"1-{CAMERAS.stop - 1 - 100} "
+              f"(or {CAMERAS.start}-{CAMERAS.stop - 1})", file=sys.stderr)
+        sys.exit(2)
+    return n
+
+
+def open_elements() -> dict[str, str]:
+    """Camera address -> remaining time, for whatever is open now."""
+    out: dict[str, str] = {}
+    txt = nft("list", "set", *TABLE, SET, check=False)
+    body = txt.partition("elements = {")[2].partition("}")[0]
+    for part in body.split(","):
+        part = " ".join(part.split())
+        if not part:
+            continue
+        addr = part.split()[0]
+        exp = part.partition("expires ")[2] or "?"
+        out[addr] = exp
+    return out
+
+
+def event(text: str) -> None:
+    """Same log the firewall counters are reviewed against."""
+    try:
+        os.makedirs(os.path.dirname(EVENTS), exist_ok=True)
+        with open(EVENTS, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time(), "text": text}) + "\n")
+    except OSError as e:          # never fail an open over bookkeeping
+        print(f"camaccess: could not write event log: {e}", file=sys.stderr)
+
+
+def who() -> str:
+    return os.environ.get("SUDO_USER") or os.environ.get("USER") or "unknown"
+
+
+def cmd_open(cams: list[int], minutes: int) -> int:
+    for n in cams:
+        ip = cam_ip(n)
+        # Delete first: adding an existing element does not refresh its
+        # timeout, so without this a second `open` would silently leave
+        # the original expiry and look like it had extended the window.
+        nft("delete", "element", *TABLE, SET, "{" + ip + "}", check=False)
+        nft("add", "element", *TABLE, SET,
+            "{" + f"{ip} timeout {minutes}m" + "}")
+    names = ", ".join(f"camera {n - 100} ({cam_ip(n)}:{WEB_PORT[n]})"
+                      for n in cams)
+    print(f"camaccess: open for {minutes}m — {names}")
+    event(f"camaccess OPEN by {who()} for {minutes}m: "
+          f"{', '.join(str(n) for n in cams)}")
+    return 0
+
+
+def cmd_close(cams: list[int] | None) -> int:
+    targets = cams if cams else list(CAMERAS)
+    for n in targets:
+        nft("delete", "element", *TABLE, SET,
+            "{" + cam_ip(n) + "}", check=False)
+    left = open_elements()
+    if cams:
+        print(f"camaccess: closed {', '.join(str(n - 100) for n in cams)}"
+              + (f"; still open: {', '.join(left)}" if left else
+                 "; nothing open now"))
+    else:
+        print("camaccess: closed everything"
+              if not left else f"camaccess: still open: {', '.join(left)}")
+    event(f"camaccess CLOSE by {who()}: "
+          + (", ".join(str(n) for n in targets) if cams else "all"))
+    return 0
+
+
+def cmd_status() -> int:
+    live = open_elements()
+    if not live:
+        print("camaccess: nothing open. Camera web UIs are unreachable.")
+        return 0
+    print("camaccess: OPEN right now —")
+    for addr, exp in sorted(live.items()):
+        try:
+            n = int(addr.split(".")[2])
+            label = f"camera {n - 100}, port {WEB_PORT.get(n, '?')}"
+        except (IndexError, ValueError):
+            label = "unknown"
+        print(f"  {addr:<16} {label:<22} expires in {exp}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="camaccess", add_help=True)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    o = sub.add_parser("open", help="open one camera, or all")
+    o.add_argument("cameras", nargs="+", help="6 | 106 | c6 | all")
+    o.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
+    c = sub.add_parser("close", help="close one camera, or everything")
+    c.add_argument("cameras", nargs="*", help="empty = all")
+    sub.add_parser("status", help="what is open, and for how long")
+    a = ap.parse_args()
+
+    if a.cmd == "status":
+        return cmd_status()
+    if a.cmd == "open":
+        if a.minutes < 1 or a.minutes > 720:
+            print("camaccess: --minutes must be 1-720", file=sys.stderr)
+            return 2
+        if any(x.lower() == "all" for x in a.cameras):
+            return cmd_open(list(CAMERAS), a.minutes)
+        return cmd_open([parse_cam(x) for x in a.cameras], a.minutes)
+    if a.cmd == "close":
+        if not a.cameras or any(x.lower() == "all" for x in a.cameras):
+            return cmd_close(None)
+        return cmd_close([parse_cam(x) for x in a.cameras])
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
