@@ -264,17 +264,18 @@ $(document).ready(function() {
                     '<td>' + ((stale || c.availability === null)
                         ? 'n/a'
                         : (num(c.availability) * 100).toFixed(2) + '%') + '</td>' +
-                    /* Only local rows: this box can delete what it
-                       recorded itself. A relayed row belongs to the
-                       sensor that sent it, and the only lever for those
-                       is dropping the whole sensor — too large a blast
-                       radius to hang on a row-level button. */
-                    '<td>' + ((!c.sensor || c.sensor === 'local')
-                        ? '<button type="button" class="btn btn-default btn-xs hound-forget-row"' +
-                          ' data-ip="' + esc(c.ip) + '" title="' +
-                          "{{ lang._('Remove this row. Device rows come only from traffic this box observed, so one it can no longer see stays until deleted.') }}" +
-                          '"><i class="fa fa-times"></i></button>'
-                        : '') + '</td>' +
+                    /* Every row is removable, local or relayed. A
+                       relayed row goes through the per-device lever, not
+                       by dropping the sensor — that would discard every
+                       other camera it reports. Deleting a relayed row
+                       clears it HERE; if the sensor still classifies the
+                       address as a camera or NVR it will send it again,
+                       which the message after the click says. */
+                    '<td><button type="button" class="btn btn-default btn-xs hound-forget-row"' +
+                        ' data-ip="' + esc(c.ip) + '"' +
+                        ' data-sensor="' + esc(c.sensor || 'local') + '" title="' +
+                        "{{ lang._('Remove this row. Rows come only from traffic a sensor observed, so one it can no longer see stays until deleted.') }}" +
+                        '"><i class="fa fa-times"></i></button></td>' +
                     '</tr>';
             });
             $("#tbl-uptime tbody").html(rows ||
@@ -440,7 +441,9 @@ $(document).ready(function() {
        to the buttons themselves would be lost ten seconds later. */
     $("#tbl-uptime").on("click", ".hound-forget-row", function () {
         var $b = $(this).prop("disabled", true), ip = $b.data("ip");
-        ajaxCall("/api/hound/dashboard/forgetDevice", {'ip': ip}, function (d) {
+        var sensor = $b.data("sensor") || 'local';
+        ajaxCall("/api/hound/dashboard/forgetDevice",
+                 {'ip': ip, 'sensor': sensor}, function (d) {
             if (d && d.status === 'ok') {
                 $("#hound-dash-error")
                     .attr('class', 'alert alert-success')

@@ -93,8 +93,22 @@ class DashboardController extends ApiControllerBase
             return ['status' => 'failed',
                     'message' => gettext('Not an IP address.')];
         }
+        // A relayed row belongs to the sensor that sent it and lives in
+        // the quarantined remote_* tables, so it needs the other lever.
+        // Both are per-DEVICE: dropping the whole sensor to clear one
+        // stale address would discard every camera it reports.
+        $sensor = (string)$this->request->getPost('sensor', null, '');
         $backend = new Backend();
-        $output = trim($backend->configdRun('hound forget-device ' . $ip));
+        if ($sensor !== '' && $sensor !== 'local') {
+            if (!preg_match('/^[A-Za-z0-9._-]{1,64}$/', $sensor)) {
+                return ['status' => 'failed',
+                        'message' => gettext('Bad sensor id.')];
+            }
+            $output = trim($backend->configdRun(
+                'hound forget-remote-device ' . $sensor . ' ' . $ip));
+        } else {
+            $output = trim($backend->configdRun('hound forget-device ' . $ip));
+        }
         if ($output === '') {
             return [
                 'status' => 'failed',

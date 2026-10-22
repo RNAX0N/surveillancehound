@@ -1275,6 +1275,59 @@ class HoundStore:
                 deleted[table] = cur.rowcount
         return deleted
 
+    def forget_remote_device(self, sensor_id: str, ip: str) -> dict[str, int]:
+        """Drop ONE relayed device and its liveness history.
+
+        `forget_remote_sensor` is the only other lever and it takes the
+        whole sensor with it, which is far too much when the problem is
+        a single address. And a single address IS the common case: a
+        sensor's role ratchet is deliberate (a camera that goes quiet
+        must not silently lose its monitoring), so anything the sensor
+        ever classified as camera or nvr stays on the collector's
+        dashboard forever — including infrastructure that was never
+        meant to be liveness-tracked, like a container address that
+        disappeared behind a masquerade.
+
+        Deleting here does not stop the sensor re-sending it; that has
+        to be fixed on the sensor too. What this gives the operator is a
+        way to clear a row that is wrong NOW, without discarding every
+        other row the same sensor provides.
+        """
+        deleted: dict[str, int] = {}
+        with self._lock, self._conn:
+            for table, col in (("remote_outages", "camera_ip"),
+                               ("remote_uptime", "camera_ip"),
+                               ("remote_devices", "ip")):
+                try:
+                    cur = self._conn.execute(
+                        f"DELETE FROM {table} WHERE sensor_id = ? "
+                        f"AND {col} = ?", (sensor_id, ip))
+                except sqlite3.OperationalError:
+                    continue          # table absent: not a relay collector
+                deleted[table] = cur.rowcount
+        return deleted
+
+    def count_remote_devices_by_role(self) -> dict[str, int]:
+        """Relayed device counts per role, for the dashboard tiles.
+
+        The tiles used to count only LOCAL devices while the table under
+        them merged local and relayed rows, so a collector whose cameras
+        all live behind an agent showed "0 Cameras" above a list of
+        eleven. A count that disagrees with the list beneath it is worse
+        than no count — the same rule the alert tally already follows.
+        """
+        out: dict[str, int] = {}
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT role, COUNT(*) FROM remote_devices GROUP BY role"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return out            # no relay tables on this box
+        for role, n in rows:
+            out[str(role)] = int(n)
+        return out
+
     # Append-only relayed tables and the column that orders them oldest-first.
     # Upsert-keyed tables are capped too: a sensor can claim an unbounded
     # number of distinct IPs, so "one row per IP" is not a bound.

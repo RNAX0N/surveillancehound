@@ -32,7 +32,7 @@ Subcommands:
       OPNsense plugin, whose pages run under a Content-Security-Policy
       that blocks cross-origin iframes.
 
-  hound sensors <config.toml> [--forget ID]
+  hound sensors <config.toml> [--forget ID] [--forget-device SENSOR IP]
       Relay sensors this collector knows about: whether each is still
       reporting, its clock skew, and how much it has sent.
 
@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import socket
 import sqlite3
 import sys
 import time
@@ -637,6 +638,7 @@ def _export_body(args, cfg, store, window, now) -> int:
             [], lambda: store.list_remote_alerts(limit=args.limit))
         remote_flows = _relay(
             [], lambda: store.list_remote_flows(limit=args.limit))
+        remote_roles = _relay({}, store.count_remote_devices_by_role)
         remote_alerts_24h = _relay(
             0, lambda: store.count_remote_alerts_since(now - 86400))
         doc = {
@@ -651,9 +653,17 @@ def _export_body(args, cfg, store, window, now) -> int:
                 "started_at": session.started_at if session else 0.0,
             },
             "counts": {
-                "devices": len(devices),
-                "cameras": sum(1 for d in devices if d.role == "camera"),
-                "nvrs": sum(1 for d in devices if d.role == "nvr"),
+                # Local AND relayed, for the same reason the alert tally
+                # below is: the table under these tiles merges both, and
+                # a collector whose cameras all sit behind an agent
+                # showed "0 Cameras" above a list of eleven of them. A
+                # count that disagrees with the list beneath it is worse
+                # than no count.
+                "devices": len(devices) + sum(remote_roles.values()),
+                "cameras": (sum(1 for d in devices if d.role == "camera")
+                            + remote_roles.get("camera", 0)),
+                "nvrs": (sum(1 for d in devices if d.role == "nvr")
+                         + remote_roles.get("nvr", 0)),
                 # Counts local AND relayed, because the table below this
                 # tile renders both — a count that disagrees with the
                 # list under it is worse than no count. Relayed rows are
@@ -710,9 +720,25 @@ def cmd_sensors(args: argparse.Namespace) -> int:
     now = time.time()
     # Read-only for the listing; `--forget` deletes a sensor's relayed
     # rows, so that path needs a writable store.
-    store = (HoundStore(path=cfg.store.path) if args.forget
+    writing = bool(args.forget or args.forget_device)
+    store = (HoundStore(path=cfg.store.path) if writing
              else _ro_store(cfg))
     try:
+        if args.forget_device:
+            sensor_id, ip = args.forget_device
+            gone = store.forget_remote_device(sensor_id, ip)
+            total = sum(gone.values())
+            if not total:
+                print(f"no relayed rows for {ip!r} from sensor "
+                      f"{sensor_id!r}")
+                return 1
+            print(f"forgot {ip} from {sensor_id}: "
+                  + ", ".join(f"{k}={v}" for k, v in gone.items() if v))
+            print("The sensor will send it again if it still classifies "
+                  "the address as a camera or NVR — clear it there too "
+                  f"with: hound devices <config> --forget {ip}")
+            return 0
+
         if args.forget:
             gone = store.forget_remote_sensor(args.forget)
             total = sum(gone.values())
@@ -1106,6 +1132,28 @@ def cmd_web(args: argparse.Namespace) -> int:
     return 0
 
 
+def _addresses_on_this_host(candidates: list[str]) -> list[str]:
+    """Which of these addresses belong to the machine we are running on.
+
+    Binding a UDP socket to an address succeeds only if the kernel has
+    it on some interface, and fails with EADDRNOTAVAIL otherwise. Port 0
+    so nothing is reserved and no packet is ever sent — this is a
+    question, not a connection. Pure stdlib and it behaves the same on
+    Linux and FreeBSD, which matters because the agent and the collector
+    do not run the same OS.
+    """
+    mine = []
+    for ip in candidates:
+        fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        try:
+            with socket.socket(fam, socket.SOCK_DGRAM) as sk:
+                sk.bind((ip, 0))
+            mine.append(ip)
+        except OSError:
+            pass
+    return mine
+
+
 def cmd_config_check(args: argparse.Namespace) -> int:
     cfg = _cfg(args.config)
     print(f"config: {args.config}")
@@ -1125,6 +1173,23 @@ def cmd_config_check(args: argparse.Namespace) -> int:
         print(f"  WARNING: ignored unknown section(s): {', '.join(unknown)}")
         print("    These are not read by this version. Anything you set in "
               "them has no effect.")
+    # Monitoring yourself is incoherent, and it reads as a fault.
+    # Liveness here is inferred from traffic seen on the monitored
+    # interface; this host's own address will not appear there, so it
+    # goes "down" and stays down — while the very report saying so
+    # proves the host is up. Seen in the field: an agent listing its own
+    # LAN address in nvr_ips, relaying "88.255.5.11 down 22h" to the
+    # collector from that same machine.
+    own = _addresses_on_this_host(
+        list(cfg.network.camera_ips) + list(cfg.network.nvr_ips))
+    for ip in own:
+        print(f"  WARNING: {ip} is an address of THIS machine, and it is "
+              f"listed as a camera or NVR to watch.")
+        print("    Liveness is inferred from observed traffic, so this host "
+              "cannot see itself and will report the address as permanently "
+              "down. Remove it from camera_ips/nvr_ips, then "
+              f"'hound devices <config> --forget {ip}'.")
+
     for idx, key in bad_notify_keys:
         print(f"  WARNING: [[notify]] block {idx}: '{key}' is not a notify "
               f"setting and is being IGNORED.")
@@ -1274,6 +1339,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sn = sub.add_parser("sensors", help="relay sensors known to this collector")
     p_sn.add_argument("config")
+    p_sn.add_argument("--forget-device", nargs=2, metavar=("SENSOR", "IP"),
+                      help="drop ONE relayed device row and its outage "
+                           "history, leaving the rest of that sensor's "
+                           "data alone")
     p_sn.add_argument("--forget", metavar="ID",
                       help="delete a sensor and everything it ever sent")
     p_sn.set_defaults(func=cmd_sensors)
