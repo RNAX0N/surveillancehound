@@ -1,0 +1,78 @@
+# PENDING — not applied, and deliberately not loadable.
+#
+# The `.pending` suffix keeps this out of `include "/etc/nftables.d/*.nft"`.
+# It is a prepared change for the WireGuard cutover, held because:
+#   - `wg0` does not exist yet, so the rule would be inert;
+#   - it belongs in `inet myfw`, which this project does not own; and
+#   - it widens the NVR host's own egress, which is a policy decision
+#     for the operator rather than a consequence of P2.
+#
+# ---------------------------------------------------------------------
+# THE PROBLEM
+#
+# The cameras LISTEN on udp/51820 and are the configured initiators
+# (Endpoint = their /30 gateway, PersistentKeepalive 25s). But
+# WireGuard lets EITHER side start a handshake when it has data and the
+# session has lapsed — so when Frigate reconnects RTSP across a camera
+# reboot, link flap or lost keepalive, the NVR initiates toward
+# 117.111.10N.2:51820.
+#
+# `inet myfw`'s output chain is `policy drop` and permits only
+# udp/{53,123,443,7844}, tcp/{53,80,443,7844,8971} and the relay's
+# tcp/18443. udp/51820 is absent, so an NVR-initiated handshake dies in
+# our own egress filter: no log, no counter, and it presents as a key
+# mismatch or a camera fault.
+#
+# Replies to CAMERA-initiated handshakes are already fine:
+# `ct state established,related accept` is the first rule in that chain.
+# Only the NVR-initiated direction is at risk.
+#
+# ---------------------------------------------------------------------
+# WHERE IT GOES, and why not here
+#
+# An `accept` in another table cannot rescue this packet: both output
+# chains are evaluated and `inet myfw` reaching its `policy drop` is a
+# final verdict. The permitting rule therefore has to be in myfw itself.
+#
+# Put it INSIDE the `chain output { ... }` body in /etc/nftables.conf
+# (the table is defined at lines 41-71), NOT in a drop-in. A drop-in
+# would have to use `add rule inet myfw output ...`, which appends a
+# duplicate on every reload; redefining the table in its own file is
+# idempotent.
+#
+# Place it after the OUTPUT chain's established/related rule. Mind which
+# chain: `input` has an identically worded established rule earlier in
+# the file, and a naive `sed` on the first match puts this in the wrong
+# one, where it does nothing and looks right.
+
+    # WireGuard to the cameras. Pinned to the camera VLANs, both ports
+    # fixed at 51820, and NEW only — replies already ride the
+    # established rule above. Counted so the handshake is part of the
+    # acceptance test rather than an assumption.
+    #
+    # Note the comment goes AFTER the verdict. `counter comment "..."`
+    # is a syntax error; the first draft of this file had it and would
+    # have failed to load at cutover time, which is the worst moment to
+    # find out. Validated by inserting it into a COPY of the live
+    # /etc/nftables.conf and loading that in a throwaway netns.
+    oifname "enp6s0.*" ip daddr 117.111.0.0/16 udp sport 51820 udp dport 51820 ct state new counter accept comment "NVR-initiated WireGuard handshake to a camera"
+
+# ---------------------------------------------------------------------
+# HOW TO KNOW IT WAS NEEDED, AND THAT IT WORKED
+#
+# `inet gsfw`'s observe_output chain already counts this traffic per
+# camera as `out_wg_1NN`, live now and inert until wg0 exists. So:
+#
+#   out_wg_1NN moves, in_wg_1NN flat   -> the NVR is initiating and
+#                                          being stopped locally. This
+#                                          rule is required.
+#   both move                          -> handshakes flow both ways.
+#   only in_wg_1NN moves               -> cameras initiate exclusively;
+#                                          this rule is not needed yet.
+#
+#   nft list counter inet gsfw out_wg_106
+#   nft list counter inet gsfw in_wg_106
+#
+# Verify after applying, during one camera's cutover:
+#   nft list chain inet myfw output | grep 51820
+#   nft list counter inet myfw      # the comment above names the rule

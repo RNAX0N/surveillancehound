@@ -205,4 +205,65 @@ table inet gsfw {
         tcp dport { 22, 8971 } limit rate 12/minute log prefix "gsfw-wouldblock mgmt-not-lan: " level warn
         tcp dport { 22, 8971 } counter name in_mgmt_offlan return
     }
+
+    # ---- what the NVR ORIGINATES toward a camera ----------------------
+    counter out_wg_101        { comment "NVR -> camera 101 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_102        { comment "NVR -> camera 102 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_103        { comment "NVR -> camera 103 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_104        { comment "NVR -> camera 104 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_105        { comment "NVR -> camera 105 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_106        { comment "NVR -> camera 106 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_107        { comment "NVR -> camera 107 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_108        { comment "NVR -> camera 108 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_109        { comment "NVR -> camera 109 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_110        { comment "NVR -> camera 110 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_111        { comment "NVR -> camera 111 udp/51820: tunnel handshake we ORIGINATE" }
+    counter out_wg_112        { comment "NVR -> camera 112 udp/51820: tunnel handshake we ORIGINATE" }
+
+    chain observe_output {
+        # Pure measurement, no verdicts, like the rest of this table.
+        # It exists for one failure that is otherwise invisible: the
+        # cameras LISTEN on udp/51820 and WireGuard lets EITHER side
+        # start a handshake, so when Frigate reconnects RTSP across a
+        # lapsed session the NVR initiates. `inet myfw`'s output chain
+        # is `policy drop` and does not permit udp/51820, so that
+        # handshake dies in our own egress filter with no log and no
+        # counter, and presents as a key or camera fault.
+        #
+        # This chain cannot fix that — an accept here would not save a
+        # packet from another chain's drop policy, which is why the
+        # permitting rule has to live in `inet myfw` itself. What it
+        # does is make the attempt VISIBLE: if `out_wg_1NN` moves while
+        # `in_wg_1NN` on the camera side stays flat, the NVR is trying
+        # to initiate and being stopped locally. That turns a silent
+        # loss into a reading.
+        type filter hook output priority filter + 10; policy accept;
+        ct state established,related return
+        oif "lo" return
+
+        oifname "enp6s0.101" ip daddr 117.111.101.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_101 return
+        oifname "enp6s0.102" ip daddr 117.111.102.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_102 return
+        oifname "enp6s0.103" ip daddr 117.111.103.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_103 return
+        oifname "enp6s0.104" ip daddr 117.111.104.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_104 return
+        oifname "enp6s0.105" ip daddr 117.111.105.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_105 return
+        oifname "enp6s0.106" ip daddr 117.111.106.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_106 return
+        oifname "enp6s0.107" ip daddr 117.111.107.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_107 return
+        oifname "enp6s0.108" ip daddr 117.111.108.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_108 return
+        oifname "enp6s0.109" ip daddr 117.111.109.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_109 return
+        oifname "enp6s0.110" ip daddr 117.111.110.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_110 return
+        oifname "enp6s0.111" ip daddr 117.111.111.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_111 return
+        oifname "enp6s0.112" ip daddr 117.111.112.2 udp sport 51820 udp dport 51820 \
+            counter name out_wg_112 return
+    }
 }
