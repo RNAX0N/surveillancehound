@@ -51,14 +51,50 @@ _NOISE = (
 )
 
 
+_ELEMENTS = re.compile(r"elements\s*=\s*\{(?P<body>[^}]*)\}")
+
+
+def _self_expiring(line: str) -> bool:
+    """True only if this is a set-element line and EVERY element in it
+    carries an expiry.
+
+    The "every" matters. One permanent element hiding among expiring
+    ones is exactly how on-demand access becomes permanent access, so
+    a mixed list is still reported as drift.
+    """
+    m = _ELEMENTS.search(line)
+    if not m:
+        return False
+    parts = [e.strip() for e in m.group("body").split(",") if e.strip()]
+    return bool(parts) and all(" expires " in f" {e} " or "expires" in e
+                               for e in parts)
+
+
 def sh(*argv: str) -> tuple[int, str]:
     p = subprocess.run(argv, capture_output=True, text=True)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+_ELEM_BLOCK = re.compile(r"elements\s*=\s*\{(.*?)\}", re.S)
+
+
+def _collapse_elements(text: str) -> str:
+    """Put a multi-element set list back on one line.
+
+    nft wraps `elements = { a, b }` across lines once there is more than
+    one element, which split the block so neither half looked like a set
+    at all. The halves then read as two unexplained live-only lines, so
+    the moment a SECOND on-demand client was authorised every
+    legitimate use would report drift again — the cry-wolf failure this
+    check keeps walking into.
+    """
+    return _ELEM_BLOCK.sub(
+        lambda m: "elements = {" + " ".join(m.group(1).split()) + "}", text)
+
+
 def normalise(text: str) -> list[str]:
     out = []
-    for line in text.splitlines():
+    for line in _collapse_elements(text).splitlines():
         for rx, repl in _NOISE:
             line = rx.sub(repl, line)
         if line.strip():
@@ -91,6 +127,7 @@ def main() -> int:
         wanted = [ln.split() for ln in tables.splitlines() if ln.startswith("table ")]
 
         problems = []
+        notes = []
         for _, family, name in wanted:
             rc_ns, want = sh("ip", "netns", "exec", NS,
                              "nft", "list", "table", family, name)
@@ -110,6 +147,24 @@ def main() -> int:
                              - collections.Counter(b)).elements())
             only_live = list((collections.Counter(b)
                               - collections.Counter(a)).elements())
+
+            # Elements that carry their own expiry are transient BY
+            # DESIGN — the on-demand camera web access set is the live
+            # example. They are genuinely live-only and genuinely lost
+            # on reload, which is the intended behaviour, not a finding.
+            # Reporting them as drift would mean every legitimate use of
+            # `startcamaccess` raised an alert, and an alert that fires
+            # on correct operation is one the operator learns to skip.
+            # They are still PRINTED, because unexplained access is
+            # worth seeing; they just do not fail the check.
+            transient = [x for x in only_live if _self_expiring(x)]
+            only_live = [x for x in only_live if not _self_expiring(x)]
+            for x in transient:
+                notes.append(f"  table {family} {name}: on-demand, "
+                             f"self-expiring: {x.strip()}")
+            if not only_cfg and not only_live:
+                continue
+
             problems.append(f"  table {family} {name}:")
             for x in only_cfg:
                 problems.append(f"    in config, not live : {x.strip()}")
@@ -122,10 +177,16 @@ def main() -> int:
             print("\n".join(problems))
             print("\nA live-only rule disappears at the next reload, reboot or")
             print("`docker restart`. A config-only rule is not protecting you.")
+            if notes:
+                print("\nAlso live, but expected:")
+                print("\n".join(notes))
             return 1
 
         names = ", ".join(f"{f} {n}" for _, f, n in wanted) or "(none)"
         print(f"in sync: {len(wanted)} table(s) match the config [{names}]")
+        if notes:
+            print("Open on demand right now, and self-expiring:")
+            print("\n".join(notes))
         return 0
     finally:
         sh("ip", "netns", "del", NS)

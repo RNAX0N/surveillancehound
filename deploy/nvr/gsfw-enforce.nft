@@ -57,9 +57,34 @@ table inet gsfw_enforce {
     #      tightened later from evidence instead of from guesswork.
     counter e_frigate_rtsp    { comment "Frigate -> camera tcp/554" }
     counter e_lan_ping        { comment "LAN -> camera icmp echo-request" }
-    counter e_admin_mgmt      { comment "admin host -> camera tcp/{22,443}" }
+    counter e_admin_mgmt      { comment "admin host -> camera tcp/22 (ssh; web UI is on-demand)" }
     counter e_bridge_egress   { comment "container egress to a non-camera destination" }
     counter e_wg_rtsp         { comment "Frigate -> tunnel peer tcp/554 (inert until wg0 exists)" }
+    counter e_camweb          { comment "an on-demand client reaching a camera web UI" }
+
+    # On-demand camera web UI access, replacing the old cam-access
+    # service's blanket `-i enp4s0 -o enp6s0.+ -j ACCEPT` in DOCKER-USER.
+    #
+    # EMPTY BY DEFAULT and every element carries a TIMEOUT, so access
+    # closes itself. The old rule was called "temporary" and was simply
+    # on — nothing expired it, and `stopcamaccess` had to be remembered.
+    # Here forgetting is the safe case. A `nft -f` reload also flushes
+    # the set, so reloading the firewall closes access rather than
+    # silently preserving it.
+    #
+    # Addresses, not MACs, and deliberately: the admin workstation is on
+    # 88.255.1.0/24 and reaches this host through OPNsense, so packets
+    # arrive bearing OPNSENSE's far-side MAC (1a:4b:24:b5:fa:1f), not
+    # the workstation's (d8:43:ae:0f:ed:f1). Matching that MAC would
+    # admit everything the router forwards — strictly LOOSER than an
+    # address match. MAC binding for this client can only be enforced
+    # on OPNsense, which shares its L2 segment.
+    set camweb_clients {
+        type ipv4_addr
+        flags timeout
+        timeout 30m
+        comment "on-demand camera web UI clients; empty = no access"
+    }
 
     chain enforce_forward {
         type filter hook forward priority filter + 20; policy drop;
@@ -91,12 +116,27 @@ table inet gsfw_enforce {
         iifname "enp4s0" ip saddr 88.255.0.0/16 oifname "enp6s0.*" \
             icmp type echo-request counter name e_lan_ping accept
 
-        # Camera management stays scoped to the admin host, which is
-        # narrower than the ping allowance on purpose: reaching a
-        # camera's shell or web UI is not the same as asking whether it
-        # is alive. Widening this to LAN space is one word if wanted.
+        # Camera SSH from the admin host, permanently: the firmware work
+        # needs a shell at unpredictable times and a self-expiring
+        # window would just be fought.
+        #
+        # tcp/443 was REMOVED from this rule on 2026-10-22. It had made
+        # the web UI permanently reachable on our own firmware (which
+        # serves 443) while the vendor units (which serve 80) needed
+        # `startcamaccess` — the same function behind two different
+        # access models, which is how one of them ends up forgotten.
+        # Both web ports now sit behind the on-demand set below.
         iifname "enp4s0" ip saddr 88.255.1.221 oifname "enp6s0.*" \
-            tcp dport { 22, 443 } counter name e_admin_mgmt accept
+            tcp dport 22 counter name e_admin_mgmt accept
+
+        # Camera web UIs, for whoever is currently in the set. Ports
+        # discovered by probing every camera from this host on
+        # 2026-10-22: tcp/80 on the vendor units (101, 104, 105, 108,
+        # 109, 110, 111) and tcp/443 on ours (102, 103, 106, 107).
+        # Nothing else answered, so nothing else is allowed — the old
+        # rule opened every port on every camera VLAN.
+        iifname "enp4s0" ip saddr @camweb_clients oifname "enp6s0.*" \
+            tcp dport { 80, 443 } counter name e_camweb accept
 
         # Non-Frigate RTSP gets its OWN counter, mirroring the observer's
         # `fwd_rtsp_nonfrigate`. Without the split, verification needed

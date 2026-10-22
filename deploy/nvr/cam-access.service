@@ -1,0 +1,57 @@
+# On-demand camera web UI access.
+#
+# Driven by the operator's existing aliases, unchanged:
+#   startcamaccess -> systemctl start cam-access.service
+#   stopcamaccess  -> systemctl stop  cam-access.service
+#
+# WHAT THIS REPLACED, and why each change is a tightening:
+#
+#   iptables -I DOCKER-USER -i enp4s0 -o enp6s0.+ -j ACCEPT
+#   iptables -I DOCKER-USER -i enp6s0.+ -o enp4s0 -m conntrack \
+#            --ctstate ESTABLISHED,RELATED -j ACCEPT
+#
+# 1. It allowed ANY source arriving on enp4s0 — the whole LAN and
+#    anything OPNsense routed in — not one workstation.
+# 2. It allowed EVERY PORT on every camera VLAN: ssh, rtsp, telnet,
+#    vendor service ports, not just the web UI.
+# 3. It was called "temporary" and was simply ON. Nothing expired it;
+#    closing depended on remembering `stopcamaccess`. It was found
+#    active, with no record of when it had been started.
+# 4. `BindsTo=docker.service` meant a Docker restart silently took the
+#    rules with it, and DOCKER-USER is Docker's chain — camera web
+#    access from the LAN is not container traffic and does not belong
+#    in it. This project has already caused one recording outage
+#    through Docker chain interaction.
+# 5. Since P2, a DROP in `inet gsfw_enforce` (priority filter + 20)
+#    overrides an ACCEPT in iptables' filter table (priority 0), so
+#    these rules had stopped working while still appearing to be the
+#    mechanism. That is the worst of both: no access, and a latent
+#    hole if P2 were ever lifted.
+#
+# Now: one address, two ports, and a timeout that closes it without
+# anyone having to act. Forgetting is the safe direction.
+#
+# To change the window, edit the timeout below. To authorise a second
+# machine, add another ExecStart line — not a wider subnet.
+
+[Unit]
+Description=On-demand camera web UI access (nftables set, self-expiring)
+Documentation=file:///etc/nftables.d/gsfw-enforce.nft
+After=nftables.service
+Wants=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# The timeout is the real guarantee; `stopcamaccess` is a convenience.
+ExecStart=/usr/sbin/nft add element inet gsfw_enforce camweb_clients \
+    { 88.255.1.221 timeout 30m }
+
+# `-` so a stop still succeeds when the element has already expired on
+# its own, which is the expected case rather than an error.
+ExecStop=-/usr/sbin/nft delete element inet gsfw_enforce camweb_clients \
+    { 88.255.1.221 }
+
+# No [Install]: this is operator-triggered and must never start at boot.
+# Access that survives a reboot is not on-demand access.
