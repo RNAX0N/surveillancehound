@@ -1,0 +1,22 @@
+# Installed as /etc/sudoers.d/camaccess, mode 0440.
+#
+# Passwordless sudo for ONE command, so camera web access can be opened
+# from the workstation without an interactive login:
+#
+#     ssh nvr sudo camaccess open 6
+#
+# Without this, sudo prompts for a password and a non-interactive ssh
+# hangs rather than failing cleanly.
+#
+# WHAT THIS GRANTS, precisely: anyone who can authenticate as nj over
+# ssh can open or close camera web access without re-authenticating.
+# That is the intent. It is not a general privilege: camaccess validates
+# every argument against the camera list and a 1-720 minute bound, calls
+# nft with fixed arguments and no shell, and can only add or remove
+# elements in one nftables set and append to the event log. The binary
+# is root-owned and mode 0755, so the user it is granted to cannot
+# modify what runs.
+#
+# The access it opens still expires on its own, so this cannot be used
+# to leave a door open indefinitely.
+nj ALL=(root) NOPASSWD: /usr/local/sbin/camaccess

@@ -1,11 +1,24 @@
 #!/usr/bin/python3
 """camaccess — open one camera's web UI, briefly, and say so out loud.
 
-    camaccess open 6          # camera 6 only, 30 minutes
+    camaccess open            # every camera, 30 minutes
+    camaccess open 6          # camera 6 only
+    camaccess open 6 7 11     # several
     camaccess open 6 --minutes 5
-    camaccess open all        # what bare `startcamaccess` does
-    camaccess close [N]       # close one, or everything
+    camaccess close [N ...]   # close some, or everything
     camaccess status          # what is open, and for how much longer
+
+Built to be run NON-INTERACTIVELY over ssh, which is the point:
+
+    ssh nvr sudo camaccess open 6
+    ssh nvr sudo camaccess close
+
+/etc/sudoers.d/camaccess grants passwordless sudo for THIS COMMAND
+ONLY, because otherwise sudo prompts and a non-interactive ssh hangs
+instead of failing. Every argument is validated against the camera list
+and a 1-720 minute bound, and nft is invoked with fixed arguments and
+no shell, so the privilege that rule grants is exactly "open or close
+camera web access" and nothing adjacent to it.
 
 Driven by the operator's aliases, which are unchanged:
     startcamaccess -> systemctl start cam-access.service   (-> open all)
@@ -174,8 +187,14 @@ def cmd_status() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(prog="camaccess", add_help=True)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    o = sub.add_parser("open", help="open one camera, or all")
-    o.add_argument("cameras", nargs="+", help="6 | 106 | c6 | all")
+    o = sub.add_parser("open", help="open one camera, several, or all")
+    # nargs="*": bare `camaccess open` means ALL, because the operator
+    # would rather the default were all-or-nothing and only narrow when
+    # they choose to. Requiring an argument made the common case the
+    # awkward one.
+    o.add_argument("cameras", nargs="*",
+                   help="empty or 'all' = every camera; else 6 | 106 | c6 "
+                        "| 117.111.106.2, space-separated")
     o.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
     c = sub.add_parser("close", help="close one camera, or everything")
     c.add_argument("cameras", nargs="*", help="empty = all")
@@ -188,13 +207,17 @@ def main() -> int:
         if a.minutes < 1 or a.minutes > 720:
             print("camaccess: --minutes must be 1-720", file=sys.stderr)
             return 2
-        if any(x.lower() == "all" for x in a.cameras):
+        if not a.cameras or any(x.lower() == "all" for x in a.cameras):
             return cmd_open(list(CAMERAS), a.minutes)
-        return cmd_open([parse_cam(x) for x in a.cameras], a.minutes)
+        # dict.fromkeys to drop duplicates while keeping the order the
+        # operator typed, so `open 6 6 7` is not two writes for 6.
+        return cmd_open(list(dict.fromkeys(parse_cam(x)
+                                           for x in a.cameras)), a.minutes)
     if a.cmd == "close":
         if not a.cameras or any(x.lower() == "all" for x in a.cameras):
             return cmd_close(None)
-        return cmd_close([parse_cam(x) for x in a.cameras])
+        return cmd_close(list(dict.fromkeys(parse_cam(x)
+                                            for x in a.cameras)))
     return 2
 
 
