@@ -237,6 +237,35 @@ $(document).ready(function() {
                 if (c.sensor && c.sensor !== 'local') bySensor[c.ip] = c.sensor;
             });
 
+            /* Rows a STILL-REPORTING sensor has stopped mentioning.
+               Those are leftovers: the sensor forgot the device (it was
+               removed from its config, or it was infrastructure that
+               stopped appearing), so nothing will ever refresh them.
+               A camera that is merely DOWN is not one of these — the
+               sensor keeps relaying its row while it is down, which is
+               why 117.111.112.2 reads "never seen" and not "unknown".
+               The sensor-is-reporting condition is the whole safety of
+               this: when a sensor itself goes quiet ALL its rows go
+               stale, and offering to delete them then would wipe a live
+               segment's cameras during an outage. */
+            var reporting = {};
+            $.each(sensors, function (i, x) {
+                reporting[x.sensor_id] = !!x.reporting;
+            });
+            var forgotten = $.grep(cams, function (c) {
+                return c.stale === true && c.sensor && c.sensor !== 'local'
+                       && reporting[c.sensor] === true;
+            });
+            if (forgotten.length) {
+                $("#hound-forget-stale")
+                    .text("{{ lang._('Remove ') }}" + forgotten.length +
+                          "{{ lang._(' row(s) the sensor no longer reports') }}")
+                    .show();
+            } else {
+                $("#hound-forget-stale").hide();
+            }
+            window.houndForgotten = forgotten;
+
             var rows = '';
             $.each(cams, function (i, c) {
                 var superseded = (!c.sensor || c.sensor === 'local') &&
@@ -460,6 +489,34 @@ $(document).ready(function() {
         });
     });
 
+    /* Sequential on purpose: each delete is a configd spawn, and firing
+       fourteen at once buries the packet loop for no gain on a one-off
+       operator action. Reuses the per-device endpoint rather than a new
+       bulk one, so there is a single validated deletion path. */
+    $("#hound-forget-stale").click(function () {
+        var list = (window.houndForgotten || []).slice();
+        if (!list.length) { return; }
+        var $b = $(this).prop("disabled", true);
+        var done = 0;
+        (function next() {
+            if (!list.length) {
+                $b.prop("disabled", false);
+                $("#hound-dash-error")
+                    .attr('class', 'alert alert-success')
+                    .text("{{ lang._('Removed ') }}" + done +
+                          "{{ lang._(' stale row(s).') }}").show();
+                loadDashboard();
+                return;
+            }
+            var c = list.shift();
+            ajaxCall("/api/hound/dashboard/forgetDevice",
+                     {'ip': c.ip, 'sensor': c.sensor}, function (d) {
+                if (d && d.status === 'ok') { done++; }
+                next();
+            });
+        })();
+    });
+
     $("#hound-refresh").click(function () { loadDashboard(); });
 });
 </script>
@@ -524,6 +581,12 @@ $(document).ready(function() {
 
             <h4>
                 {{ lang._('Camera uptime') }}
+                <button id="hound-forget-stale" type="button"
+                        class="btn btn-default btn-xs pull-right"
+                        style="display:none; margin-right:4px;"
+                        title="{{ lang._('Delete relayed rows that a sensor which IS still reporting has stopped sending. Those are leftovers nothing will refresh. A camera that is merely down keeps being reported and is not touched.') }}">
+                    <i class="fa fa-eraser"></i>
+                </button>
                 <button id="hound-forget-unclaimed" type="button"
                         class="btn btn-default btn-xs pull-right"
                         title="{{ lang._('Delete rows for devices this box no longer has in its config — for example cameras that moved behind a relay agent. They cannot be cleared any other way: roles never downgrade and pruning keeps open outages.') }}">
