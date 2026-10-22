@@ -61,6 +61,8 @@ table inet gsfw_enforce {
     counter e_bridge_egress   { comment "container egress to a non-camera destination" }
     counter e_wg_rtsp         { comment "Frigate -> tunnel peer tcp/554 (inert until wg0 exists)" }
     counter e_camweb          { comment "an on-demand client reaching a camera web UI" }
+    counter e_dnat_in         { comment "admin host -> a published container port (Frigate UI, RTSP republish)" }
+    counter e_dnat_other_drop { comment "anyone else reaching a published container port: now denied" }
 
     # On-demand camera web UI access, replacing the old cam-access
     # service's blanket `-i enp4s0 -o enp6s0.+ -j ACCEPT` in DOCKER-USER.
@@ -96,7 +98,29 @@ table inet gsfw_enforce {
 
         # Frigate's published ports arrive DNAT'd. The plan flags this
         # as the load-bearing rule whose absence stops recording.
-        ct status dnat accept
+        #
+        # Counted, belatedly: this is the one allow that had no counter,
+        # which broke the rule that every allow is measured so the
+        # allowlist can be narrowed from evidence. It also turned out to
+        # be the path the Frigate web UI actually takes — tcp/8971 is
+        # DNAT'd to the container from every interface except the docker
+        # bridge, so it never reaches the input chain, and restricting
+        # input alone would not have restricted the UI at all.
+        # Restricted to the admin workstation at the operator's
+        # instruction: "anything incoming, whether frigate webui from
+        # lan or ssh, should be this machine only". This is the rule
+        # that makes that true for the UI — tcp/8971 is DNAT'd and
+        # never touches the input chain, so tightening input would have
+        # changed nothing. Proven by measurement: two connections to
+        # 88.255.5.11:8971 moved e_dnat_in from 0 to 2.
+        #
+        # It also closes the plan's decision 5 without touching the
+        # compose file: Frigate's 554 and 8554 are published on EVERY
+        # interface, and they are DNAT'd by the same mechanism, so they
+        # are now reachable only from the same one address.
+        ct status dnat ip saddr 88.255.1.221 counter name e_dnat_in accept
+        ct status dnat limit rate 12/minute log prefix "gsfw-drop dnat-not-admin: " level warn
+        ct status dnat counter name e_dnat_other_drop drop
 
         # ---- THE POINT OF P2 -------------------------------------------
         # A camera VLAN may not initiate anything through this box. With

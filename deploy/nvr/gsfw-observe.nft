@@ -79,6 +79,7 @@ table inet gsfw {
     counter in_wg_112   { comment "camera 112: WireGuard underlay" }
     counter in_oth_112  { comment "camera 112: anything else at the NVR" }
     counter in_admin_mgmt         { comment "admin host -> 22/8971 on the LAN side" }
+    counter in_ntp_lan            { comment "a LAN host using this NVR as its time source" }
     counter in_mgmt_offlan        { comment "22/8971 from somewhere that is NOT the LAN side" }
 
     chain observe_forward {
@@ -198,6 +199,16 @@ table inet gsfw {
         iifname "enp6s0.111" counter name in_oth_111 return
         iifname "enp6s0.112" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c112: " level warn
         iifname "enp6s0.112" counter name in_oth_112 return
+
+        # NTP from the LAN side. We have no evidence either way about
+        # whether a LAN host uses this NVR as its time source: chronyd
+        # listens on 0.0.0.0:123 and the old input rule allowed udp/123
+        # from anywhere, so one might have been relying on it for
+        # months. P3 keeps it permitted and this counter settles it —
+        # zero after a few days means it can be narrowed to the camera
+        # VLANs with evidence instead of with a guess. Breaking a time
+        # source silently is a bad way to find out.
+        iifname "enp4s0" udp dport 123 counter name in_ntp_lan return
 
         # Management, and management from the wrong side of the house.
         iifname "enp4s0" ip saddr 88.255.1.221 tcp dport { 22, 8971 } \
