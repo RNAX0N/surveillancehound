@@ -22,6 +22,8 @@
             <title>SurveillanceHound</title>
             <monitor>Monitor</monitor>
             <cameras>Cameras up</cameras>
+            <nvrs>NVRs up</nvrs>
+            <other>Other devices up</other>
             <alerts>Alerts (24h)</alerts>
             <watching>watching</watching>
             <stalled>capture stalled</stalled>

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -782,6 +783,99 @@ def _check_opnsense_widget() -> None:
           f"endpoints, ACL and uninstall all line up")
 
 
+def _check_opnsense_widget_counts() -> None:
+    """RUN the widget against a known dashboard and check the numbers.
+
+    The static check next to this one proves the widget's references
+    line up. It cannot prove the widget counts correctly, and the first
+    version did not: it summed every uptime row under one "Cameras up"
+    label, so twelve cameras plus the NVR's own twelve VLAN gateway
+    addresses rendered "22 / 27 cameras" — a figure that is the count of
+    nothing. The operator found that, which is the wrong person to find
+    it.
+
+    Needs node. Absent, it says so rather than passing quietly, the same
+    way the PHP parser check does — a skipped check that prints nothing
+    is indistinguishable from one that passed.
+    """
+    if shutil.which("node") is None:
+        print("  OPNsense widget counts: SKIPPED (no node) — THIS GATE IS "
+              "OPEN, the widget's arithmetic was not executed")
+        return
+
+    widget = (OPNSENSE / "src/opnsense/www/js/widgets/"
+              "SurveillanceHound.js").resolve()
+    harness = r"""
+import fs from 'fs';
+const src = fs.readFileSync(process.argv[2], 'utf8');
+globalThis.$ = (x) => ({ append: () => x, text: (t) => ({ html: () => t }) });
+globalThis.BaseTableWidget = class { dataChanged() { return true; } };
+const mod = await import('data:text/javascript,' + encodeURIComponent(
+    src.replace('export default class', 'export class')));
+const w = new mod.SurveillanceHound();
+w.translations = new Proxy({}, { get: (_, k) => String(k) });
+let rows = null;
+w.updateTable = (id, r) => { rows = r; };
+const run = async (doc) => { w.ajaxCall = async () => doc; rows = null;
+    await w.onWidgetTick(); return rows; };
+const line = (k) => (rows.find((r) => r[0] === k) || [])[1];
+const dev = (ip, role, sensor, state) => ({ ip, role, sensor, state });
+
+// Twelve cameras and twelve VLAN gateways the NVR owns, one of each
+// never seen, plus a local row for the NVR itself.
+const doc = { monitor: { alive: true, blind: false },
+              counts: { alerts_24h: 100 },
+              uptime: [dev('88.255.5.11', 'nvr', 'local', 'up')],
+              remote_uptime: [] };
+for (let n = 101; n <= 112; n++) {
+    const st = n === 112 ? 'never_seen' : 'up';
+    doc.remote_uptime.push(dev(`117.111.${n}.1`, 'nvr', 'frigate', st));
+    doc.remote_uptime.push(dev(`117.111.${n}.2`, 'camera', 'frigate', st));
+}
+const out = [];
+await run(doc);
+out.push(['mixed roles: cameras', line('cameras'), '11 / 12']);
+out.push(['mixed roles: nvrs', line('nvrs'), '12 / 13']);
+
+// Only cameras: no NVR line at all rather than "0 / 0".
+await run({ ...doc, uptime: [],
+            remote_uptime: doc.remote_uptime.filter((c) => c.role === 'camera') });
+out.push(['cameras only: nvr line absent', String(line('nvrs')), 'undefined']);
+out.push(['cameras only: cameras', line('cameras'), '11 / 12']);
+
+// A local duplicate of an address a sensor also reports must not be
+// counted twice.
+await run({ monitor: { alive: true, blind: false }, counts: {},
+            uptime: [dev('10.0.0.5', 'camera', 'local', 'down')],
+            remote_uptime: [dev('10.0.0.5', 'camera', 'frigate', 'up')] });
+out.push(['duplicate collapsed', line('cameras'), '1 / 1']);
+
+// Stalled capture must refuse to state a figure.
+await run({ ...doc, monitor: { alive: true, blind: true } });
+out.push(['stalled: no figure', String(line('cameras')).includes('unknown'),
+          true]);
+
+let bad = 0;
+for (const [name, got, want] of out) {
+    if (String(got) !== String(want)) {
+        console.log(`FAIL ${name}: got ${got}, want ${want}`);
+        bad++;
+    }
+}
+console.log(bad === 0 ? 'OK ' + out.length : 'BAD');
+"""
+    with tempfile.TemporaryDirectory() as td:
+        hp = Path(td) / "h.mjs"
+        hp.write_text(harness)
+        r = subprocess.run(["node", str(hp), str(widget)],
+                           capture_output=True, text=True, timeout=120)
+    out = (r.stdout + r.stderr).strip()
+    assert r.returncode == 0 and "OK " in out, (
+        f"widget arithmetic wrong:\n{out}")
+    print(f"  OPNsense widget counts: executed, "
+          f"{out.split('OK ')[-1].strip()} assertions on real data shapes")
+
+
 def _check_opnsense_renderer_error_path() -> None:
     """Missing config block should fail loudly, not silently emit garbage."""
     mod = _load_opnsense_renderer()
@@ -1296,6 +1390,7 @@ def main() -> int:
     _check_opnsense_layout()
     _check_opnsense_menu_xml()
     _check_opnsense_widget()
+    _check_opnsense_widget_counts()
     _check_opnsense_form_ids()
     print()
     print("=== OPNsense renderer ===")
