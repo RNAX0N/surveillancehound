@@ -1,11 +1,23 @@
-# PENDING — not applied, and deliberately not loadable.
+# APPLIED 2026-10-22 with the operator's approval. This file is the
+# record, NOT the source: the rule now lives inside the `chain output`
+# body of /etc/nftables.conf. The `.applied` suffix keeps this out of
+# `include "/etc/nftables.d/*.nft"` so it cannot be loaded twice.
 #
-# The `.pending` suffix keeps this out of `include "/etc/nftables.d/*.nft"`.
-# It is a prepared change for the WireGuard cutover, held because:
-#   - `wg0` does not exist yet, so the rule would be inert;
-#   - it belongs in `inet myfw`, which this project does not own; and
-#   - it widens the NVR host's own egress, which is a policy decision
-#     for the operator rather than a consequence of P2.
+#   backup before the edit : /etc/nftables.conf.pre-wg-20261022-120340
+#   sha256 before          : 0f8bc2a267366fc138d45479e7be5df0a268f0a1c1f3230ca601f486f835eff3
+#   sha256 after           : 79677fc9c50ed8a8aad1992d1e7bb868c62183f176f67dc51f6dfc1c3a4ddafa
+#   diff                   : exactly one added line, at 59a60
+#
+# VERIFIED WITH A REAL PACKET rather than by reading the rule: one
+# udp/51820 -> 51820 datagram from 117.111.106.1 to camera 6 moved both
+# the myfw rule's counter and `out_wg_106` in the observe table from 0
+# to 1. "It loaded" would have proven nothing — a rule naming a
+# nonexistent interface loads happily and matches nothing.
+#
+# Applied live with `nft add rule ... handle 11` rather than by
+# reloading the whole config, because a reload re-creates the drop-in
+# tables and would have reset every observation counter and flushed the
+# camera-web-access set.
 #
 # ---------------------------------------------------------------------
 # THE PROBLEM
