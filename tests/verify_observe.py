@@ -471,6 +471,17 @@ rc, out = run_summary(
     broken, [{"ts": T0 + stop * STEP, "text": "C3 down, MAC change"}])
 check("the same window with the event logged is HOLD", rc == 2, f"rc={rc}")
 check("...and quotes the event", "MAC change" in out)
+check("...and says maintenance explains it", "Logged maintenance explains" in out)
+
+# An event in the log that excused nothing must not make the verdict
+# claim maintenance explains anything — the window-open marker is one.
+marker = [{"ts": T0, "text": "P1 window opened; operator may reflash"}]
+rc, out = run_summary({**clean, "in_ntp_112": [0] * DAY}, marker)
+check("a hold on a known-absent camera is still HOLD", rc == 2, f"rc={rc}")
+check("...and does NOT blame maintenance for it",
+      "Logged maintenance explains" not in out, out[-600:])
+check("...and names how many readings are unsettled",
+      "1 reading observation cannot settle" in out, out[-400:])
 
 # An unexpected class is still a hard NO-GO.
 surprise = dict(clean)

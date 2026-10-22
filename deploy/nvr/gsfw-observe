@@ -466,7 +466,8 @@ def chrony_window(samples: list[dict], cam: str | None) -> dict | None:
 
 def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
               events: list[dict], egress: dict[str, int],
-              blockers: list[str], confirm: list[str]) -> tuple[str, str]:
+              blockers: list[str], confirm: list[str],
+              cited: list[str] | None = None) -> tuple[str, str]:
     """Verdict for one camera's NTP counter, judged on continuity.
 
     Returns (table cell, detail line). Appends to `blockers`/`confirm`
@@ -555,6 +556,8 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
                 "mentions this camera: "
                 + "; ".join(f'"{e["text"]}"' for e in rel[:2])
                 + f". Confirm it is back and syncing before P2/P3.{why_else}")
+            if cited is not None:
+                cited.append(name)
             return "**silent — maintenance?**", detail
         if (ch and ch["requests"] == 0 and not ch["restarted"]
                 and ch["span_s"] >= gap):
@@ -586,6 +589,8 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
                 f"({span_str(worst)}), and an event covers that span: "
                 + "; ".join(f'"{e["text"]}"' for e in rel[:2])
                 + ". Confirm the camera came back and resumed syncing.")
+            if cited is not None:
+                cited.append(name)
             return f"**{mins:.0f}min gap — maintenance?**", detail
         blockers.append(
             f"`{name}` went {mins:.0f} min without a single poll "
@@ -631,6 +636,9 @@ def cmd_summary() -> int:
     print("|---|---:|---|---|---|")
     blockers, findings, confirm = [], [], []
     ntp_detail: list[str] = []
+    # Confirmations that rest on a logged maintenance event,
+    # as opposed to ones observation simply cannot settle.
+    cited: list[str] = []
     events = load_events()
     egress = egress_by_camera()
     for n in names:
@@ -645,7 +653,7 @@ def cmd_summary() -> int:
 
         if kind == "must_be_used":
             verdict, note = judge_ntp(n, cam, tot, s, events, egress,
-                                      blockers, confirm)
+                                      blockers, confirm, cited)
             if note:
                 ntp_detail.append(note)
         elif tot == 0:
@@ -659,6 +667,7 @@ def cmd_summary() -> int:
             rel = events_mentioning(events, cam)
             if rel:
                 verdict = "**non-zero — maintenance?**"
+                cited.append(n)
                 confirm.append(
                     f"`{n}` saw {tot} packets, and an event may explain it: "
                     + "; ".join(f'"{e["text"]}"' for e in rel[:2])
@@ -720,11 +729,21 @@ def cmd_summary() -> int:
     if confirm:
         print("\n### Needs your confirmation\n")
         print("\n".join(f"- {c}" for c in confirm))
-        print("\n## HOLD for P2 — maintenance overlapped the window")
-        print("Nothing here is necessarily wrong, but a firmware campaign")
-        print("ran during observation, so these readings have an innocent")
-        print("explanation AND a dangerous one and the counters cannot tell")
-        print("them apart. Confirm each, or re-run a clean window.")
+        # Name the actual reason. Blaming maintenance when the hold is
+        # really a known-absent camera sends the operator looking at the
+        # wrong thing, and a verdict that misstates its own grounds is
+        # the failure this tool was rewritten to stop making.
+        n = len(confirm)
+        print(f"\n## HOLD for P2 — {n} reading{'s' if n > 1 else ''} "
+              f"observation cannot settle")
+        if cited:
+            print(f"Logged maintenance explains {len(cited)} of them, so those")
+            print("have an innocent reading AND a dangerous one and the")
+            print("counters cannot tell them apart. An event in the log is")
+            print("not by itself one of these — only one that lines up with")
+            print("a reading counts, which is why this says 'explains'.")
+        print("Nothing above is a finding against the lockdown. Confirm each")
+        print("item, and P2 is clear to proceed on everything else.")
         return 2
 
     print("\n## GO for P2")
