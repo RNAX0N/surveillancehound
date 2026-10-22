@@ -87,6 +87,16 @@ table inet gsfw {
         oifname "wg0" ip daddr 10.77.0.0/24 tcp dport 554 return
         ip saddr 88.255.1.221 oifname "enp6s0.*" tcp dport { 22, 443 } return
 
+        # Admin ping into a camera VLAN. ADDED 2026-10-22 because the
+        # window caught exactly one packet of it — the operator pinging
+        # camera 3 while it rebooted for its MAC change — and P2 as
+        # drafted would have dropped it. "Can I ping the camera" is the
+        # first thing anyone asks when one does not come back, and
+        # losing it looks precisely like the lockdown broke something.
+        # Echo REQUEST only, from the admin host only; the reply comes
+        # back on the established rule above.
+        ip saddr 88.255.1.221 oifname "enp6s0.*" icmp type echo-request return
+
         # ---- classes P2 will DROP. Count, log sparsely, then RETURN.
         iifname "wg0" oifname "wg0" counter name fwd_wg_to_wg \
             log prefix "gsfw-wouldblock wg-to-wg: " level info limit rate 6/minute return

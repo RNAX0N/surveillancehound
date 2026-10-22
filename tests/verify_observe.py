@@ -159,7 +159,11 @@ def judge(vals: list[int], events=None, egress=None, name="in_ntp_106",
     cell, detail = G.judge_ntp(name, G.camera_of(name), tot, s,
                                events or [], egress or {},
                                blockers, confirm)
-    return cell, blockers, confirm, detail
+    # Blockers carry the counter they belong to, so a waiver can be
+    # matched to one. The checks below read the message text.
+    for b in blockers:
+        assert isinstance(b, tuple) and b[0] == name, b
+    return cell, [b[1] for b in blockers], confirm, detail
 
 
 def chrony_series(n: int, ntp_start: int, ntp_end: int,
@@ -410,13 +414,15 @@ print("\nwhole-summary outcomes")
 
 
 def run_summary(series: dict[str, list[int]], events: list[dict],
-                n: int = DAY) -> tuple[int, str]:
+                n: int = DAY, acks: list[dict] | None = None
+                ) -> tuple[int, str]:
     """cmd_summary against temp files, with the clock and the journal
     stubbed. Patched at module scope and restored, so one case cannot
     leak into the next."""
     d = tempfile.mkdtemp(prefix="gsfw-observe-test.")
     samples_p = os.path.join(d, "samples.jsonl")
     events_p = os.path.join(d, "events.jsonl")
+    acks_p = os.path.join(d, "acks.jsonl")
     import json
     with open(samples_p, "w") as fh:
         for row in build(n, series):
@@ -424,9 +430,12 @@ def run_summary(series: dict[str, list[int]], events: list[dict],
     with open(events_p, "w") as fh:
         for e in events:
             fh.write(json.dumps(e) + "\n")
+    with open(acks_p, "w") as fh:
+        for a in (acks or []):
+            fh.write(json.dumps(a) + "\n")
 
-    old = (G.SAMPLES, G.EVENTS, G.journal_lines, G._JOURNAL)
-    G.SAMPLES, G.EVENTS = samples_p, events_p
+    old = (G.SAMPLES, G.EVENTS, G.ACKS, G.journal_lines, G._JOURNAL)
+    G.SAMPLES, G.EVENTS, G.ACKS = samples_p, events_p, acks_p
     G.journal_lines = lambda: []
     G._JOURNAL = []
     try:
@@ -435,7 +444,7 @@ def run_summary(series: dict[str, list[int]], events: list[dict],
             rc = G.cmd_summary()
         return rc, buf.getvalue()
     finally:
-        G.SAMPLES, G.EVENTS, G.journal_lines, G._JOURNAL = old
+        G.SAMPLES, G.EVENTS, G.ACKS, G.journal_lines, G._JOURNAL = old
 
 
 healthy = {f"in_ntp_{c}": backed_off(DAY, 4) for c in range(101, 112)}
@@ -497,6 +506,92 @@ check("...and says so", "too short" in out)
 rc, out = run_summary({}, [], n=0)
 check("no samples at all is NO-GO", rc == 1, f"rc={rc}")
 check("...and refuses to read silence as a pass", "nothing was watched" in out)
+
+
+# --------------------------------------------------------------------
+# 5b. cumulative totals, and counters the table no longer defines
+# --------------------------------------------------------------------
+print("\ntotals across resets, and retired counters")
+
+check("a total is cumulative, not the last reading",
+      G.counted_total(build(6, {"c": [0, 5, 9, 9, 14, 20]}), "c") == 20)
+check("...and survives a reset",
+      G.counted_total(build(6, {"c": [10, 10, 0, 1, 2, 4]}), "c") == 14,
+      str(G.counted_total(build(6, {"c": [10, 10, 0, 1, 2, 4]}), "c")))
+check("...counting a pre-existing first reading",
+      G.counted_total(build(3, {"c": [7, 7, 8]}), "c") == 8)
+
+# The regression this found on the live box: a table replace zeroed the
+# counters, so the old last-reading total reported a real finding as 0.
+reset_mid = dict(clean)
+reset_mid["fwd_cam_egress"] = [i for i in range(DAY // 2)] + [0] * (DAY // 2)
+rc, out = run_summary(reset_mid, [])
+check("a finding before a counter reset is still reported",
+      f"| `fwd_cam_egress` | {DAY // 2 - 1} |" in out, out[:1200])
+
+# A counter the current table does not define belongs to an earlier
+# ruleset; today's classifier has nothing to say about its name.
+orphan = {k: v for k, v in clean.items()}
+orphan["in_cam_ntp"] = [i * 4 for i in range(DAY // 2)] + [None] * (DAY // 2)
+rc, out = run_summary(orphan, [])
+check("a retired counter does not block", rc == 0, f"rc={rc}\n{out[-400:]}")
+check("...is labelled as retired", "retired — earlier ruleset" in out)
+check("...and its traffic is still shown",
+      "under an earlier ruleset" in out and "Retired counters" in out)
+
+
+# --------------------------------------------------------------------
+# 6. the operator's answer resolves a HOLD, and cannot waive a blocker
+# --------------------------------------------------------------------
+print("\noperator acks")
+
+held = {**clean, "in_ntp_112": [0] * DAY}
+rc, out = run_summary(held, [])
+check("unanswered, a known-absent camera holds", rc == 2, f"rc={rc}")
+
+ack_now = [{"ts": T0 + DAY * STEP, "counter": "in_ntp_112",
+            "reason": "yes, camera 12 is still undeployed"}]
+rc, out = run_summary(held, [], acks=ack_now)
+check("answered, the same window is GO", rc == 0, f"rc={rc}\n{out[-500:]}")
+check("...and the answer is printed, not swallowed",
+      "Answered by the operator" in out and "still undeployed" in out)
+check("...quoting when it was given", "operator confirmed on" in out)
+
+stale = [{"ts": T0 - 86400, "counter": "in_ntp_112", "reason": "fine"}]
+rc, out = run_summary(held, [], acks=stale)
+check("an ack from before the window does not carry over", rc == 2, f"rc={rc}")
+
+# An ack CAN clear a blocker — a finding stays in the samples forever,
+# so once it is genuinely fixed the tool would otherwise say NO-GO
+# permanently and the only way forward would be to stop believing it.
+# What must never happen is a waiver that is silent or that reads as a
+# clean window.
+surprise2 = {**clean, "in_cam_other": steady(DAY, per=3)}
+rc, out = run_summary(surprise2, [], acks=[
+    {"ts": T0 + DAY * STEP, "counter": "in_cam_other",
+     "reason": "added to the P2 allowlist"}])
+check("an acked blocker becomes a waiver, not a blocker", rc == 0, f"rc={rc}")
+check("...printed in full with its reason",
+      "Waived by the operator" in out and "P2 allowlist" in out)
+check("...and the verdict says it is not a clean window",
+      "with 1 waived finding" in out and "Not a clean window" in out,
+      out[-500:])
+check("...and is NOT reported as a plain GO",
+      "\n## GO for P2\n" not in out)
+
+rc, out = run_summary(surprise2, [], acks=[
+    {"ts": T0 - 86400, "counter": "in_cam_other", "reason": "old"}])
+check("a pre-window ack does not waive a blocker", rc == 1, f"rc={rc}")
+
+rc, out = run_summary(surprise2, [])
+check("an unwaived blocker is still NO-GO", rc == 1, f"rc={rc}")
+
+rc, out = run_summary(held, [], acks=[
+    {"ts": T0 + DAY * STEP, "counter": "in_ntp_111", "reason": "wrong one"}])
+check("an ack for a different counter does not apply", rc == 2, f"rc={rc}")
+
+rc, out = run_summary(held, [], acks=[{"ts": "bad", "counter": 7}])
+check("a malformed ack line is ignored, not fatal", rc == 2, f"rc={rc}")
 
 
 # --------------------------------------------------------------------

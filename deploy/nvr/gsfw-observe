@@ -9,6 +9,7 @@ decision.
     gsfw-observe snapshot     # every 15 min, from a timer: one sample
     gsfw-observe summary      # at T+24h: the review, as markdown
     gsfw-observe event "..."  # note maintenance, so a flatline is read right
+    gsfw-observe ack NAME "…"  # record the operator's answer to a HOLD item
 
 `snapshot` is append-only and never interprets. `summary` interprets and
 never writes to the samples. Keeping them apart matters: a summary that
@@ -41,6 +42,7 @@ import time
 
 SAMPLES = "/var/log/gsfw-observe/samples.jsonl"
 EVENTS = "/var/log/gsfw-observe/events.jsonl"
+ACKS = "/var/log/gsfw-observe/acks.jsonl"
 TABLE = ("inet", "gsfw")
 CAMERAS = range(101, 113)
 
@@ -182,6 +184,46 @@ def _chrony_age(tok: str) -> float | None:
         return None
 
 
+def cmd_ack(name: str, reason: str) -> int:
+    """Record that the operator has ANSWERED a confirmation item.
+
+    A HOLD exists because observation cannot settle something; only a
+    human can. Without a way to record the answer, the only routes to
+    GO were to edit the thresholds or to assert GO in prose — the first
+    launders a decision into code, the second leaves no trail at all.
+    An ack is a dated, attributable line that the summary reads back.
+
+    Deliberately CANNOT clear a blocker, only a confirmation. A blocker
+    means the lockdown would drop traffic nobody predicted; signing that
+    off without changing anything is exactly the waiver this whole
+    window exists to prevent.
+    """
+    os.makedirs(os.path.dirname(ACKS), exist_ok=True)
+    with open(ACKS, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": time.time(), "counter": name,
+                             "reason": reason}) + "\n")
+    print(f"gsfw-observe: recorded answer for {name}: {reason}")
+    return 0
+
+
+def load_acks() -> dict[str, dict]:
+    """Latest ack per counter."""
+    if not os.path.exists(ACKS):
+        return {}
+    out: dict[str, dict] = {}
+    for line in open(ACKS, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+            if isinstance(r.get("counter"), str) and isinstance(r.get("ts"), (int, float)):
+                out[r["counter"]] = r
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
 def cmd_event(text: str) -> int:
     """Record a maintenance event, so a counter anomaly can be attributed.
 
@@ -307,6 +349,37 @@ def observed_span(samples: list[dict], name: str) -> float:
     """
     present = [r["ts"] for r in samples if name in r["counters"]]
     return (present[-1] - present[0]) if len(present) > 1 else 0.0
+
+
+def counted_total(samples: list[dict], name: str) -> int:
+    """Everything this counter ever counted, across resets.
+
+    NOT the last reading. nftables counters restart at zero when the
+    table is replaced — which happens on a reboot, on a rule amendment,
+    and every time `nft -f` reloads the file — so reading the last
+    sample erases every packet seen before the most recent replace. A
+    finding would vanish from the verdict while still sitting in the
+    samples, and the verdict would go quiet for the most dangerous
+    possible reason: somebody touched the ruleset.
+
+    A decrease is a restart, so the new reading counts in full rather
+    than as a delta.
+    """
+    total = 0
+    prev = None
+    for r in samples:
+        c = r["counters"].get(name)
+        if c is None:
+            continue
+        v = c["packets"]
+        if prev is None:
+            total = v
+        elif v >= prev:
+            total += v - prev
+        else:
+            total += v          # restarted; everything since is new
+        prev = v
+    return total
 
 
 def longest_span(spans: list[tuple[float, float]]
@@ -466,8 +539,10 @@ def chrony_window(samples: list[dict], cam: str | None) -> dict | None:
 
 def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
               events: list[dict], egress: dict[str, int],
-              blockers: list[str], confirm: list[str],
-              cited: list[str] | None = None) -> tuple[str, str]:
+              blockers: list[tuple[str, str]], confirm: list[str],
+              cited: list[str] | None = None,
+              acks: dict[str, dict] | None = None,
+              answered: list[str] | None = None) -> tuple[str, str]:
     """Verdict for one camera's NTP counter, judged on continuity.
 
     Returns (table cell, detail line). Appends to `blockers`/`confirm`
@@ -515,20 +590,20 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
     # counter, the counter is the thing in doubt: chrony is the service
     # we are trying to protect, and this tool is the new code.
     if ch and ch["requests"] and tot == 0:
-        blockers.append(
+        blockers.append((name,
             f"`{name}` counted nothing, but chrony served {ch['requests']} "
             f"requests from this camera over the same period. The camera is "
             f"fine; the COUNTER is not seeing its traffic. Fix the rule "
             f"before reading any verdict out of this window — every other "
-            f"silent reading here is suspect for the same reason.")
+            f"silent reading here is suspect for the same reason."))
         return "**RULE WRONG — chrony saw it**", detail
     if ch and ch["drops"]:
-        blockers.append(
+        blockers.append((name,
             f"`{name}`: chrony REFUSED {ch['drops']} requests from this "
             f"camera. This is the camera-12 failure, and it is a live one: "
             f"the camera is asking and not being served. Fix the chrony "
             f"allow list; it is not a firewall problem and P2/P3 will not "
-            f"change it either way.")
+            f"change it either way."))
         return "**chrony refusing**", detail
 
     if tot == 0:
@@ -545,6 +620,14 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
                 f"finding either way yet; let the counter run.{why_else}")
             return "no verdict yet", detail
         if name in EXPECTED_SILENT:
+            ack = (acks or {}).get(name)
+            if ack and ack["ts"] >= samples[0]["ts"]:
+                when = time.strftime("%m-%d %H:%M", time.localtime(ack["ts"]))
+                answered.append(
+                    f"`{name}` read zero for the whole window, and the "
+                    f"operator confirmed on {when}: \"{ack['reason']}\" "
+                    f"({EXPECTED_SILENT[name]})")
+                return "silent — confirmed", detail
             confirm.append(f"`{name}` saw no NTP in {mins:.0f} min. Known: "
                            f"{EXPECTED_SILENT[name]} Confirm this is still "
                            f"true before P2/P3.{why_else}")
@@ -575,10 +658,10 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
             corroborated = (" chrony was not readable, so this rests on the "
                             "counter alone — check `chronyc -n clients` "
                             "before acting on it.")
-        blockers.append(
+        blockers.append((name,
             f"`{name}` saw no NTP in {mins:.0f} min of proven silence. That "
             f"is past backoff — BusyBox ntpd still asks once per ~68 min."
-            f"{corroborated}{why_else}")
+            f"{corroborated}{why_else}"))
         return "**UNEXPECTED — silent**", detail
 
     if gap >= NTP_GAP_FAIL_S:
@@ -592,11 +675,11 @@ def judge_ntp(name: str, cam: str | None, tot: int, samples: list[dict],
             if cited is not None:
                 cited.append(name)
             return f"**{mins:.0f}min gap — maintenance?**", detail
-        blockers.append(
+        blockers.append((name,
             f"`{name}` went {mins:.0f} min without a single poll "
             f"({span_str(worst)}) and no maintenance event covers it. "
             f"Past 2h this is not backoff; the camera stopped asking."
-            f"{why_else}")
+            f"{why_else}"))
         return f"**UNEXPECTED — {mins:.0f}min gap**", detail
 
     if gap >= NTP_GAP_WARN_S:
@@ -639,10 +722,17 @@ def cmd_summary() -> int:
     # Confirmations that rest on a logged maintenance event,
     # as opposed to ones observation simply cannot settle.
     cited: list[str] = []
+    # Confirmations the operator has already answered, with the answer.
+    acks = load_acks()
+    answered: list[str] = []
+    # Counters the current table no longer defines. The last sample IS
+    # the current table, so this needs no separate source of truth.
+    current = set(last["counters"])
+    retired: list[str] = []
     events = load_events()
     egress = egress_by_camera()
     for n in names:
-        tot = last["counters"].get(n, {}).get("packets", 0)
+        tot = counted_total(s, n)
         firsts = next((r for r in s if r["counters"].get(n, {}).get("packets", 0)), None)
         lasts = next((r for r in reversed(s)
                       if r["counters"].get(n, {}).get("packets", 0)), None)
@@ -651,9 +741,25 @@ def cmd_summary() -> int:
         kind = classify(n)
         cam = camera_of(n)
 
+        # A counter the CURRENT table does not define cannot be judged
+        # by the current classifier. These are leftovers from an earlier
+        # generation of the ruleset — the aggregate `in_cam_ntp` became
+        # twelve per-camera counters, for instance — and today's rules
+        # have nothing to say about a name they no longer use. Judging
+        # them anyway turned 369 perfectly good NTP packets into an
+        # "unexpected" blocker. Their totals are still printed, because
+        # a retired counter is history, not noise.
+        if n not in current:
+            retired.append(f"`{n}`: {tot} packets under an earlier ruleset "
+                           f"(last seen {ls})")
+            print(f"| `{n}` | {tot} | {fs} | {ls} | retired — earlier "
+                  f"ruleset |")
+            continue
+
         if kind == "must_be_used":
             verdict, note = judge_ntp(n, cam, tot, s, events, egress,
-                                      blockers, confirm, cited)
+                                      blockers, confirm, cited,
+                                      acks, answered)
             if note:
                 ntp_detail.append(note)
         elif tot == 0:
@@ -674,10 +780,10 @@ def cmd_summary() -> int:
                     + ". Confirm this traffic is not needed before P2/P3.")
             else:
                 verdict = "**UNEXPECTED**"
-                blockers.append(
+                blockers.append((n,
                     f"`{n}` saw {tot} packets. The lockdown would have "
                     f"dropped these and nobody predicted them. Resolve "
-                    f"before P2.")
+                    f"before P2."))
         print(f"| `{n}` | {tot} | {fs} | {ls} | {verdict} |")
 
     if ntp_detail:
@@ -701,7 +807,7 @@ def cmd_summary() -> int:
 
     for n in names:
         tag = LOG_TAG.get(n)
-        tot = last["counters"].get(n, {}).get("packets", 0)
+        tot = counted_total(s, n)
         if not tag or not tot:
             continue
         ex = journal_examples(tag)
@@ -710,15 +816,58 @@ def cmd_summary() -> int:
             for e in ex:
                 print(f"  - `{e}`")
 
+    if retired:
+        print("\n### Retired counters, kept for the record\n")
+        print("These names are not in the table that is loaded now, so the")
+        print("current rules have no verdict on them. Their traffic was")
+        print("real; it was counted under a ruleset that has since changed.")
+        print()
+        print("\n".join(f"- {r}" for r in retired))
+
+    if answered:
+        print("\n### Answered by the operator\n")
+        print("\n".join(f"- {a}" for a in answered))
+
     print("\n### Findings the lockdown is meant to stop\n")
     print("\n".join(f"- {f}" for f in findings) or "- none")
 
-    if blockers:
+    # A blocker the operator has explicitly answered becomes a WAIVER,
+    # not a pass.
+    #
+    # This reverses an earlier decision that an ack could never clear a
+    # blocker. That rule was right about the danger and wrong about what
+    # happens in practice: a finding stays in the samples forever, so
+    # once it is genuinely resolved — by adding the flow to the
+    # allowlist, say — the tool would report NO-GO permanently, and the
+    # only way forward would be to stop believing the tool. A verdict
+    # nobody can act on gets ignored, which is worse than one that
+    # records who overrode it and why.
+    #
+    # The guard is that a waiver can never be silent and never reads as
+    # a clean window: it is printed in full with its date and reason,
+    # counted in the verdict line, and the exit text says so.
+    waived = []
+    hard = []
+    for key, text in blockers:
+        ack = acks.get(key)
+        if ack and ack["ts"] >= first["ts"]:
+            waived.append((key, text, ack))
+        else:
+            hard.append(text)
+
+    if hard:
         print("\n### Blockers\n")
-        print("\n".join(f"- {b}" for b in blockers))
+        print("\n".join(f"- {b}" for b in hard))
         print("\n## NO-GO for P2")
         print("Resolve the blockers above, then re-run the window.")
         return 1
+
+    if waived:
+        print("\n### Waived by the operator\n")
+        for key, text, ack in waived:
+            when = time.strftime("%m-%d %H:%M", time.localtime(ack["ts"]))
+            print(f"- {text}")
+            print(f"  - **waived {when}:** \"{ack['reason']}\"")
 
     if hours < 23.0:
         print(f"\n## NO-GO for P2 — window too short ({hours:.1f}h of 24h)")
@@ -746,6 +895,16 @@ def cmd_summary() -> int:
         print("item, and P2 is clear to proceed on everything else.")
         return 2
 
+    if waived:
+        n = len(waived)
+        print(f"\n## GO for P2 — with {n} waived finding"
+              f"{'s' if n > 1 else ''}")
+        print("Not a clean window. Everything else is a class the lockdown")
+        print("is meant to stop, and everything that must stay permitted was")
+        print("seen in use — but the finding(s) above were signed off rather")
+        print("than observed away, and that is recorded here on purpose.")
+        return 0
+
     print("\n## GO for P2")
     print("Every non-zero counter is a class the lockdown is meant to stop,")
     print("and everything that must stay permitted was seen in use.")
@@ -758,6 +917,12 @@ if __name__ == "__main__":
         sys.exit(cmd_snapshot())
     if mode == "summary":
         sys.exit(cmd_summary())
+    if mode == "ack":
+        if len(sys.argv) < 4:
+            print("usage: gsfw-observe ack <counter> \"why it is fine\"",
+                  file=sys.stderr)
+            sys.exit(2)
+        sys.exit(cmd_ack(sys.argv[2], " ".join(sys.argv[3:])))
     if mode == "event":
         if len(sys.argv) < 3:
             print("usage: gsfw-observe event \"what happened\"", file=sys.stderr)
