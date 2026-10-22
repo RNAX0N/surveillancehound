@@ -12,6 +12,16 @@
 # a-camera-cable case, which is the point) or unexpected, in which case
 # enforcing without this window would have caused an outage.
 #
+# EVERY COUNTED CLASS IS TWO RULES, and must stay that way.
+# `limit rate` is a MATCH in nftables, not a modifier on `log`. Written
+# as one rule, the counter incremented, the limit then failed, the
+# `return` never ran, and the packet fell through to be counted a SECOND
+# time further down — usually by `fwd_other`. Totals would have inflated
+# and class attribution would have been wrong precisely under load,
+# which is when this table is worth reading. (The 24h window is
+# unaffected: no class came near its rate.) The enforcing table had the
+# same shape with a worse consequence — see gsfw-enforce.nft.
+#
 # Own table, replaced atomically by name. Nothing Docker owns is named.
 # See mailbox-agents/surveillancehound-nvr-hardening-PLAN_2026-10-20.md
 
@@ -87,38 +97,44 @@ table inet gsfw {
         oifname "wg0" ip daddr 10.77.0.0/24 tcp dport 554 return
         ip saddr 88.255.1.221 oifname "enp6s0.*" tcp dport { 22, 443 } return
 
-        # Admin ping into a camera VLAN. ADDED 2026-10-22 because the
+        # Ping into a camera VLAN from the LAN. ADDED 2026-10-22: the
         # window caught exactly one packet of it — the operator pinging
         # camera 3 while it rebooted for its MAC change — and P2 as
         # drafted would have dropped it. "Can I ping the camera" is the
         # first thing anyone asks when one does not come back, and
         # losing it looks precisely like the lockdown broke something.
-        # Echo REQUEST only, from the admin host only; the reply comes
-        # back on the established rule above.
-        ip saddr 88.255.1.221 oifname "enp6s0.*" icmp type echo-request return
+        #
+        # Scoped to the LAN per the operator: echo REQUEST only, arriving
+        # on the LAN interface, from LAN space. The interface match is
+        # what makes "from the LAN" true; the saddr match is belt-and-
+        # braces while `rp_filter` is still 0 (P4 fixes that), since
+        # without it nothing stops a forged LAN source from elsewhere.
+        # Replies ride the established rule above.
+        iifname "enp4s0" ip saddr 88.255.0.0/16 oifname "enp6s0.*" \
+            icmp type echo-request return
 
         # ---- classes P2 will DROP. Count, log sparsely, then RETURN.
-        iifname "wg0" oifname "wg0" counter name fwd_wg_to_wg \
-            log prefix "gsfw-wouldblock wg-to-wg: " level info limit rate 6/minute return
-        iifname "wg0" counter name fwd_wg_initiated \
-            log prefix "gsfw-wouldblock wg-initiated: " level info limit rate 6/minute return
+        iifname "wg0" oifname "wg0" limit rate 6/minute log prefix "gsfw-wouldblock wg-to-wg: " level info
+        iifname "wg0" oifname "wg0" counter name fwd_wg_to_wg return
+        iifname "wg0" limit rate 6/minute log prefix "gsfw-wouldblock wg-initiated: " level info
+        iifname "wg0" counter name fwd_wg_initiated return
 
         # Anything pulling RTSP from a camera that is not Frigate. The
         # operator asked for this one specifically, by pre-NAT source.
-        ip daddr 117.111.0.0/16 tcp dport 554 counter name fwd_rtsp_nonfrigate \
-            log prefix "gsfw-wouldblock rtsp-not-frigate: " level warn limit rate 12/minute return
+        ip daddr 117.111.0.0/16 tcp dport 554 limit rate 12/minute log prefix "gsfw-wouldblock rtsp-not-frigate: " level warn
+        ip daddr 117.111.0.0/16 tcp dport 554 counter name fwd_rtsp_nonfrigate return
 
         # A camera VLAN talking out to anything. With forward policy
         # ACCEPT today, this reaches every camera, the LAN, and the
         # internet. This counter being non-zero is the finding.
-        iifname "enp6s0.*" counter name fwd_cam_egress \
-            log prefix "gsfw-wouldblock cam-egress: " level warn limit rate 12/minute return
+        iifname "enp6s0.*" limit rate 12/minute log prefix "gsfw-wouldblock cam-egress: " level warn
+        iifname "enp6s0.*" counter name fwd_cam_egress return
 
-        oifname "enp6s0.*" counter name fwd_into_cam_other \
-            log prefix "gsfw-wouldblock into-cam: " level info limit rate 12/minute return
+        oifname "enp6s0.*" limit rate 12/minute log prefix "gsfw-wouldblock into-cam: " level info
+        oifname "enp6s0.*" counter name fwd_into_cam_other return
 
-        counter name fwd_other \
-            log prefix "gsfw-wouldblock other-forward: " level info limit rate 6/minute return
+        limit rate 6/minute log prefix "gsfw-wouldblock other-forward: " level info
+        counter name fwd_other return
     }
 
     chain observe_input {
@@ -158,23 +174,35 @@ table inet gsfw {
         # Anything else a camera sends AT the NVR. P3 drops this, so a
         # non-zero counter here is a service something depends on that
         # nobody mentioned.
-        iifname "enp6s0.101" counter name in_oth_101 log prefix "gsfw-wouldblock cam-to-nvr c101: " level warn limit rate 6/minute return
-        iifname "enp6s0.102" counter name in_oth_102 log prefix "gsfw-wouldblock cam-to-nvr c102: " level warn limit rate 6/minute return
-        iifname "enp6s0.103" counter name in_oth_103 log prefix "gsfw-wouldblock cam-to-nvr c103: " level warn limit rate 6/minute return
-        iifname "enp6s0.104" counter name in_oth_104 log prefix "gsfw-wouldblock cam-to-nvr c104: " level warn limit rate 6/minute return
-        iifname "enp6s0.105" counter name in_oth_105 log prefix "gsfw-wouldblock cam-to-nvr c105: " level warn limit rate 6/minute return
-        iifname "enp6s0.106" counter name in_oth_106 log prefix "gsfw-wouldblock cam-to-nvr c106: " level warn limit rate 6/minute return
-        iifname "enp6s0.107" counter name in_oth_107 log prefix "gsfw-wouldblock cam-to-nvr c107: " level warn limit rate 6/minute return
-        iifname "enp6s0.108" counter name in_oth_108 log prefix "gsfw-wouldblock cam-to-nvr c108: " level warn limit rate 6/minute return
-        iifname "enp6s0.109" counter name in_oth_109 log prefix "gsfw-wouldblock cam-to-nvr c109: " level warn limit rate 6/minute return
-        iifname "enp6s0.110" counter name in_oth_110 log prefix "gsfw-wouldblock cam-to-nvr c110: " level warn limit rate 6/minute return
-        iifname "enp6s0.111" counter name in_oth_111 log prefix "gsfw-wouldblock cam-to-nvr c111: " level warn limit rate 6/minute return
-        iifname "enp6s0.112" counter name in_oth_112 log prefix "gsfw-wouldblock cam-to-nvr c112: " level warn limit rate 6/minute return
+        iifname "enp6s0.101" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c101: " level warn
+        iifname "enp6s0.101" counter name in_oth_101 return
+        iifname "enp6s0.102" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c102: " level warn
+        iifname "enp6s0.102" counter name in_oth_102 return
+        iifname "enp6s0.103" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c103: " level warn
+        iifname "enp6s0.103" counter name in_oth_103 return
+        iifname "enp6s0.104" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c104: " level warn
+        iifname "enp6s0.104" counter name in_oth_104 return
+        iifname "enp6s0.105" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c105: " level warn
+        iifname "enp6s0.105" counter name in_oth_105 return
+        iifname "enp6s0.106" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c106: " level warn
+        iifname "enp6s0.106" counter name in_oth_106 return
+        iifname "enp6s0.107" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c107: " level warn
+        iifname "enp6s0.107" counter name in_oth_107 return
+        iifname "enp6s0.108" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c108: " level warn
+        iifname "enp6s0.108" counter name in_oth_108 return
+        iifname "enp6s0.109" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c109: " level warn
+        iifname "enp6s0.109" counter name in_oth_109 return
+        iifname "enp6s0.110" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c110: " level warn
+        iifname "enp6s0.110" counter name in_oth_110 return
+        iifname "enp6s0.111" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c111: " level warn
+        iifname "enp6s0.111" counter name in_oth_111 return
+        iifname "enp6s0.112" limit rate 6/minute log prefix "gsfw-wouldblock cam-to-nvr c112: " level warn
+        iifname "enp6s0.112" counter name in_oth_112 return
 
         # Management, and management from the wrong side of the house.
         iifname "enp4s0" ip saddr 88.255.1.221 tcp dport { 22, 8971 } \
             counter name in_admin_mgmt return
-        tcp dport { 22, 8971 } counter name in_mgmt_offlan \
-            log prefix "gsfw-wouldblock mgmt-not-lan: " level warn limit rate 12/minute return
+        tcp dport { 22, 8971 } limit rate 12/minute log prefix "gsfw-wouldblock mgmt-not-lan: " level warn
+        tcp dport { 22, 8971 } counter name in_mgmt_offlan return
     }
 }

@@ -1,0 +1,139 @@
+#!/usr/sbin/nft -f
+#
+# P2 — FORWARD LOCKDOWN. This one actually drops.
+#
+# Approved by the operator 2026-10-22 on the strength of the P1
+# observation window: over 23.6 hours every drop below fired zero times
+# except one admin ping, which is now an explicit allow. So this closes
+# the laptop-on-a-camera-cable hole without cutting anything that was
+# observed to be in use.
+#
+# WHY A SEPARATE TABLE, at a LATER priority than the observer.
+# `inet gsfw` observes at `filter + 10` with `policy accept` and counts
+# what P2 would drop. This table enforces at `filter + 20`, so the
+# observer still sees every packet first. That is what makes
+# verification a measurement rather than a hope: after this is loaded,
+# an increment on `fwd_cam_egress` over there must be matched by one on
+# `e_cam_egress_drop` here. If the two disagree, the model is wrong.
+# Replacing the observe table with an enforcing one would have thrown
+# away the before/after comparison and the 24h of history with it.
+#
+# Nothing here touches the input or output chains, so it cannot break
+# SSH to this host or the relay agent, both of which are host-local.
+# `ip filter` (Docker) and `inet myfw` are untouched and unnamed.
+#
+# WHY EVERY DROP IS TWO RULES.
+# `limit rate` in nftables is a MATCH, not a modifier on `log`. Written
+# as one rule — `counter … log … limit rate 12/minute drop` — the rule
+# stops matching once the rate budget is spent, and the packet FALLS
+# THROUGH to whatever comes next. Here that was `iifname "br-*" accept`,
+# so container traffic toward a camera above 12 packets/minute would
+# have been ACCEPTED by the rule written to drop it: a flood bypass in
+# the one chain whose job is to stop floods.
+#
+# So the log is its own rule, which always falls through by design, and
+# the drop below it is unconditional. The two must stay adjacent and in
+# that order. Found 2026-10-22 by three stray packets landing on
+# `e_other_drop` when they should have hit `e_into_cam_drop`.
+#
+# See mailbox-agents/surveillancehound-nvr-hardening-PLAN_2026-10-20.md §P2
+
+table inet gsfw_enforce
+delete table inet gsfw_enforce
+
+table inet gsfw_enforce {
+    # ---- what is dropped. Each has a counter because, per the plan,
+    #      P2's acceptance test is a COUNTER, not a successful load:
+    #      nftables happily accepts a rule naming an interface that does
+    #      not exist, so "it loaded" proves nothing about what it matches.
+    counter e_cam_egress_drop { comment "a camera VLAN initiating off its /30: the reason P2 exists" }
+    counter e_rtsp_nonfrigate { comment "something other than Frigate pulling tcp/554 from a camera" }
+    counter e_into_cam_drop   { comment "toward a camera, not Frigate RTSP / admin / LAN ping" }
+    counter e_wg_to_wg_drop   { comment "tunnel peer to tunnel peer" }
+    counter e_wg_init_drop    { comment "a tunnel peer initiating" }
+    counter e_other_drop      { comment "forwarded, matched no allow class: the default drop" }
+
+    # ---- what is allowed. Counted too, so the allowlist can be
+    #      tightened later from evidence instead of from guesswork.
+    counter e_frigate_rtsp    { comment "Frigate -> camera tcp/554" }
+    counter e_lan_ping        { comment "LAN -> camera icmp echo-request" }
+    counter e_admin_mgmt      { comment "admin host -> camera tcp/{22,443}" }
+    counter e_bridge_egress   { comment "container egress to a non-camera destination" }
+    counter e_wg_rtsp         { comment "Frigate -> tunnel peer tcp/554 (inert until wg0 exists)" }
+
+    chain enforce_forward {
+        type filter hook forward priority filter + 20; policy drop;
+
+        # Replies to anything already permitted. Must come first: the
+        # camera-egress drop below would otherwise kill the RTSP stream
+        # Frigate asked for, since the video flows camera -> Frigate.
+        ct state established,related accept
+
+        # Frigate's published ports arrive DNAT'd. The plan flags this
+        # as the load-bearing rule whose absence stops recording.
+        ct status dnat accept
+
+        # ---- THE POINT OF P2 -------------------------------------------
+        # A camera VLAN may not initiate anything through this box. With
+        # forward policy ACCEPT as it was, a laptop on a camera cable
+        # reached every other camera, the LAN and the internet. The
+        # window measured this at zero packets in 23.6h, so nothing
+        # legitimate is losing a path here.
+        iifname "enp6s0.*" limit rate 12/minute log prefix "gsfw-drop cam-egress: " level warn
+        iifname "enp6s0.*" counter name e_cam_egress_drop drop
+
+        # ---- toward the cameras: three ways in, nothing else ----------
+        ip saddr 172.19.0.2 ip daddr 117.111.0.0/16 tcp dport 554 \
+            counter name e_frigate_rtsp accept
+
+        # Ping from the LAN, per the operator. Echo REQUEST only; the
+        # reply is carried by `established` above.
+        iifname "enp4s0" ip saddr 88.255.0.0/16 oifname "enp6s0.*" \
+            icmp type echo-request counter name e_lan_ping accept
+
+        # Camera management stays scoped to the admin host, which is
+        # narrower than the ping allowance on purpose: reaching a
+        # camera's shell or web UI is not the same as asking whether it
+        # is alive. Widening this to LAN space is one word if wanted.
+        iifname "enp4s0" ip saddr 88.255.1.221 oifname "enp6s0.*" \
+            tcp dport { 22, 443 } counter name e_admin_mgmt accept
+
+        # Non-Frigate RTSP gets its OWN counter, mirroring the observer's
+        # `fwd_rtsp_nonfrigate`. Without the split, verification needed
+        # arithmetic: the observer read 3 and the enforcer read 7 for the
+        # same packets, because one separated this class and the other
+        # folded it into the general into-camera drop. A comparison that
+        # has to be reconciled by hand is a comparison that stops being
+        # made, and this pair of tables exists precisely so the check is
+        # mechanical: same class, same name, same number.
+        ip daddr 117.111.0.0/16 tcp dport 554 limit rate 12/minute log prefix "gsfw-drop rtsp-not-frigate: " level warn
+        ip daddr 117.111.0.0/16 tcp dport 554 counter name e_rtsp_nonfrigate drop
+
+        oifname "enp6s0.*" limit rate 12/minute log prefix "gsfw-drop into-cam: " level warn
+        oifname "enp6s0.*" counter name e_into_cam_drop drop
+
+        # ---- the tunnel. wg0 does not exist yet, so these match
+        #      nothing today; they are here so the camera session's
+        #      cutover lands on a policy that is already correct rather
+        #      than on a chain that has to be edited under pressure.
+        iifname "wg0" oifname "wg0" limit rate 6/minute log prefix "gsfw-drop wg-to-wg: " level warn
+        iifname "wg0" oifname "wg0" counter name e_wg_to_wg_drop drop
+        oifname "wg0" ip daddr 10.77.0.0/24 tcp dport 554 \
+            counter name e_wg_rtsp accept
+        iifname "wg0" limit rate 6/minute log prefix "gsfw-drop wg-initiated: " level warn
+        iifname "wg0" counter name e_wg_init_drop drop
+
+        # ---- container egress elsewhere -------------------------------
+        # Allowed because this is the NVR application and the approved
+        # scope says so. Counted because the window recorded ZERO new
+        # outbound non-RTSP flows from it in 23.6h, which suggests this
+        # could be narrowed to nothing — but "I saw none for a day" is
+        # not "it needs none", and the box that records is the wrong
+        # place to find out the hard way. The counter turns that into a
+        # measurement instead of an argument.
+        iifname "br-*" counter name e_bridge_egress accept
+
+        limit rate 6/minute log prefix "gsfw-drop other: " level info
+        counter name e_other_drop drop
+    }
+}
