@@ -28,6 +28,12 @@ rm -rf /usr/local/opnsense/mvc/app/controllers/OPNsense/Hound \
        /usr/local/opnsense/mvc/app/views/OPNsense/Hound \
        /usr/local/opnsense/scripts/OPNsense/Hound
 rm -f  /usr/local/opnsense/service/conf/actions.d/actions_hound.conf
+# The dashboard widget. Easy to forget because it does not live under a
+# Hound/ directory like everything else above, and leaving it behind is
+# not harmless: the dashboard would keep offering a tile whose API is
+# gone, so it renders an error for every user on every page load.
+rm -f  /usr/local/opnsense/www/js/widgets/SurveillanceHound.js \
+       /usr/local/opnsense/www/js/widgets/Metadata/SurveillanceHound.xml
 ok "plugin removed"
 
 say "removing the hound CLI"

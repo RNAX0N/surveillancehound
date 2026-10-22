@@ -64,6 +64,50 @@ class DashboardController extends ApiControllerBase
     }
 
     /**
+     * Forget ONE device row, by address.
+     *
+     * The per-row companion to forgetUnclaimed. That one only removes
+     * rows the configuration no longer claims, which leaves the case an
+     * operator actually hits: an address still listed under Camera IPs
+     * whose traffic this box can no longer see, because the camera moved
+     * behind a relay agent. Device rows come only from OBSERVED traffic,
+     * so such a row is stale, unremovable by the other button, and will
+     * not be re-created on its own.
+     *
+     * The address is validated as an IP here and nowhere else matters:
+     * it is interpolated into a configd command line, so anything that
+     * is not an address must not get that far.
+     *
+     * POST-only: it mutates.
+     *
+     * @return array
+     */
+    public function forgetDeviceAction()
+    {
+        if (!$this->request->isPost()) {
+            return ['status' => 'failed',
+                    'message' => gettext('POST required')];
+        }
+        $ip = (string)$this->request->getPost('ip', null, '');
+        if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
+            return ['status' => 'failed',
+                    'message' => gettext('Not an IP address.')];
+        }
+        $backend = new Backend();
+        $output = trim($backend->configdRun('hound forget-device ' . $ip));
+        if ($output === '') {
+            return [
+                'status' => 'failed',
+                'message' => gettext(
+                    'No response from the hound backend. Run "configctl ' .
+                    'hound forget-device <ip>" from a shell to see why.'
+                ),
+            ];
+        }
+        return ['status' => 'ok', 'response' => $output];
+    }
+
+    /**
      * Return the dashboard document produced by `hound export`.
      *
      * @param string $limit max alert/flow rows; clamped, and validated as

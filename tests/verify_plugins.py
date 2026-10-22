@@ -243,7 +243,12 @@ def _check_systemd_unit_parses() -> None:
                     f"directive will be IGNORED at runtime — move the "
                     f"comment to its own line:\n    {line}")
         # And it must parse as INI at all, which is what systemd expects.
-        cp = configparser.ConfigParser(strict=False)
+        # interpolation=None: systemd is not configparser. A template
+        # unit's `%i` (and `%H`, `%n`, …) are systemd specifiers, and the
+        # default interpolation treats `%` as its own syntax and raises
+        # on them — so adding a perfectly valid `foo@.service` broke this
+        # check rather than the unit.
+        cp = configparser.ConfigParser(strict=False, interpolation=None)
         cp.read_string(u.read_text())
         assert "Service" in cp, f"{u}: no [Service] section"
         assert cp["Service"].get("ExecStart"), f"{u}: no ExecStart"
@@ -694,6 +699,87 @@ def _check_opnsense_menu_xml() -> None:
     assert entry.get("VisibleName"), f"{hound}: entry has no VisibleName"
     print(f"  OPNsense menu: {len(menus)} Menu.xml — category/entry shape "
           f"matches core plugins, properties are attributes")
+
+
+def _check_opnsense_widget() -> None:
+    """The dashboard widget must line up with its metadata and its API.
+
+    Three ways a widget breaks silently, none of which show up as an
+    error anywhere an operator looks — the tile simply renders blank or
+    says "undefined":
+
+    * a `this.translations.X` with no X in the metadata XML yields the
+      JavaScript string "undefined" in the user's face;
+    * a filename in the metadata that does not match the class file
+      means the dashboard offers a widget it cannot load;
+    * an <endpoint> the ACL does not cover hides the widget from every
+      user, including the one who installed it.
+
+    Same idea as the Wazuh field check: the thing that drifts is the
+    reference between two files nobody edits together.
+    """
+    wdir = OPNSENSE / "src" / "opnsense" / "www" / "js" / "widgets"
+    metas = sorted((wdir / "Metadata").glob("*.xml"))
+    assert metas, f"no widget metadata under {wdir / 'Metadata'}"
+
+    acl = ET.parse(OPNSENSE / "src/opnsense/mvc/app/models/OPNsense/Hound/"
+                   "ACL/ACL.xml").getroot()
+    patterns = [e.text or "" for e in acl.iter("pattern")]
+
+    for meta in metas:
+        root = ET.parse(meta).getroot()
+        for widget in root:
+            fn = widget.findtext("filename")
+            assert fn, f"{meta.name}: {widget.tag} has no <filename>"
+            js = wdir / fn
+            assert js.is_file(), f"{meta.name}: {fn} does not exist"
+
+            src = js.read_text()
+            declared = {t.tag for t in widget.find("translations") or []}
+            used = set(re.findall(r"this\.translations\.([A-Za-z_]\w*)", src))
+            missing = used - declared
+            assert not missing, (
+                f"{fn} uses translations absent from {meta.name}: "
+                f"{sorted(missing)} — these render as 'undefined'")
+
+            # The class name must match the file, since the dashboard
+            # imports by filename and instantiates by it.
+            stem = js.stem
+            assert re.search(rf"export default class {stem}\b", src), (
+                f"{fn}: expected `export default class {stem}`")
+
+            for ep in widget.iter("endpoint"):
+                url = (ep.text or "").lstrip("/")
+                covered = any(
+                    url.startswith(pat.rstrip("*")) for pat in patterns)
+                assert covered, (
+                    f"{meta.name}: endpoint {ep.text} is not covered by the "
+                    f"plugin ACL {patterns} — the widget would be hidden "
+                    f"from every user")
+
+            # An endpoint the controller does not implement is the same
+            # class of silent break, so check the action exists.
+            m = re.match(r"/api/hound/(\w+)/(\w+)", ep.text or "")
+            if m:
+                ctrl = (OPNSENSE / "src/opnsense/mvc/app/controllers/"
+                        "OPNsense/Hound/Api" /
+                        f"{m.group(1).capitalize()}Controller.php")
+                assert ctrl.is_file(), f"no controller for {ep.text}"
+                assert f"function {m.group(2)}Action" in ctrl.read_text(), (
+                    f"{ctrl.name} has no {m.group(2)}Action for {ep.text}")
+
+    # Uninstall must take the widget with it, or the dashboard keeps
+    # offering a tile whose API has gone.
+    uninstall = (OPNSENSE / "uninstall.sh").read_text()
+    for meta in metas:
+        for widget in ET.parse(meta).getroot():
+            fn = widget.findtext("filename")
+            assert fn in uninstall, f"uninstall.sh does not remove {fn}"
+        assert meta.name in uninstall, (
+            f"uninstall.sh does not remove {meta.name}")
+
+    print(f"  OPNsense widget: {len(metas)} metadata file(s), translations, "
+          f"endpoints, ACL and uninstall all line up")
 
 
 def _check_opnsense_renderer_error_path() -> None:
@@ -1209,6 +1295,7 @@ def main() -> int:
     _check_dashboard_reports_its_own_failure()
     _check_opnsense_layout()
     _check_opnsense_menu_xml()
+    _check_opnsense_widget()
     _check_opnsense_form_ids()
     print()
     print("=== OPNsense renderer ===")

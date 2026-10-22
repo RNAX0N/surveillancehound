@@ -264,10 +264,21 @@ $(document).ready(function() {
                     '<td>' + ((stale || c.availability === null)
                         ? 'n/a'
                         : (num(c.availability) * 100).toFixed(2) + '%') + '</td>' +
+                    /* Only local rows: this box can delete what it
+                       recorded itself. A relayed row belongs to the
+                       sensor that sent it, and the only lever for those
+                       is dropping the whole sensor — too large a blast
+                       radius to hang on a row-level button. */
+                    '<td>' + ((!c.sensor || c.sensor === 'local')
+                        ? '<button type="button" class="btn btn-default btn-xs hound-forget-row"' +
+                          ' data-ip="' + esc(c.ip) + '" title="' +
+                          "{{ lang._('Remove this row. Device rows come only from traffic this box observed, so one it can no longer see stays until deleted.') }}" +
+                          '"><i class="fa fa-times"></i></button>'
+                        : '') + '</td>' +
                     '</tr>';
             });
             $("#tbl-uptime tbody").html(rows ||
-                '<tr><td colspan="8">' +
+                '<tr><td colspan="9">' +
                 "{{ lang._('No cameras known yet — set Camera IPs under Settings.') }}" +
                 '</td></tr>');
 
@@ -417,19 +428,51 @@ $(document).ready(function() {
             stopPolling();
         }
     });
+
+    /* The dashboard is the landing tab, so no `shown.bs.tab` fires for it
+       on load — that event is only emitted when a tab is switched TO.
+       Without this the page opened on an empty table and stayed empty
+       until the operator clicked away and back. */
+    if ($("#dashboard").hasClass("active")) {
+        startPolling();
+    }
+    /* Delegated: the rows are rebuilt on every poll, so a handler bound
+       to the buttons themselves would be lost ten seconds later. */
+    $("#tbl-uptime").on("click", ".hound-forget-row", function () {
+        var $b = $(this).prop("disabled", true), ip = $b.data("ip");
+        ajaxCall("/api/hound/dashboard/forgetDevice", {'ip': ip}, function (d) {
+            if (d && d.status === 'ok') {
+                $("#hound-dash-error")
+                    .attr('class', 'alert alert-success')
+                    .text(d.response || "{{ lang._('Removed.') }}").show();
+                loadDashboard();
+            } else {
+                $b.prop("disabled", false);
+                $("#hound-dash-error")
+                    .attr('class', 'alert alert-danger')
+                    .text((d && d.message) ||
+                          "{{ lang._('Could not reach the hound backend.') }}")
+                    .show();
+            }
+        });
+    });
+
     $("#hound-refresh").click(function () { loadDashboard(); });
 });
 </script>
 
+<!-- Dashboard first: this page is opened to look at the cameras far more
+     often than to change a setting, and landing on a form invites editing
+     something by accident on the way to a glance. -->
 <ul class="nav nav-tabs" role="tablist" id="maintabs">
-    <li class="active"><a data-toggle="tab" href="#settings">{{ lang._('Settings') }}</a></li>
-    <li><a data-toggle="tab" href="#dashboard">{{ lang._('Dashboard') }}</a></li>
+    <li class="active"><a data-toggle="tab" href="#dashboard">{{ lang._('Dashboard') }}</a></li>
+    <li><a data-toggle="tab" href="#settings">{{ lang._('Settings') }}</a></li>
     <li><a data-toggle="tab" href="#help">{{ lang._('Help') }}</a></li>
 </ul>
 
 <div class="tab-content content-box">
 
-    <div id="settings" class="tab-pane fade in active">
+    <div id="settings" class="tab-pane fade">
         <div class="content-box-main">
             {{ partial("layout_partials/base_form",
                        ['fields': generalForm, 'id': 'frm_general_settings']) }}
@@ -450,7 +493,7 @@ $(document).ready(function() {
         </div>
     </div>
 
-    <div id="dashboard" class="tab-pane fade">
+    <div id="dashboard" class="tab-pane fade in active">
         <div class="content-box-main">
 
             <div id="hound-dash-error" class="alert alert-danger" style="display:none;"></div>
@@ -497,6 +540,7 @@ $(document).ready(function() {
                             <th>{{ lang._('Down for') }}</th>
                             <th>{{ lang._('Outages') }}</th>
                             <th>{{ lang._('Availability') }}</th>
+                            <th></th>
                         </tr>
                     </thead>
                     <tbody></tbody>

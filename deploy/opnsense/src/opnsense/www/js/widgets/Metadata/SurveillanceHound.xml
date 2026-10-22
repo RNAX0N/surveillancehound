@@ -1,0 +1,35 @@
+<metadata>
+    <!--
+        Widget registration for the OPNsense dashboard.
+
+        The dashboard discovers widgets by reading every XML in this
+        Metadata directory, so a plugin ships its own file here rather
+        than editing Core.xml. The element name is the widget id; the
+        filename must match the class file next to this directory.
+
+        <endpoints> is not documentation: the dashboard uses it to
+        decide whether the logged-in user may see this widget at all,
+        by checking the ACL for each listed endpoint. Omit it and the
+        widget shows for everyone; get it wrong and it shows for nobody.
+    -->
+    <surveillancehound>
+        <filename>SurveillanceHound.js</filename>
+        <link>/ui/hound/</link>
+        <endpoints>
+            <endpoint>/api/hound/dashboard/data</endpoint>
+        </endpoints>
+        <translations>
+            <title>SurveillanceHound</title>
+            <monitor>Monitor</monitor>
+            <cameras>Cameras up</cameras>
+            <alerts>Alerts (24h)</alerts>
+            <watching>watching</watching>
+            <stalled>capture stalled</stalled>
+            <stopped>not running</stopped>
+            <unreachable>backend unreachable</unreachable>
+            <unknown>unknown — not watching</unknown>
+            <down>down</down>
+            <neverseen>never seen</neverseen>
+        </translations>
+    </surveillancehound>
+</metadata>
