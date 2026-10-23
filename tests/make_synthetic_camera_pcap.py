@@ -83,6 +83,24 @@ def build() -> bytes:
         ts = BASE_TS + 50 + i * 1.05  # spans ~210 s
         out += _tcp_packet(ts, CAMERA_IP, "192.0.2.7", 53000, 4444, 96)
 
+    # 5) the camera beaconing to the limited broadcast address. Shaped on
+    #    the real thing: a fisheye on vendor firmware sending ~200 bytes
+    #    to 255.255.255.255:10008 every half hour. It is NOT in
+    #    lan_subnets and is not private, so before `broadcast_beacon`
+    #    existed this landed in telemetry_offnet at MEDIUM — forty
+    #    unactionable medium alerts a day from one camera.
+    for i in range(3):
+        ts = BASE_TS + 300 + i * 0.4
+        out += _tcp_packet(ts, CAMERA_IP, "255.255.255.255",
+                           52974, 10008, 209)
+
+    # 6) ...and to a multicast group, which also cannot be routed off
+    #    the segment. Same class, different reason to be unroutable.
+    for i in range(2):
+        ts = BASE_TS + 320 + i * 0.4
+        out += _tcp_packet(ts, CAMERA_IP, "239.255.255.250",
+                           52975, 1900, 180)
+
     return bytes(out)
 
 

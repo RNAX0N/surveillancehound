@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from surveillancehound.alerts import Alert, AlertEngine
 from surveillancehound.baseline import BaselineEngine, HSEngine, make_engine
 from surveillancehound.capture import CaptureError, stream_packets
-from surveillancehound.classify import FlowClassifier
+from surveillancehound.classify import FlowClassifier, is_broadcast_or_multicast
 from surveillancehound.config import HoundCfg
 from surveillancehound.discover import DeviceClassifier
 from surveillancehound.flows import FlowAggregator, LiveFlow
@@ -706,16 +706,28 @@ class Hound:
                 fc.src_ip, cam_role, fl.last_ts, fl.packets, fl.bytes,
                 first_seen=fl.first_ts,
             )
-            self.store.upsert_device(
-                fc.dst_ip, self.devices.role_for(fc.dst_ip), fl.last_ts, 0, 0,
-                first_seen=fl.first_ts,
-            )
+            # A broadcast or multicast address is not a device. Storing
+            # one gave "255.255.255.255" a row in the register, a line in
+            # "Devices seen", and a `new_device` alert — for an address
+            # nobody is at. The beacon that revealed it is already
+            # reported as `broadcast_beacon`.
+            if not is_broadcast_or_multicast(fc.dst_ip):
+                self.store.upsert_device(
+                    fc.dst_ip, self.devices.role_for(fc.dst_ip),
+                    fl.last_ts, 0, 0, first_seen=fl.first_ts,
+                )
             # alert from the flow
             alert = self.alerts.from_flow(fc, now)
             if alert is not None:
                 self._emit(alert)
             # new-peer alert: a camera contacted a peer it hasn't talked to before
-            if cam_role == "camera":
+            # A broadcast or multicast address is NOT a peer. "camera
+            # 117.111.109.2 contacted a new peer: 255.255.255.255" says
+            # nothing about who the camera talked to — nobody answers at
+            # that address, and every camera on the segment generates the
+            # same line. The beacon itself is already reported as
+            # `broadcast_beacon`.
+            if cam_role == "camera" and not is_broadcast_or_multicast(fc.dst_ip):
                 peers = self._known_peers_per_camera.setdefault(fc.src_ip, set())
                 if fc.dst_ip not in peers:
                     peers.add(fc.dst_ip)
@@ -733,6 +745,11 @@ class Hound:
 
     def _maybe_new_device(self, ip: str, now: float) -> None:
         if ip in self._seen_ips:
+            return
+        # Not a device: see the upsert in _flush. Marked seen so the
+        # check is not repeated for every packet of every beacon.
+        if is_broadcast_or_multicast(ip):
+            self._seen_ips.add(ip)
             return
         self._seen_ips.add(ip)
         # the very first observation might be on a router/loopback — only alert

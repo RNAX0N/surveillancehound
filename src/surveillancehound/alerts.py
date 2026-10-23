@@ -27,6 +27,11 @@ KIND_BULK_INBOUND = "bulk_inbound"
 KIND_CONTROL_CHANNEL = "control_channel_suspect"
 KIND_TELEMETRY_OFFNET = "telemetry_offnet"
 KIND_CAMERA_TO_CAMERA = "camera_to_camera"
+# Broadcast / multicast from a camera. Its own kind at INFO because it
+# cannot leave the segment: it used to land in telemetry_offnet at
+# medium, where one camera's 30-minute beacon produced forty unactionable
+# medium alerts a day and taught the operator to ignore that severity.
+KIND_BROADCAST_BEACON = "broadcast_beacon"
 KIND_NEW_DEVICE = "new_device"
 KIND_NEW_PEER = "new_peer"
 KIND_CAMERA_OFFLINE = "camera_offline"
@@ -53,6 +58,7 @@ _REPORTABLE_FLOW = {
     "control_channel_suspect": (KIND_CONTROL_CHANNEL, "medium"),
     "telemetry_offnet": (KIND_TELEMETRY_OFFNET, "medium"),
     "camera_to_camera": (KIND_CAMERA_TO_CAMERA, "low"),
+    "broadcast_beacon": (KIND_BROADCAST_BEACON, "info"),
 }
 
 

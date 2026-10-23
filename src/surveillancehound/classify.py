@@ -28,6 +28,8 @@ Device events (emitted by the periodic tick, not by per-flow classification):
 
 from __future__ import annotations
 
+import ipaddress
+
 from dataclasses import dataclass
 
 from surveillancehound.config import NetworkCfg, ThresholdCfg
@@ -100,6 +102,28 @@ class FlowClassifier:
                 return self._mk("lan_normal", "info", cam_ep, peer_ep,
                                 bytes_to_camera, bytes_from_camera,
                                 f"LAN traffic between camera {cam_ep[0]} and {peer_ip}.")
+            # BROADCAST AND MULTICAST FIRST, because they cannot leave
+            # the segment and so cannot be exfiltration — which is what
+            # every class below this line is about.
+            #
+            # `255.255.255.255` is not in lan_subnets and is not private,
+            # so it fell through to telemetry_offnet at MEDIUM. One
+            # camera beaconing to 255.255.255.255:10008 every 30 minutes
+            # produced about forty medium alerts a day that no operator
+            # can act on, and that is how a medium severity stops meaning
+            # anything. It is still worth SEEING — a camera shouting on
+            # the wire is worth knowing about — so it is reported, at
+            # info, under its own name.
+            if self._is_broadcast_or_multicast(peer_ip):
+                return self._mk(
+                    "broadcast_beacon", "info", cam_ep, peer_ep,
+                    bytes_to_camera, bytes_from_camera,
+                    f"camera {cam_ep[0]} is beaconing to {peer_ip}:"
+                    f"{peer_port}. Broadcast and multicast cannot be "
+                    f"routed off this segment, so nothing is leaving the "
+                    f"network — but something on the camera is announcing "
+                    f"itself.",
+                )
             # peer is off-LAN, not allowlisted — the interesting cases
             if bytes_to_camera >= self.t.bulk_inbound_bytes:
                 return self._mk(
@@ -142,6 +166,13 @@ class FlowClassifier:
             "neither endpoint is a known camera.",
         )
 
+    @staticmethod
+    def _is_broadcast_or_multicast(ip: str) -> bool:
+        """Thin wrapper; the daemon shares the module-level function so
+        `new_peer` and the classifier cannot disagree about what counts
+        as unroutable."""
+        return is_broadcast_or_multicast(ip)
+
     def _mk(
         self, cls: str, sev: str, cam_ep: tuple, peer_ep: tuple,
         to_cam: int, from_cam: int, detail: str,
@@ -153,3 +184,24 @@ class FlowClassifier:
             bytes_to_camera=to_cam, bytes_from_camera=from_cam,
             detail=detail,
         )
+
+
+def is_broadcast_or_multicast(ip: str) -> bool:
+    """Addresses that cannot be routed off the local segment.
+
+    Limited broadcast (255.255.255.255) and multicast (224.0.0.0/4,
+    plus IPv6 ff00::/8). SUBNET broadcast is deliberately NOT here:
+    recognising 117.111.105.3 as the broadcast of a /30 needs the
+    mask, which a header-only sensor does not have, and guessing one
+    would mean occasionally calling a real host a broadcast.
+
+    Link-local (169.254/16, fe80::/10) is already covered by
+    `is_lan`, so it never reaches this check.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr.is_multicast:
+        return True
+    return addr == ipaddress.ip_address("255.255.255.255")

@@ -147,6 +147,22 @@
         <group>availability,</group>
     </rule>
 
+    <!-- Broadcast / multicast from a camera. Level 3 (informational):
+         it cannot be routed off the segment, so it is not exfiltration,
+         and one camera's 30-minute beacon would otherwise produce forty
+         actionable-looking alerts a day. Kept as a rule rather than
+         dropped because a camera that STARTS announcing itself, or one
+         that stops, is worth being able to correlate. -->
+    <rule id="100226" level="3">
+        <if_sid>100200</if_sid>
+        <field name="kind">^broadcast_beacon$</field>
+        <description>SurveillanceHound: camera beaconing to broadcast/multicast (cannot leave the segment)</description>
+        <mitre>
+            <id>T1046</id>
+        </mitre>
+        <group>discovery,</group>
+    </rule>
+
     <rule id="100225" level="4">
         <if_sid>100200</if_sid>
         <field name="kind">^camera_to_camera$</field>

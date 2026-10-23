@@ -436,6 +436,14 @@ _HELP_TEXT: dict = {
          "what": "Two cameras are talking to each other directly. Cameras normally "
                  "speak only to the NVR, so this is either a misconfiguration or "
                  "one camera being used to reach another."},
+        {"kind": "broadcast_beacon",
+         "what": "A camera is sending to a broadcast or multicast address "
+                 "(255.255.255.255, or a 224.0.0.0/4 group). Those cannot be "
+                 "routed off this segment, so nothing is leaving the network "
+                 "and this is NOT exfiltration — which is why it is info and "
+                 "not medium. It is still shown because something on the "
+                 "camera is announcing itself: a beacon that suddenly starts, "
+                 "stops, or comes from a new camera is worth a look."},
         {"kind": "sensor_offline",
          "what": "A relay SENSOR has stopped reporting to this collector. High "
                  "severity, and it is a statement about the sensor, not its "

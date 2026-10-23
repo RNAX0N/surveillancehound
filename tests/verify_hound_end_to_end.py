@@ -179,7 +179,7 @@ def main() -> int:
         flows = store.recent_flows(limit=20)
         by_class = {f.classification: f for f in flows}
         for needed in ("lan_normal", "telemetry_offnet", "bulk_inbound",
-                       "control_channel_suspect"):
+                       "control_channel_suspect", "broadcast_beacon"):
             assert needed in by_class, (
                 f"missing classification {needed} (got {list(by_class)})"
             )
@@ -189,7 +189,24 @@ def main() -> int:
         assert ctrl.dst_port == 4444 and ctrl.packets == 200, (
             ctrl.dst_port, ctrl.packets,
         )
-        print(f"  flows: 4 expected classifications present; "
+        # A broadcast and a multicast destination are the SAME class, and
+        # neither may be telemetry_offnet: both are unroutable off the
+        # segment, so calling them exfiltration is wrong, and at medium
+        # they drowned the severity. One camera beaconing every 30
+        # minutes was forty such alerts a day.
+        beacons = [f for f in flows if f.classification == "broadcast_beacon"]
+        beacon_dsts = {f.dst_ip for f in beacons}
+        assert beacon_dsts == {"255.255.255.255", "239.255.255.250"}, (
+            f"broadcast_beacon should cover limited broadcast AND "
+            f"multicast, got {beacon_dsts}")
+        offnet_dsts = {f.dst_ip for f in flows
+                       if f.classification == "telemetry_offnet"}
+        assert "255.255.255.255" not in offnet_dsts, (
+            "broadcast is being reported as off-network telemetry again")
+        assert "239.255.255.250" not in offnet_dsts, (
+            "multicast is being reported as off-network telemetry again")
+
+        print(f"  flows: 5 expected classifications present; "
               f"bulk_inbound to_cam={bulk.bytes_to_camera:,}B, "
               f"control_channel {ctrl.packets} pkts")
 
@@ -199,6 +216,11 @@ def main() -> int:
         assert "bulk_inbound" in kinds, kinds
         assert "control_channel_suspect" in kinds, kinds
         assert "telemetry_offnet" in kinds, kinds
+        assert "broadcast_beacon" in kinds, kinds
+        beacon_alerts = [a for a in alerts if a.kind == "broadcast_beacon"]
+        assert all(a.severity == "info" for a in beacon_alerts), (
+            f"beacons must be info, not a severity that demands action: "
+            f"{[a.severity for a in beacon_alerts]}")
         assert "new_device" in kinds, kinds
         assert "new_peer" in kinds, kinds
         # severity assertions
