@@ -22,6 +22,7 @@ override remains the truth).
 from __future__ import annotations
 
 import ipaddress
+import socket
 from dataclasses import dataclass, field
 
 from surveillancehound.config import NetworkCfg
@@ -57,6 +58,9 @@ class DeviceClassifier:
 
     def __post_init__(self) -> None:
         self._camera_set = set(self.network.camera_ips)
+        # ip -> is it one of this machine's own addresses. Asked once
+        # per address, never per packet.
+        self._own_cache: dict[str, bool] = {}
         self._nvr_set = set(self.network.nvr_ips)
         self._camera_nets = [
             ipaddress.ip_network(c, strict=False)
@@ -86,7 +90,52 @@ class DeviceClassifier:
             return False
         return any(addr in n for n in self._lan_nets)
 
+    def is_own_address(self, ip: str) -> bool:
+        """Is this an address of the machine this sensor runs on?
+
+        A sensor cannot observe itself. Liveness here is inferred from
+        traffic on the monitored interface, and this host's own
+        addresses do not appear there as a peer, so anything of ours
+        that gets a camera or nvr role goes "down" and stays down while
+        the report saying so proves otherwise.
+
+        Worse than a wrong row: the NVR's VLAN gateway addresses carry
+        Frigate's MASQUERADED RTSP, so the port heuristic sees
+        117.111.10N.1 connecting to a camera's 554 and concludes the
+        gateway is a camera. Camera-to-camera traffic is then alerted as
+        "unusual; investigate" — on the recorder doing its job. That is
+        exactly what happened once the explicit nvr_ips entries for
+        those addresses were removed.
+
+        Binding a UDP socket to an address succeeds only if the kernel
+        has it on some interface, and fails with EADDRNOTAVAIL
+        otherwise. Port 0, so nothing is reserved and no packet is sent;
+        this is a question, not a connection. Pure stdlib, and it
+        behaves the same on Linux and FreeBSD, which matters because the
+        agent and the collector do not run the same OS.
+
+        Cached per address: the question is asked once per device, not
+        once per packet.
+        """
+        cached = self._own_cache.get(ip)
+        if cached is not None:
+            return cached
+        fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        try:
+            with socket.socket(fam, socket.SOCK_DGRAM) as sk:
+                sk.bind((ip, 0))
+            own = True
+        except OSError:
+            own = False
+        self._own_cache[ip] = own
+        return own
+
     def role_for(self, ip: str) -> str:
+        # 0) never a camera or an NVR if it is one of OUR addresses --
+        #    ahead of explicit config, because a configured own-address
+        #    cannot work either and `hound config-check` says so.
+        if self.is_own_address(ip):
+            return "other"
         # 1) explicit config wins
         if ip in self._nvr_set:
             return "nvr"
@@ -115,7 +164,8 @@ class DeviceClassifier:
         # mark it a camera. 'serves' = it is the dst_ip and the dst_port is
         # camera-ish (a client connecting INTO that port).
         if dst_port in _CAMERA_PORTS and self._learned.get(dst_ip, "other") == "other":
-            if dst_ip not in self._nvr_set and dst_ip not in self._camera_set:
+            if (dst_ip not in self._nvr_set and dst_ip not in self._camera_set
+                    and not self.is_own_address(dst_ip)):
                 self._learned[dst_ip] = "camera"
                 self._peers_per_ip.pop(dst_ip, None)
         # NVR hint: a LAN device that talks to many camera-classified peers.
@@ -126,6 +176,8 @@ class DeviceClassifier:
             or src_ip in self._camera_set
             or src_ip in self._nvr_set
         ):
+            return
+        if self.is_own_address(src_ip):
             return
         peers = self._peers_per_ip.setdefault(src_ip, set())
         if dst_ip in peers or len(peers) >= _MAX_PEER_HINT_SIZE:
