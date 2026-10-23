@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -59,13 +60,36 @@ CAMERAS = range(101, 113)
 EVENTS = "/var/log/gsfw-observe/events.jsonl"
 DEFAULT_MINUTES = 30
 
-# Which port each camera actually serves, from probing every unit and
-# confirmed against the camera-firmware session's own firewall: vendor
-# units answer on 80, ours on 443 (majestic's 80 is dropped on every
-# interface). Recorded for the status output; the rule permits both,
-# because a port nothing listens on is not exposure and keeping one
-# rule is easier to read than twelve.
-WEB_PORT = {n: (443 if n in (102, 103, 106, 107) else 80) for n in CAMERAS}
+# NO HARDCODED PORT MAP. There was one — {102,103,106,107}: 443, the
+# rest 80 — and it went stale the night cameras 1 and 4 were converted,
+# because a map of which firmware a camera runs has to be edited every
+# time one is reflashed and nobody edits it.
+#
+# It was only ever a LABEL: the firewall rule permits tcp/{80,443} to
+# any camera in the set, so access was never actually wrong. A label
+# that silently rots is still worth deleting.
+#
+# `status` now asks the cameras instead. This host can reach both ports
+# directly (inet myfw's output chain permits 80 and 443), so the answer
+# is observed rather than remembered, and a conversion needs no change
+# here at all.
+WEB_PORTS = (443, 80)
+PROBE_TIMEOUT = 0.4
+
+
+def serving_port(ip: str) -> int | None:
+    """Which web port this camera actually answers on, or None.
+
+    Ordered 443 first: our firmware serves 443 and drops 80, so trying
+    it first means the common case costs one connect.
+    """
+    for port in WEB_PORTS:
+        try:
+            with socket.create_connection((ip, port), PROBE_TIMEOUT):
+                return port
+        except OSError:
+            continue
+    return None
 
 
 def nft(*args: str, check: bool = True) -> str:
@@ -133,7 +157,7 @@ def who() -> str:
     return os.environ.get("SUDO_USER") or os.environ.get("USER") or "unknown"
 
 
-def cmd_open(cams: list[int], minutes: int) -> int:
+def cmd_open(cams: list[int], minutes: int, hold: bool = False) -> int:
     for n in cams:
         ip = cam_ip(n)
         # Delete first: adding an existing element does not refresh its
@@ -142,11 +166,30 @@ def cmd_open(cams: list[int], minutes: int) -> int:
         nft("delete", "element", *TABLE, SET, "{" + ip + "}", check=False)
         nft("add", "element", *TABLE, SET,
             "{" + f"{ip} timeout {minutes}m" + "}")
-    names = ", ".join(f"camera {n - 100} ({cam_ip(n)}:{WEB_PORT[n]})"
-                      for n in cams)
+    names = ", ".join(f"camera {n - 100} ({cam_ip(n)})" for n in cams)
     print(f"camaccess: open for {minutes}m — {names}")
     event(f"camaccess OPEN by {who()} for {minutes}m: "
           f"{', '.join(str(n) for n in cams)}")
+    if hold:
+        # Stay alive for the window, so the systemd unit's active period
+        # matches the access it granted.
+        #
+        # The unit used to be `Type=oneshot` with `RemainAfterExit=yes`,
+        # which left it "active (exited)" forever. `systemctl start` on
+        # an already-active unit is a NO-OP, so the operator's
+        # `startcamaccess` alias silently did nothing on every use after
+        # the first — their browser could not reach a camera and the
+        # unit looked fine. RemainAfterExit was there so `systemctl
+        # stop` would run ExecStop; holding the process achieves that
+        # without the lie, and the unit goes inactive when the window
+        # ends so the next start works.
+        #
+        # The nft set's own timeout is still the real guarantee: if this
+        # process is killed outright, access closes on schedule anyway.
+        try:
+            time.sleep(minutes * 60)
+        except KeyboardInterrupt:
+            pass
     return 0
 
 
@@ -177,10 +220,12 @@ def cmd_status() -> int:
     for addr, exp in sorted(live.items()):
         try:
             n = int(addr.split(".")[2])
-            label = f"camera {n - 100}, port {WEB_PORT.get(n, '?')}"
+            who_ = f"camera {n - 100}"
         except (IndexError, ValueError):
-            label = "unknown"
-        print(f"  {addr:<16} {label:<22} expires in {exp}")
+            who_ = "unknown"
+        port = serving_port(addr)
+        serving = f"serving :{port}" if port else "NOT answering 443 or 80"
+        print(f"  {addr:<16} {who_:<10} {serving:<24} expires in {exp}")
     return 0
 
 
@@ -196,6 +241,9 @@ def main() -> int:
                    help="empty or 'all' = every camera; else 6 | 106 | c6 "
                         "| 117.111.106.2, space-separated")
     o.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
+    o.add_argument("--hold", action="store_true",
+                   help="stay in the foreground for the window; used by "
+                        "the systemd units so unit state matches access")
     c = sub.add_parser("close", help="close one camera, or everything")
     c.add_argument("cameras", nargs="*", help="empty = all")
     sub.add_parser("status", help="what is open, and for how long")
@@ -208,11 +256,12 @@ def main() -> int:
             print("camaccess: --minutes must be 1-720", file=sys.stderr)
             return 2
         if not a.cameras or any(x.lower() == "all" for x in a.cameras):
-            return cmd_open(list(CAMERAS), a.minutes)
+            return cmd_open(list(CAMERAS), a.minutes, a.hold)
         # dict.fromkeys to drop duplicates while keeping the order the
         # operator typed, so `open 6 6 7` is not two writes for 6.
         return cmd_open(list(dict.fromkeys(parse_cam(x)
-                                           for x in a.cameras)), a.minutes)
+                                           for x in a.cameras)),
+                        a.minutes, a.hold)
     if a.cmd == "close":
         if not a.cameras or any(x.lower() == "all" for x in a.cameras):
             return cmd_close(None)

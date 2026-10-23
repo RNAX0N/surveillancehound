@@ -7,6 +7,29 @@
 # which is twelve times the exposure for the same browser tab.
 #
 # %i is the camera: 6, 106, c6 and 117.111.106.2 are all accepted.
+#
+# WHY Type=simple AND --hold, not Type=oneshot + RemainAfterExit.
+#
+# It was oneshot with RemainAfterExit=yes, so the unit stayed
+# "active (exited)" after the nft set had already expired. `systemctl
+# start` on an active unit is a NO-OP, so the operator's
+# `startcamaccess` alias silently did nothing on every use after the
+# first: the browser could not reach a camera, `camaccess status` said
+# nothing was open, and the unit looked healthy. Found by the
+# camera-firmware session 2026-10-22.
+#
+# RemainAfterExit was there so `systemctl stop` would run ExecStop.
+# Holding the process for the window achieves that without the lie, and
+# the unit goes inactive exactly when access ends, so the next start
+# works. The nft set's own timeout remains the real guarantee: kill
+# this process and access still closes on schedule.
+#
+# `systemctl start` still returns immediately (Type=simple does not
+# wait), which matters because it is driven over a non-interactive ssh.
+#
+# NOTE: re-running `start` DURING an open window is still a no-op —
+# systemd will not start an already-active unit. Use `restart` to
+# extend a window; `camaccess open` itself extends correctly.
 
 [Unit]
 Description=On-demand web UI access to camera %i (self-expiring)
@@ -15,7 +38,6 @@ After=nftables.service
 Wants=nftables.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/camaccess open %i
+Type=simple
+ExecStart=/usr/local/sbin/camaccess open %i --hold
 ExecStop=-/usr/local/sbin/camaccess close %i
