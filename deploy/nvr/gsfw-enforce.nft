@@ -56,6 +56,7 @@ table inet gsfw_enforce {
     # ---- what is allowed. Counted too, so the allowlist can be
     #      tightened later from evidence instead of from guesswork.
     counter e_frigate_rtsp    { comment "a container -> camera tcp/554 (the recorder)" }
+    counter e_recorder_udp    { comment "the recorder -> camera high UDP: RTP/RTCP for an RTSP session" }
     counter e_lan_ping        { comment "LAN -> camera icmp echo-request" }
     counter e_admin_mgmt      { comment "admin host -> camera tcp/22 (ssh; web UI is on-demand)" }
     counter e_bridge_egress   { comment "container egress to a non-camera destination" }
@@ -157,6 +158,34 @@ table inet gsfw_enforce {
         # container on one bridge.
         iifname "br-*" ip daddr 117.111.0.0/16 tcp dport 554 \
             counter name e_frigate_rtsp accept
+
+        # THE RECORDER'S UDP TO A CAMERA. Added 2026-10-22 after this
+        # chain caused 21 minutes with no recording on any camera.
+        #
+        # Frigate's startup probe negotiates RTSP over UDP, so the
+        # container sends RTP/RTCP to a high port on the camera. The
+        # into-cam drop below killed those (116 packets measured), so no
+        # conntrack entry was ever created, so the camera's RTP back to
+        # the masquerade address arrived as NEW and was dropped by the
+        # input chain too (207 more). ffprobe has no timeout, hung, and
+        # Frigate never started its recorders. Before P2 the forward
+        # chain was policy ACCEPT, the hole-punch got out, and the
+        # return traffic was simply ESTABLISHED — which is why the two
+        # earlier container recreates did not hang.
+        #
+        # THIS DOES NOT OPEN CAMERA-INITIATED UDP, which is the thing
+        # worth refusing and what the camera session asked us not to
+        # touch. Permitting the recorder's OUTBOUND packet is enough:
+        # the camera's reply then matches `ct state established` at the
+        # top of this chain, so nothing camera-originated is allowed.
+        # P2's actual purpose — a camera VLAN may not initiate anything
+        # through this box — is untouched; `e_cam_egress_drop` still
+        # drops that and still reads zero.
+        #
+        # dport >= 1024 so the recorder cannot reach a camera's ntp or
+        # wireguard ports under this rule; RTP is always ephemeral.
+        iifname "br-*" ip daddr 117.111.0.0/16 udp dport >= 1024 \
+            counter name e_recorder_udp accept
 
         # Ping from the LAN, per the operator. Echo REQUEST only; the
         # reply is carried by `established` above.
