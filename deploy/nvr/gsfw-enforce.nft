@@ -55,7 +55,7 @@ table inet gsfw_enforce {
 
     # ---- what is allowed. Counted too, so the allowlist can be
     #      tightened later from evidence instead of from guesswork.
-    counter e_frigate_rtsp    { comment "Frigate -> camera tcp/554" }
+    counter e_frigate_rtsp    { comment "a container -> camera tcp/554 (the recorder)" }
     counter e_lan_ping        { comment "LAN -> camera icmp echo-request" }
     counter e_admin_mgmt      { comment "admin host -> camera tcp/22 (ssh; web UI is on-demand)" }
     counter e_bridge_egress   { comment "container egress to a non-camera destination" }
@@ -140,7 +140,22 @@ table inet gsfw_enforce {
         iifname "enp6s0.*" counter name e_cam_egress_drop drop
 
         # ---- toward the cameras: three ways in, nothing else ----------
-        ip saddr 172.19.0.2 ip daddr 117.111.0.0/16 tcp dport 554 \
+        # MATCHED ON THE BRIDGE, NOT THE CONTAINER'S ADDRESS. This read
+        # `ip saddr 172.19.0.2`, which is the address Docker happens to
+        # have given Frigate. Docker reassigns container addresses when
+        # a network is recreated, and the day that happens this rule
+        # stops matching, every camera's RTSP is dropped as
+        # "not Frigate", and recording stops on all twelve with nothing
+        # in the Frigate logs to explain it. A single hard-coded address
+        # standing between twelve cameras and their recorder is not a
+        # risk worth keeping for the precision it buys.
+        #
+        # The widening is bounded and already granted elsewhere: only a
+        # container on one of this host's Docker bridges can match, and
+        # the `iifname "br-*"` rule further down already lets those
+        # containers reach anything that is NOT a camera. There is one
+        # container on one bridge.
+        iifname "br-*" ip daddr 117.111.0.0/16 tcp dport 554 \
             counter name e_frigate_rtsp accept
 
         # Ping from the LAN, per the operator. Echo REQUEST only; the
